@@ -6,6 +6,15 @@ AI-powered learning app for iOS and Android. Study large documents through AI su
 ![Platform](https://img.shields.io/badge/platform-iOS%20%7C%20Android-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+## 📚 Documentation
+
+- **[SETUP_GUIDE.md](SETUP_GUIDE.md)** - Detailed setup instructions and troubleshooting
+- **[FEATURES.md](FEATURES.md)** - Complete list of features and capabilities
+- **[PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)** - Architecture and design decisions
+- **[COMPLETION_SUMMARY.md](COMPLETION_SUMMARY.md)** - Project delivery summary
+
+---
+
 ## 🌟 Features
 
 - **AI Summarization**: Generate concise summaries of your documents
