@@ -29,7 +29,7 @@ export const extractMetadata = async (fileUri: string): Promise<any> => {
   try {
     const info = await FileSystem.getInfoAsync(fileUri);
     return {
-      size: info.size,
+      size: info.exists && !info.isDirectory ? (info as any).size : 0,
       exists: info.exists,
       uri: info.uri,
     };

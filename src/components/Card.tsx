@@ -10,17 +10,24 @@ interface CardProps {
 }
 
 export const Card: React.FC<CardProps> = ({ title, children, onPress, style }) => {
-  const CardWrapper = onPress ? TouchableOpacity : View;
+  if (onPress) {
+    return (
+      <TouchableOpacity
+        style={[styles.card, style]}
+        onPress={onPress}
+        activeOpacity={0.7}
+      >
+        {title && <Text style={styles.title}>{title}</Text>}
+        {children}
+      </TouchableOpacity>
+    );
+  }
 
   return (
-    <CardWrapper
-      style={[styles.card, style]}
-      onPress={onPress}
-      activeOpacity={onPress ? 0.7 : 1}
-    >
+    <View style={[styles.card, style]}>
       {title && <Text style={styles.title}>{title}</Text>}
       {children}
-    </CardWrapper>
+    </View>
   );
 };
 
