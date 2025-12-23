@@ -32,7 +32,8 @@
       "versionCode": 1,
       "permissions": [
         "RECORD_AUDIO"
-      ]
+      ],
+      "targetSdkVersion": 35
     },
     "web": {
       "favicon": "./assets/favicon.png"
