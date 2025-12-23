@@ -19,7 +19,8 @@
       "buildNumber": "1",
       "infoPlist": {
         "NSMicrophoneUsageDescription": "MindSparkle needs microphone access for voice recording features.",
-        "NSSpeechRecognitionUsageDescription": "MindSparkle uses speech recognition for voice commands."
+        "NSSpeechRecognitionUsageDescription": "MindSparkle uses speech recognition for voice commands.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
