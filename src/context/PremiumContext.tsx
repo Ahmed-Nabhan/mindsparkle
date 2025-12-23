@@ -1,0 +1,308 @@
+import React, { createContext, useState, useContext, useEffect, ReactNode, useCallback } from 'react';
+import { Alert } from 'react-native';
+import revenueCatService, { 
+  ProductInfo, 
+  SubscriptionInfo, 
+  PRODUCT_IDS,
+  ENTITLEMENT_ID 
+} from '../services/revenueCat';
+import { useAuth } from './AuthContext';
+
+// Feature limits for free tier
+export const FREE_TIER_LIMITS = {
+  maxDocuments: 5,
+  maxQuizzesPerDay: 3,
+  maxFlashcardsPerDoc: 20,
+  maxChatMessages: 10,
+  canUseVideoGen: false,
+  canUseAdvancedAnalytics: false,
+  canUseCloudSync: false,
+  canExportPdf: false,
+  canUseAudioSummary: false,
+  canCreateFolders: false,
+  maxFolders: 0,
+};
+
+// Unlimited for pro tier
+export const PRO_TIER_LIMITS = {
+  maxDocuments: -1, // -1 means unlimited
+  maxQuizzesPerDay: -1,
+  maxFlashcardsPerDoc: -1,
+  maxChatMessages: -1,
+  canUseVideoGen: true,
+  canUseAdvancedAnalytics: true,
+  canUseCloudSync: true,
+  canExportPdf: true,
+  canUseAudioSummary: true,
+  canCreateFolders: true,
+  maxFolders: -1,
+};
+
+export interface PremiumFeatures {
+  maxDocuments: number;
+  maxQuizzesPerDay: number;
+  maxFlashcardsPerDoc: number;
+  maxChatMessages: number;
+  canUseVideoGen: boolean;
+  canUseAdvancedAnalytics: boolean;
+  canUseCloudSync: boolean;
+  canExportPdf: boolean;
+  canUseAudioSummary: boolean;
+  canCreateFolders: boolean;
+  maxFolders: number;
+}
+
+interface PremiumContextType {
+  isPremium: boolean;
+  isLoading: boolean;
+  subscription: SubscriptionInfo | null;
+  products: ProductInfo[];
+  features: PremiumFeatures;
+  
+  // Actions
+  checkPremiumStatus: () => Promise<void>;
+  purchaseProduct: (productId: string) => Promise<boolean>;
+  restorePurchases: () => Promise<boolean>;
+  
+  // Feature checks
+  canAccessFeature: (feature: keyof PremiumFeatures) => boolean;
+  checkLimit: (feature: keyof PremiumFeatures, currentCount: number) => boolean;
+  showPaywall: (feature: string) => void;
+  
+  // Daily usage tracking
+  dailyQuizCount: number;
+  dailyChatCount: number;
+  incrementQuizCount: () => void;
+  incrementChatCount: () => void;
+  
+  // Debug (development only)
+  debugPremium: boolean;
+  toggleDebugPremium: () => void;
+}
+
+const PremiumContext = createContext<PremiumContextType | undefined>(undefined);
+
+export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+  const { user } = useAuth();
+  
+  const [isPremium, setIsPremium] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [subscription, setSubscription] = useState<SubscriptionInfo | null>(null);
+  const [products, setProducts] = useState<ProductInfo[]>([]);
+  const [features, setFeatures] = useState<PremiumFeatures>(FREE_TIER_LIMITS);
+  
+  // Debug mode for testing premium features in development
+  const [debugPremium, setDebugPremium] = useState(false);
+  
+  // Daily usage counters (reset at midnight)
+  const [dailyQuizCount, setDailyQuizCount] = useState(0);
+  const [dailyChatCount, setDailyChatCount] = useState(0);
+  const [lastResetDate, setLastResetDate] = useState<string>('');
+
+  // Initialize RevenueCat
+  useEffect(() => {
+    initializeRevenueCat();
+  }, []);
+
+  // Set user ID when user changes
+  useEffect(() => {
+    if (user?.id) {
+      revenueCatService.setUserId(user.id);
+    }
+  }, [user?.id]);
+
+  // Reset daily counters at midnight
+  useEffect(() => {
+    const today = new Date().toDateString();
+    if (lastResetDate !== today) {
+      setDailyQuizCount(0);
+      setDailyChatCount(0);
+      setLastResetDate(today);
+    }
+  }, [lastResetDate]);
+
+  const initializeRevenueCat = async () => {
+    try {
+      setIsLoading(true);
+      await revenueCatService.initialize();
+      await checkPremiumStatus();
+      await loadProducts();
+    } catch (error) {
+      console.error('Error initializing RevenueCat:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const loadProducts = async () => {
+    const availableProducts = await revenueCatService.getProducts();
+    setProducts(availableProducts);
+  };
+
+  const checkPremiumStatus = useCallback(async () => {
+    try {
+      const status = await revenueCatService.checkSubscriptionStatus();
+      setSubscription(status);
+      setIsPremium(status.isActive);
+      setFeatures(status.isActive ? PRO_TIER_LIMITS : FREE_TIER_LIMITS);
+    } catch (error) {
+      console.error('Error checking premium status:', error);
+      setIsPremium(false);
+      setFeatures(FREE_TIER_LIMITS);
+    }
+  }, []);
+
+  const purchaseProduct = async (productId: string): Promise<boolean> => {
+    try {
+      setIsLoading(true);
+      const result = await revenueCatService.purchaseProduct(productId);
+      
+      if (result.success) {
+        await checkPremiumStatus();
+        Alert.alert(
+          '🎉 Welcome to Pro!',
+          'Thank you for upgrading! You now have access to all premium features.',
+          [{ text: 'Awesome!' }]
+        );
+        return true;
+      } else if (result.error && result.error !== 'Purchase cancelled') {
+        Alert.alert('Purchase Failed', result.error);
+      }
+      return false;
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Something went wrong');
+      return false;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const restorePurchases = async (): Promise<boolean> => {
+    try {
+      setIsLoading(true);
+      const result = await revenueCatService.restorePurchases();
+      
+      if (result.success) {
+        await checkPremiumStatus();
+        Alert.alert(
+          'Purchases Restored!',
+          'Your Pro subscription has been restored.',
+          [{ text: 'Great!' }]
+        );
+        return true;
+      } else {
+        Alert.alert(
+          'No Purchases Found',
+          'We couldn\'t find any previous purchases to restore.',
+          [{ text: 'OK' }]
+        );
+        return false;
+      }
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Failed to restore purchases');
+      return false;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const canAccessFeature = (feature: keyof PremiumFeatures): boolean => {
+    const value = features[feature];
+    if (typeof value === 'boolean') return value;
+    return value !== 0;
+  };
+
+  const checkLimit = (feature: keyof PremiumFeatures, currentCount: number): boolean => {
+    const limit = features[feature];
+    if (typeof limit !== 'number') return true;
+    if (limit === -1) return true; // Unlimited
+    return currentCount < limit;
+  };
+
+  const showPaywall = (feature: string) => {
+    Alert.alert(
+      '✨ Pro Feature',
+      `${feature} is a Pro feature. Upgrade to unlock unlimited access to all features!`,
+      [
+        { text: 'Maybe Later', style: 'cancel' },
+        { text: 'View Plans', onPress: () => {
+          // Navigation to paywall would happen here
+          // This will be handled by the component using this
+        }},
+      ]
+    );
+  };
+
+  const incrementQuizCount = () => {
+    if (!isPremium) {
+      setDailyQuizCount(prev => prev + 1);
+    }
+  };
+
+  const incrementChatCount = () => {
+    if (!isPremium && !debugPremium) {
+      setDailyChatCount(prev => prev + 1);
+    }
+  };
+
+  // Toggle debug premium for development testing
+  const toggleDebugPremium = useCallback(() => {
+    setDebugPremium(prev => {
+      const newValue = !prev;
+      setFeatures(newValue ? PRO_TIER_LIMITS : FREE_TIER_LIMITS);
+      if (__DEV__) {
+        console.log(`🔧 Debug Premium: ${newValue ? 'ENABLED' : 'DISABLED'}`);
+      }
+      return newValue;
+    });
+  }, []);
+
+  // Computed isPremium includes debug mode
+  const effectiveIsPremium = isPremium || debugPremium;
+  const effectiveFeatures = (isPremium || debugPremium) ? PRO_TIER_LIMITS : features;
+
+  return (
+    <PremiumContext.Provider
+      value={{
+        isPremium: effectiveIsPremium,
+        isLoading,
+        subscription,
+        products,
+        features: effectiveFeatures,
+        checkPremiumStatus,
+        purchaseProduct,
+        restorePurchases,
+        canAccessFeature: (feature: keyof PremiumFeatures) => {
+          const value = effectiveFeatures[feature];
+          if (typeof value === 'boolean') return value;
+          return value !== 0;
+        },
+        checkLimit: (feature: keyof PremiumFeatures, currentCount: number) => {
+          const limit = effectiveFeatures[feature];
+          if (typeof limit !== 'number') return true;
+          if (limit === -1) return true;
+          return currentCount < limit;
+        },
+        showPaywall,
+        dailyQuizCount,
+        dailyChatCount,
+        incrementQuizCount,
+        incrementChatCount,
+        debugPremium,
+        toggleDebugPremium,
+      }}
+    >
+      {children}
+    </PremiumContext.Provider>
+  );
+};
+
+export const usePremiumContext = () => {
+  const context = useContext(PremiumContext);
+  if (!context) {
+    throw new Error('usePremiumContext must be used within a PremiumProvider');
+  }
+  return context;
+};
+
+export default PremiumContext;

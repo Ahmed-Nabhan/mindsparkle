@@ -1,0 +1,55 @@
+{
+  "expo": {
+    "name": "MindSparkle",
+    "slug": "mindsparkle",
+    "version": "1.0.0",
+    "scheme": "mindsparkle",
+    "newArchEnabled": true,
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#6C63FF"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.ahmednabhan.mindsparkle",
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "MindSparkle needs microphone access for voice recording features.",
+        "NSSpeechRecognitionUsageDescription": "MindSparkle uses speech recognition for voice commands."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#6C63FF"
+      },
+      "package": "com.ahmednabhan.mindsparkle",
+      "versionCode": 1,
+      "permissions": [
+        "RECORD_AUDIO"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-asset",
+      [
+        "expo-document-picker",
+        {
+          "iCloudContainerEnvironment": "Production"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "091c8366-02aa-4af6-a727-252b7b4338a8"
+      }
+    },
+    "owner": "ahmed_nabhan"
+  }
+}

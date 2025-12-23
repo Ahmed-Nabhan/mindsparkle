@@ -1,0 +1,45 @@
+export const strings = {
+  welcome: {
+    title: 'Welcome to MindSparkle',
+    subtitle: 'Here you can learn and sparkle your information with simple colors',
+  },
+  home: {
+    title: 'MindSparkle',
+    getStarted: 'Get Started',
+    description: 'AI-powered learning platform',
+  },
+  upload: {
+    title: 'Learning Documents',
+    uploadButton: 'Upload Document',
+    selectFile: 'Select a file to upload',
+    supportedFormats: 'Supported formats: PDF, DOCX, TXT',
+    noDocuments: 'No documents uploaded yet',
+  },
+  actions: {
+    summarize: 'Summarize',
+    study: 'Study',
+    generateVideo: 'Generate Video',
+    test: 'Test',
+    labs: 'Labs',
+  },
+  sidebar: {
+    exams: 'Exams',
+    interviewTests: 'Interview Tests',
+    summarization: 'Summarization',
+    aiVideo: 'AI Video',
+    performance: 'Performance',
+    labs: 'Labs',
+    settings: 'Settings',
+  },
+  common: {
+    loading: 'Loading...',
+    error: 'An error occurred',
+    success: 'Success!',
+    cancel: 'Cancel',
+    confirm: 'Confirm',
+    save: 'Save',
+    delete: 'Delete',
+    edit: 'Edit',
+    back: 'Back',
+  },
+};
