@@ -191,3 +191,4 @@ ios/.xcode.env.local
 *.swo
 *~
 .tmp/
+google-service-account.json
