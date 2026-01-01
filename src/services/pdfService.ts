@@ -1,7 +1,7 @@
 // PDF Processing Service - 100% FREE local extraction
 // Falls back to OpenAI Vision OCR for scanned PDFs (uses your existing OpenAI credits)
 
-import * as FileSystem from 'expo-file-system/legacy';
+import * as FileSystem from 'expo-file-system';
 import { extractPdfText, extractTextFromChunk } from './pdfExtractor';
 import { callApi } from './apiService';
 

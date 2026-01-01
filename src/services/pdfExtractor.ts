@@ -1,7 +1,7 @@
 // PDF Extractor Service - Handles documents of ANY size (up to 1GB+)
 // Uses chunked processing for large files + server-side fallback
 
-import * as FileSystem from 'expo-file-system/legacy';
+import * as FileSystem from 'expo-file-system';
 
 // Types
 interface PDFPage {

@@ -1,7 +1,7 @@
 // New PDF Processing Service - No external API needed!
 // Uses local parsing + Supabase Storage for free PDF processing
 
-import * as FileSystem from 'expo-file-system/legacy';
+import * as FileSystem from 'expo-file-system';
 import { supabase } from './supabase';
 import { generateId } from '../utils/helpers';
 

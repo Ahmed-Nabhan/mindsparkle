@@ -309,118 +309,25 @@ async function callOpenAI(systemPrompt: string, userPrompt: string, maxTokens = 
     }
     return data.choices?.[0]?.message?.content || "";
   }
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
+
+  try {
+    const { action, content, language, isCombine, chunkInfo, includeImages, imageUrls, questionCount, totalPages, pageCount, style, useAnimations, ...body } = await req.json();
+
+    let result;
+    let systemPrompt;
+    const hasImages = imageUrls && imageUrls.length > 0;
+    const hasContent = content && content.length > 0;
+
+    switch (action) {
+      case 'summarize': {
   
   // Build a tuned system prompt using prompt builder
   systemPrompt = buildSystemPrompt('summarize', { isCombine, chunkInfo }, language);
-  result = await callOpenAI(systemPrompt, `${language && language !== 'en' ? 'Respond in ' + language + '. ' : ''}Create a comprehensive, study-friendly summary of this content (${content.length} characters):\n\n${content}`, 4096, 0.3);
-**Main Idea:** [One clear sentence]
-
-**Key Concepts:**
-1. **[Concept Name]** (p. X)
-   - Definition: [Clear explanation]
-   - Why it matters: [Importance]
-   - Example: [If provided in text]
-
-2. **[Concept Name]** (p. X)
-   - Definition: [Clear explanation]
-   - Connection to: [Related concepts]
-
-**Important Facts:**
-• [Fact] (p. X)
-• [Fact] (p. X)
-
-(Continue for all sections)
-
-## 🔑 Key Terms Glossary
-| Term | Definition | Page |
-|------|-----------|------|
-| [Term] | [Definition] | p. X |
-
-## 📝 Study Checklist
-☐ Understand [concept 1]
-☐ Know [concept 2]
-☐ Can explain [concept 3]
-(List 10-15 items)
-
-## ⚡ Quick Facts (For Last-Minute Review)
-1. [Most important fact]
-2. [Second most important]
-(List 10-15 facts)
-
-## 💡 Key Takeaways
-(5-7 ESSENTIAL points to remember)
-
-RULES:
-- Be THOROUGH - cover ALL pages
-- Make explanations CLEAR and STUDENT-FRIENDLY
-- Include page refs for EVERY major point
-- Think like a teacher preparing students for an exam`;
-        } else if (chunkInfo) {
-          systemPrompt = `Summarize ${chunkInfo} for STUDY PURPOSES.
-
-Create a clear, organized summary with:
-
-**Main Topics in This Section:**
-• [Topic 1]
-• [Topic 2]
-
-**Key Concepts & Definitions:**
-1. **[Term]**: [Clear definition]
-2. **[Term]**: [Clear definition]
-
-**Important Details:**
-• [Detail with significance]
-• [Detail with significance]
-
-**Connections:** How this relates to other concepts
-
-Be thorough, accurate, and student-friendly.`;
-        } else {
-          systemPrompt = `You are an expert study guide creator making PROFESSIONAL EDUCATIONAL CONTENT.
-
-YOUR GOAL: Create a summary that helps students LEARN and REMEMBER the material.
-
-FORMAT YOUR RESPONSE AS:
-
-# 📚 STUDY SUMMARY
-
-## 🎯 Overview
-**Topic:** [Main subject]
-**Key Question This Answers:** [What problem/question does this address?]
-
-## 📖 Main Content
-
-### Key Concept 1: [Name]
-**What it is:** [Clear 1-2 sentence explanation]
-**Why it matters:** [Importance/application]
-**Key details:**
-• [Detail 1]
-• [Detail 2]
-
-### Key Concept 2: [Name]
-(Same format)
-
-## 🔑 Essential Terms
-• **[Term 1]**: [Definition]
-• **[Term 2]**: [Definition]
-
-## ⚡ Quick Facts
-1. [Important fact 1]
-2. [Important fact 2]
-(Continue for all key facts)
-
-## 💡 Key Takeaways
-(5-7 most important points to remember)
-
-## 🧠 Study Tips
-(2-3 tips for mastering this material)
-
-RULES:
-- Make it COMPREHENSIVE yet CLEAR
-- Use simple language that students can understand
-- Organize logically for easy studying
-- Include ALL important information`;
-        }
         
         // If images are available and either text is small or includeImages explicitly requested,
         // use the vision-capable endpoint to produce a multimodal summary that references images.
@@ -699,8 +606,8 @@ Each flashcard should have:
 //   {"term": "Photosynthesis", "definition": "The process by which plants convert light energy into chemical energy", "difficulty": "medium"},
 //   {"term": "What is the capital of France?", "definition": "Paris", "difficulty": "easy"}
 // ]
-// Generate 10-20 high-quality flashcards covering the most important concepts.
-        result = await callOpenAI(systemPrompt, `Create flashcards from this content:\n\n${content}`, 4096);
+// Generate 10-20 high-quality flashcards covering the most important concepts.`;
+        
         result = await callOpenAI(systemPrompt, `Create flashcards from this content:\n\n${content}`, 4096);
         
         try {
@@ -863,3 +770,4 @@ Your output should be the extracted text in a readable format.`;
     });
   }
 });
+}
