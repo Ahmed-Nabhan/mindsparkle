@@ -456,7 +456,7 @@ export var VideoScreen: React.FC = function() {
     setIsPaused(false);
     isPausedRef.current = false;
     var sections = videoScript ?  (videoScript.sections || []) : [];
-    var idx = Math. min(sections.length, currentSectionIndex + 1);
+    var idx = Math.min(sections.length, currentSectionIndex + 1);
     setCurrentSectionIndex(idx);
     if (isPlaying) {
       playSection(idx);
@@ -477,7 +477,7 @@ export var VideoScreen: React.FC = function() {
   var getCurrentVisual = function(): VisualResult {
     if (!videoScript || currentSectionIndex < 0) return null;
     var sections = videoScript.sections || [];
-    if (currentSectionIndex >= sections. length) return null;
+    if (currentSectionIndex >= sections.length) return null;
     var section = sections[currentSectionIndex];
 
     // Priority 1: Visual Directions (Smart Screen)
@@ -591,7 +591,7 @@ export var VideoScreen: React.FC = function() {
         </TouchableOpacity>
         <Text style={styles.selectTitle}>Choose Your AI Teacher</Text>
         <Text style={styles.selectSubtitle}>Select who will guide you through this lesson</Text>
-        <View style={styles. teacherGrid}>
+        <View style={styles.teacherGrid}>
           {TEACHERS.map(function(teacher) {
             var isSelected = selectedTeacher.id === teacher.id;
             return (
@@ -644,7 +644,7 @@ export var VideoScreen: React.FC = function() {
         <View style={styles.progressBarBg}>
           <View style={[styles.progressBarFill, { width: `${loadingProgress}%`, backgroundColor: selectedTeacher.color }]} />
         </View>
-        <Text style={styles. loadingMessage}>{loadingMessage}</Text>
+        <Text style={styles.loadingMessage}>{loadingMessage}</Text>
         <ActivityIndicator size="large" color={selectedTeacher.color} style={{ marginTop: 20 }} />
       </View>
     );
@@ -652,7 +652,7 @@ export var VideoScreen: React.FC = function() {
 
   if (! videoScript) {
     return (
-      <View style={styles. loadingContainer}>
+      <View style={styles.loadingContainer}>
         <Text style={styles.errorText}>Failed to create lesson</Text>
         <TouchableOpacity style={styles.retryButton} onPress={handleBack}><Text style={styles.retryButtonText}>Go Back</Text></TouchableOpacity>
       </View>
@@ -670,7 +670,7 @@ export var VideoScreen: React.FC = function() {
     <View style={styles.container}>
       <View style={[styles.header, { backgroundColor: sectionColor }]}>
         <TouchableOpacity style={styles.headerBackButton} onPress={handleBack}>
-          <Text style={styles. headerBackText}>← Back</Text>
+          <Text style={styles.headerBackText}>← Back</Text>
         </TouchableOpacity>
         <Text style={styles.headerTitle} numberOfLines={1}>{videoScript.title || "AI Lesson"}</Text>
         <View style={styles.headerSpacer} />
@@ -688,19 +688,19 @@ export var VideoScreen: React.FC = function() {
             {currentSection && <Text style={[styles.currentSectionTitle, { color: sectionColor }]}>{currentSection.title}</Text>}
           </View>
 
-          <Animated.View style={[styles. teacherArea, { transform: [{ translateY: teacherTranslateY }] }]}>
-            <Animated.View style={[styles. teacherCircle, { borderColor: selectedTeacher.color, transform: [{ scale: pulseAnim }] }]}>
+          <Animated.View style={[styles.teacherArea, { transform: [{ translateY: teacherTranslateY }] }]}>
+            <Animated.View style={[styles.teacherCircle, { borderColor: selectedTeacher.color, transform: [{ scale: pulseAnim }] }]}>
               <Text style={styles.teacherMainEmoji}>{selectedTeacher.avatar}</Text>
               {isPlaying && <View style={[styles.speakingWave, { backgroundColor: selectedTeacher.color }]} />}
             </Animated.View>
-            <Text style={[styles.teacherNameLabel, { color: selectedTeacher. color }]}>{selectedTeacher. name}</Text>
+            <Text style={[styles.teacherNameLabel, { color: selectedTeacher.color }]}>{selectedTeacher.name}</Text>
             <Text style={styles.teacherStatus}>{isPlaying ? "Speaking..." : "Ready"}</Text>
           </Animated.View>
         </View>
 
         <View style={styles.progressSection}>
           <View style={styles.progressTrack}>
-            <Animated.View style={[styles. progressFill, { backgroundColor: sectionColor, width: progressAnim. interpolate({ inputRange: [0, 100], outputRange: ["0%", "100%"] }) }]} />
+            <Animated.View style={[styles.progressFill, { backgroundColor: sectionColor, width: progressAnim.interpolate({ inputRange: [0, 100], outputRange: ["0%", "100%"] }) }]} />
           </View>
         </View>
 
@@ -710,7 +710,7 @@ export var VideoScreen: React.FC = function() {
           <TouchableOpacity style={[styles.playBtn, { backgroundColor: sectionColor }]} onPress={handlePlay}>
             <Text style={styles.playEmoji}>{isPlaying ? "⏸️" : "▶️"}</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.controlBtn} onPress={handleNext}><Text style={styles. controlEmoji}>⏩</Text></TouchableOpacity>
+          <TouchableOpacity style={styles.controlBtn} onPress={handleNext}><Text style={styles.controlEmoji}>⏩</Text></TouchableOpacity>
           <TouchableOpacity style={styles.controlBtn} onPress={function() { setShowSpeedMenu(!showSpeedMenu); }}>
             <Text style={styles.speedText}>{playbackSpeed}x</Text>
           </TouchableOpacity>
@@ -781,7 +781,7 @@ export var VideoScreen: React.FC = function() {
           <View style={[styles.contentCard, { borderLeftColor: sectionColor }]}>
             <Text style={[styles.cardHeading, { color: sectionColor }]}>{currentSection.title}</Text>
             <Text style={styles.cardNarration}>{currentSection.narration}</Text>
-            {currentSection.keyPoints && currentSection.keyPoints. length > 0 && (
+            {currentSection.keyPoints && currentSection.keyPoints.length > 0 && (
               <View style={styles.keyPointsBox}>
                 <Text style={styles.keyPointsHeading}>📌 Key Points</Text>
                 {currentSection.keyPoints.map(function(pt, i) {
@@ -822,22 +822,22 @@ export var VideoScreen: React.FC = function() {
             </View>
             {videoScript.tables && videoScript.tables.length > 0 && (
               <View style={styles.noteBox}>
-                <Text style={styles. noteBoxTitle}>📊 Tables Covered</Text>
+                <Text style={styles.noteBoxTitle}>📊 Tables Covered</Text>
                 {videoScript.tables.map(function(tbl, i) {
-                  return <Text key={i} style={styles. noteListItem}>• {tbl. title || "Table " + (i + 1)} (Page {tbl.pageNumber})</Text>;
+                  return <Text key={i} style={styles.noteListItem}>• {tbl.title || "Table " + (i + 1)} (Page {tbl.pageNumber})</Text>;
                 })}
               </View>
             )}
             {videoScript.images && videoScript.images.length > 0 && (
               <View style={styles.noteBox}>
-                <Text style={styles. noteBoxTitle}>🖼️ Diagrams & Figures</Text>
+                <Text style={styles.noteBoxTitle}>🖼️ Diagrams & Figures</Text>
                 {videoScript.images.slice(0, 6).map(function(img, i) {
-                  return <Text key={i} style={styles. noteListItem}>• {img. type}:  {img.description}</Text>;
+                  return <Text key={i} style={styles.noteListItem}>• {img.type}:  {img.description}</Text>;
                 })}
               </View>
             )}
             <View style={styles.noteBox}>
-              <Text style={styles. noteBoxTitle}>🎯 Conclusion</Text>
+              <Text style={styles.noteBoxTitle}>🎯 Conclusion</Text>
               <Text style={styles.noteBoxText}>{videoScript.conclusion || "Thank you for completing this lesson."}</Text>
             </View>
           </View>

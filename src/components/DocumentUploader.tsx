@@ -48,10 +48,10 @@ export const DocumentUploader: React.FC<DocumentUploaderProps> = ({
         }
 
         // Validate file size
-        if (file.size && !isValidFileSize(file.size, config.limits. maxDocumentSize)) {
-          Alert. alert(
+        if (file.size && !isValidFileSize(file.size, config.limits.maxDocumentSize)) {
+          Alert.alert(
             'File Too Large',
-            `Maximum file size is ${formatFileSize(config.limits. maxDocumentSize)}.`
+            `Maximum file size is ${formatFileSize(config.limits.maxDocumentSize)}.`
           );
           setIsPicking(false);
           return;
@@ -80,8 +80,8 @@ export const DocumentUploader: React.FC<DocumentUploaderProps> = ({
         ) : (
           <>
             <Text style={styles.uploadIcon}>📄</Text>
-            <Text style={styles.uploadText}>{strings. upload.selectFile}</Text>
-            <Text style={styles. supportedFormats}>{strings.upload. supportedFormats}</Text>
+            <Text style={styles.uploadText}>{strings.upload.selectFile}</Text>
+            <Text style={styles.supportedFormats}>{strings.upload.supportedFormats}</Text>
           </>
         )}
       </TouchableOpacity>
@@ -90,7 +90,7 @@ export const DocumentUploader: React.FC<DocumentUploaderProps> = ({
         <View style={styles.selectedFile}>
           <Text style={styles.fileName}>{selectedFile.name}</Text>
           <Text style={styles.fileSize}>
-            {selectedFile. size ? formatFileSize(selectedFile.size) : 'Unknown size'}
+            {selectedFile.size ? formatFileSize(selectedFile.size) : 'Unknown size'}
           </Text>
         </View>
       )}
@@ -104,7 +104,7 @@ const styles = StyleSheet.create({
   },
   uploadBox: {
     borderWidth:  2,
-    borderColor: colors. primary,
+    borderColor: colors.primary,
     borderStyle: 'dashed',
     borderRadius: 12,
     padding: 32,
@@ -140,7 +140,7 @@ const styles = StyleSheet.create({
   fileName: {
     fontSize: 14,
     fontWeight: '600',
-    color: colors. text,
+    color: colors.text,
     marginBottom: 4,
   },
   fileSize: {

@@ -13,8 +13,8 @@ export interface ParsedDocument {
 
 export const parseDocument = async (fileUri: string, fileType: string): Promise<ParsedDocument> => {
   try {
-    const fileInfo = await FileSystem. getInfoAsync(fileUri);
-    const fileSize = fileInfo. exists && ! fileInfo.isDirectory ?  (fileInfo as any).size : 0;
+    const fileInfo = await FileSystem.getInfoAsync(fileUri);
+    const fileSize = fileInfo.exists && !fileInfo.isDirectory ?  (fileInfo as any).size : 0;
     const fileSizeMB = fileSize / (1024 * 1024);
 
     if (fileSizeMB > MAX_FILE_SIZE_MB) {
@@ -23,8 +23,8 @@ export const parseDocument = async (fileUri: string, fileType: string): Promise<
 
     let content = '';
 
-    if (fileType === 'text/plain' || fileType. includes('txt')) {
-      content = await FileSystem. readAsStringAsync(fileUri);
+    if (fileType === 'text/plain' || fileType.includes('txt')) {
+      content = await FileSystem.readAsStringAsync(fileUri);
     } else if (fileType === 'application/pdf' || fileType.includes('pdf')) {
       content = await extractPdfTextChunked(fileUri, fileSize);
     } else if (fileType.includes('word') || fileType.includes('docx') || fileType.includes('doc')) {
@@ -36,7 +36,7 @@ export const parseDocument = async (fileUri: string, fileType: string): Promise<
     }
 
     if (! content || content.trim().length < 20) {
-      throw new Error('Could not extract text.  The file may be scanned/image-based.');
+      throw new Error('Could not extract text. The file may be scanned/image-based.');
     }
 
     const chunks = splitIntoChunks(content, MAX_CHUNK_SIZE);
@@ -86,11 +86,11 @@ const extractPdfTextChunked = async (fileUri: string, fileSize: number): Promise
         // Clear memory
         if (extractedText.length > 500000) {
           // Keep only meaningful content, trim excess
-          extractedText = extractedText. substring(0, 500000);
+          extractedText = extractedText.substring(0, 500000);
           break;
         }
       } catch (chunkError) {
-        console. log('Chunk ' + i + ' read error, skipping...');
+        console.log('Chunk ' + i + ' read error, skipping...');
         continue;
       }
     }
@@ -98,11 +98,11 @@ const extractPdfTextChunked = async (fileUri: string, fileSize: number): Promise
     // Clean up final text
     extractedText = cleanText(extractedText);
 
-    if (extractedText. length < 30) {
+    if (extractedText.length < 30) {
       throw new Error('PDF may be scanned/image-based. Text extraction requires OCR.');
     }
 
-    console.log('Extracted ' + extractedText. length + ' characters from PDF');
+    console.log('Extracted ' + extractedText.length + ' characters from PDF');
     return extractedText;
   } catch (error:  any) {
     throw new Error(error.message || 'Could not extract text from PDF.');
@@ -126,8 +126,8 @@ const extractTextSimple = function(binaryString:  string): string {
       if (currentText.length > 1) {
         // Filter readable ASCII
         var readable = '';
-        for (var j = 0; j < currentText. length; j++) {
-          var c = currentText. charCodeAt(j);
+        for (var j = 0; j < currentText.length; j++) {
+          var c = currentText.charCodeAt(j);
           if (c >= 32 && c <= 126) {
             readable += currentText[j];
           }
@@ -324,7 +324,7 @@ const splitIntoChunks = function(text: string, maxSize: number): string[] {
       }
     }
     
-    chunks.push(text. substring(start, end).trim());
+    chunks.push(text.substring(start, end).trim());
     start = end + 1;
   }
 
@@ -332,7 +332,7 @@ const splitIntoChunks = function(text: string, maxSize: number): string[] {
 };
 
 export const extractMetadata = async (fileUri: string): Promise<any> => {
-  const info = await FileSystem. getInfoAsync(fileUri);
+  const info = await FileSystem.getInfoAsync(fileUri);
   return {
     size: info.exists && !info.isDirectory ? (info as any).size : 0,
     exists: info.exists,

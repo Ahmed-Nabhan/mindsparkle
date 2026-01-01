@@ -78,7 +78,7 @@ export function DocumentProvider({ children }: { children:  ReactNode }) {
       }}
     >
       {children}
-    </DocumentContext. Provider>
+    </DocumentContext.Provider>
   );
 }
 

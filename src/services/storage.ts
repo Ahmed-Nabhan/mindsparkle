@@ -4,7 +4,7 @@ import { TestResult } from '../types/performance';
 import { Folder } from '../types/folder';
 import { uploadFileToStorage } from './supabase';
 
-const db = SQLite. openDatabaseSync('mindsparkle.db');
+const db = SQLite.openDatabaseSync('mindsparkle.db');
 
 export const initDatabase = async (): Promise<void> => {
   try {
@@ -61,7 +61,7 @@ export const initDatabase = async (): Promise<void> => {
     `);
     console.log('Folders table created');
   } catch (error) {
-    console. error('Error creating tables:', error);
+    console.error('Error creating tables:', error);
     throw error;
   }
 };
@@ -94,15 +94,15 @@ export const saveDocument = async (document: Document): Promise<void> => {
        contentToSave = contentToSave.substring(0, 500000) + '... [TRUNCATED]';
     }
 
-    await db. runAsync(
+    await db.runAsync(
       `INSERT INTO documents (id, title, fileName, fileUri, fileType, fileSize, uploadedAt, content, summary, userId, pdfCloudUrl, extractedDataJson)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
       [
-        document. id,
+        document.id,
         document.title,
         document.fileName,
         document.fileUri,
-        document. fileType,
+        document.fileType,
         document.fileSize,
         document.uploadedAt.toISOString(),
         contentToSave,
@@ -179,7 +179,7 @@ export const getDocumentById = async (id: string): Promise<Document | null> => {
       }
       return {
         ...row,
-        uploadedAt:  new Date(row. uploadedAt),
+        uploadedAt:  new Date(row.uploadedAt),
         pdfCloudUrl: row.pdfCloudUrl || undefined,
         extractedData,
       };
@@ -193,17 +193,17 @@ export const getDocumentById = async (id: string): Promise<Document | null> => {
 
 export const saveTestResult = async (result: TestResult): Promise<void> => {
   try {
-    await db. runAsync(
+    await db.runAsync(
       `INSERT INTO test_results (id, documentId, userId, score, totalQuestions, correctAnswers, completedAt, timeSpent, testType)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ? );`,
       [
         result.id,
-        result. documentId,
+        result.documentId,
         result.userId,
         result.score,
         result.totalQuestions,
         result.correctAnswers,
-        result. completedAt.toISOString(),
+        result.completedAt.toISOString(),
         result.timeSpent,
         result.testType,
       ]

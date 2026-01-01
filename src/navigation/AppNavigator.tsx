@@ -36,7 +36,7 @@ const Drawer = createDrawerNavigator<MainDrawerParamList>();
 
 const MainDrawer = () => {
   return (
-    <Drawer. Navigator
+    <Drawer.Navigator
       drawerContent={(props) => <Sidebar {...props} />}
       screenOptions={{
         headerStyle: {
@@ -50,18 +50,18 @@ const MainDrawer = () => {
         drawerInactiveTintColor:  colors.textSecondary,
       }}
     >
-      <Drawer. Screen 
+      <Drawer.Screen 
         name="Home" 
         component={HomeScreen}
         options={{
-          title: strings.home. title,
+          title: strings.home.title,
         }}
       />
-      <Drawer. Screen 
+      <Drawer.Screen 
         name="Upload" 
         component={UploadScreen}
         options={{
-          title: strings.upload. title,
+          title: strings.upload.title,
         }}
       />
       <Drawer.Screen 
@@ -80,7 +80,7 @@ const MainDrawer = () => {
           drawerItemStyle:  { display: 'none' },
         }}
       />
-      <Drawer. Screen 
+      <Drawer.Screen 
         name="Study" 
         component={StudyScreen}
         options={{
@@ -88,7 +88,7 @@ const MainDrawer = () => {
           drawerItemStyle:  { display: 'none' },
         }}
       />
-      <Drawer. Screen 
+      <Drawer.Screen 
         name="Video" 
         component={VideoScreen}
         options={{
@@ -104,21 +104,21 @@ const MainDrawer = () => {
           drawerItemStyle:  { display: 'none' },
         }}
       />
-      <Drawer. Screen 
+      <Drawer.Screen 
         name="Labs" 
         component={LabsScreen}
         options={{
           title: strings.sidebar.labs,
         }}
       />
-      <Drawer. Screen 
+      <Drawer.Screen 
         name="Performance" 
         component={PerformanceScreen}
         options={{
           title: strings.sidebar.performance,
         }}
       />
-      <Drawer. Screen 
+      <Drawer.Screen 
         name="Exams" 
         component={ExamsScreen}
         options={{
@@ -129,7 +129,7 @@ const MainDrawer = () => {
         name="Interview" 
         component={InterviewScreen}
         options={{
-          title: strings.sidebar. interviewTests,
+          title: strings.sidebar.interviewTests,
         }}
       />
       {/* New Screens */}

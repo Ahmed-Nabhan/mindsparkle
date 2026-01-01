@@ -27,7 +27,7 @@ export const DocumentActionsScreen:  React.FC = () => {
   }, []);
 
   const loadDocument = async () => {
-    const doc = await getDocument(route.params. documentId);
+    const doc = await getDocument(route.params.documentId);
     setDocument(doc);
     setIsLoading(false);
   };
@@ -121,19 +121,19 @@ export const DocumentActionsScreen:  React.FC = () => {
     <View style={styles.container}>
       <Header title={document.title} subtitle="Choose an action" />
       
-      <ScrollView style={styles. content}>
-        <Card style={styles. actionCard}>
+      <ScrollView style={styles.content}>
+        <Card style={styles.actionCard}>
           <Text style={styles.actionIcon}>📝</Text>
-          <Text style={styles.actionTitle}>{strings.actions. summarize}</Text>
-          <Text style={styles. actionDescription}>
+          <Text style={styles.actionTitle}>{strings.actions.summarize}</Text>
+          <Text style={styles.actionDescription}>
             Get an AI-generated summary of your document
           </Text>
           <Button title={strings.actions.summarize} onPress={handleSummarize} />
         </Card>
 
-        <Card style={styles. actionCard}>
+        <Card style={styles.actionCard}>
           <Text style={styles.actionIcon}>📚</Text>
-          <Text style={styles.actionTitle}>{strings.actions. study}</Text>
+          <Text style={styles.actionTitle}>{strings.actions.study}</Text>
           <Text style={styles.actionDescription}>
             Study with AI-assisted learning tools
           </Text>
@@ -142,7 +142,7 @@ export const DocumentActionsScreen:  React.FC = () => {
 
         <Card style={styles.actionCard}>
           <Text style={styles.actionIcon}>🎥</Text>
-          <Text style={styles. actionTitle}>{strings.actions.generateVideo}</Text>
+          <Text style={styles.actionTitle}>{strings.actions.generateVideo}</Text>
           <Text style={styles.actionDescription}>
             Create an AI video summary with narration
           </Text>
@@ -151,20 +151,20 @@ export const DocumentActionsScreen:  React.FC = () => {
 
         <Card style={styles.actionCard}>
           <Text style={styles.actionIcon}>✏️</Text>
-          <Text style={styles.actionTitle}>{strings. actions.test}</Text>
+          <Text style={styles.actionTitle}>{strings.actions.test}</Text>
           <Text style={styles.actionDescription}>
             Take an AI-generated quiz
           </Text>
-          <Button title={strings.actions. test} onPress={handleTest} />
+          <Button title={strings.actions.test} onPress={handleTest} />
         </Card>
 
         <Card style={styles.actionCard}>
           <Text style={styles.actionIcon}>🔬</Text>
-          <Text style={styles. actionTitle}>{strings.actions.labs}</Text>
-          <Text style={styles. actionDescription}>
+          <Text style={styles.actionTitle}>{strings.actions.labs}</Text>
+          <Text style={styles.actionDescription}>
             Access interactive labs and exercises
           </Text>
-          <Button title={strings.actions. labs} onPress={handleLabs} />
+          <Button title={strings.actions.labs} onPress={handleLabs} />
         </Card>
 
         {/* New Feature Cards */}
@@ -255,7 +255,7 @@ const styles = StyleSheet.create({
   },
   errorText: {
     fontSize: 16,
-    color: colors. error,
+    color: colors.error,
     textAlign: 'center',
     marginTop: 32,
   },

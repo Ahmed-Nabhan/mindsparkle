@@ -50,11 +50,11 @@ export const SummaryScreen: React.FC = () => {
   }, [summary]);
 
   const loadDocumentAndSummary = async () => {
-    const doc = await getDocument(route.params. documentId);
+    const doc = await getDocument(route.params.documentId);
     setDocument(doc);
     
     if (doc?. summary) {
-      setSummary(doc. summary);
+      setSummary(doc.summary);
     }
     setIsLoading(false);
   };
@@ -183,7 +183,7 @@ export const SummaryScreen: React.FC = () => {
   );
 };
 
-const styles = StyleSheet. create({
+const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,

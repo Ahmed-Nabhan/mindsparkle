@@ -225,14 +225,14 @@ export const QuizScreen: React.FC<QuizScreenProps> = ({ route, navigation }) => 
     }
 
     if (index === questions[currentQuestion].correctAnswer) {
-      return styles. correctOption;
+      return styles.correctOption;
     }
 
     if (selectedAnswer === index) {
-      return styles. wrongOption;
+      return styles.wrongOption;
     }
 
-    return styles. option;
+    return styles.option;
   };
 
   const getOptionTextStyle = (index:  number) => {
@@ -255,7 +255,7 @@ export const QuizScreen: React.FC<QuizScreenProps> = ({ route, navigation }) => 
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color={colors.primary} />
-        <Text style={styles. loadingText}>{loadingMessage}</Text>
+        <Text style={styles.loadingText}>{loadingMessage}</Text>
         {quizAttempt > 1 && (
           <Text style={styles.attemptText}>Generating new questions (Attempt #{quizAttempt})</Text>
         )}
@@ -394,7 +394,7 @@ export const QuizScreen: React.FC<QuizScreenProps> = ({ route, navigation }) => 
   const question = questions[currentQuestion];
 
   return (
-    <ScrollView style={styles. container}>
+    <ScrollView style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.progress}>
           Question {currentQuestion + 1} of {questions.length}
@@ -407,7 +407,7 @@ export const QuizScreen: React.FC<QuizScreenProps> = ({ route, navigation }) => 
         <Text style={styles.score}>Score: {Math.round(score * 10) / 10}</Text>
       </View>
 
-      <View style={styles. progressBar}>
+      <View style={styles.progressBar}>
         <View 
           style={[
             styles.progressFill, 
@@ -446,7 +446,7 @@ export const QuizScreen: React.FC<QuizScreenProps> = ({ route, navigation }) => 
       )}
 
       <View style={styles.questionCard}>
-        <Text style={styles.questionText}>{question. question}</Text>
+        <Text style={styles.questionText}>{question.question}</Text>
       </View>
 
       <View style={styles.optionsContainer}>
@@ -575,7 +575,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     marginBottom: 12,
     borderWidth:  2,
-    borderColor: colors. primary,
+    borderColor: colors.primary,
   },
   correctOption: {
     backgroundColor: '#d4edda',

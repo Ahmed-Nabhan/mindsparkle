@@ -3,7 +3,7 @@
  */
 export const isValidEmail = (email:  string): boolean => {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex. test(email);
+  return emailRegex.test(email);
 };
 
 /**
@@ -19,8 +19,8 @@ export const isValidPassword = (password: string): boolean => {
 export const isValidFileType = (fileName: string, allowedTypes: string[]): boolean => {
   if (! fileName) return false;
   
-  const lowerFileName = fileName. toLowerCase();
-  const extension = lowerFileName. substring(lowerFileName.lastIndexOf('. '));
+  const lowerFileName = fileName.toLowerCase();
+  const extension = lowerFileName.substring(lowerFileName.lastIndexOf('.'));
   
   // Check extension
   const isValidExt = allowedTypes.some(function(type) {
