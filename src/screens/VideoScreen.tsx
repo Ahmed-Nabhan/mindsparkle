@@ -140,7 +140,7 @@ export var VideoScreen: React.FC = function() {
   var [autoAdvance, setAutoAdvance] = useState(true);
   var [showSpeedMenu, setShowSpeedMenu] = useState(false);
 
-  var teacherAnim = useRef(new Animated. Value(0)).current;
+  var teacherAnim = useRef(new Animated.Value(0)).current;
   var progressAnim = useRef(new Animated.Value(0)).current;
   var pulseAnim = useRef(new Animated.Value(1)).current;
   var isPausedRef = useRef(false);

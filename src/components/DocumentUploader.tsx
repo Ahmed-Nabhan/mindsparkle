@@ -8,7 +8,7 @@ import { isValidFileType, isValidFileSize } from '../utils/validators';
 import { formatFileSize } from '../utils/helpers';
 
 interface DocumentUploaderProps {
-  onDocumentSelected: (document: DocumentPicker. DocumentPickerResult) => void;
+  onDocumentSelected: (document: DocumentPicker.DocumentPickerResult) => void;
 }
 
 export const DocumentUploader: React.FC<DocumentUploaderProps> = ({
