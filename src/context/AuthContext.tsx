@@ -1,6 +1,7 @@
 import React, { createContext, useState, useContext, useEffect, ReactNode } from 'react';
 import { User, AuthState } from '../types/user';
 import { getCurrentUser, signIn as supabaseSignIn, signOut as supabaseSignOut, signUp as supabaseSignUp } from '../services/supabase';
+import { cloudSyncService } from '../services/cloudSyncService';
 
 interface AuthContextType extends AuthState {
   signIn: (email: string, password: string) => Promise<void>;
@@ -30,6 +31,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           createdAt: new Date(data.user.created_at),
         });
         setIsAuthenticated(true);
+        
+        // Initialize sync service
+        cloudSyncService.initialize(data.user.id);
       }
     } catch (error) {
       console.error('Error checking user:', error);
@@ -51,6 +55,13 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           createdAt: new Date(data.user.created_at),
         });
         setIsAuthenticated(true);
+        
+        // Initialize sync service
+        cloudSyncService.initialize(data.user.id);
+        
+        // Trigger background sync (don't await)
+        cloudSyncService.downloadDocuments().catch(console.error);
+        cloudSyncService.downloadFolders().catch(console.error);
       }
     } catch (error) {
       console.error('Error signing in:', error);
@@ -71,6 +82,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           createdAt: new Date(data.user.created_at),
         });
         setIsAuthenticated(true);
+        
+        // Initialize sync service
+        cloudSyncService.initialize(data.user.id);
       }
     } catch (error) {
       console.error('Error signing up:', error);

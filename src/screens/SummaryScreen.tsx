@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image } from 'react-native';
 import { useRoute, useNavigation } from '@react-navigation/native';
 import { colors } from '../constants/colors';
 import { Header } from '../components/Header';
@@ -8,6 +8,7 @@ import { LoadingSpinner } from '../components/LoadingSpinner';
 import { Button } from '../components/Button';
 import { useDocument } from '../hooks/useDocument';
 import { generateSummary } from '../services/openai';
+import { updateDocumentSummary } from '../services/storage';
 import type { MainDrawerScreenProps } from '../navigation/types';
 import type { Document } from '../types/document';
 
@@ -19,6 +20,8 @@ export const SummaryScreen: React.FC = () => {
   const { getDocument } = useDocument();
   const [document, setDocument] = useState<Document | null>(null);
   const [summary, setSummary] = useState<string>('');
+  const [summaryImage, setSummaryImage] = useState<string | null>(null);
+  const [displaySummary, setDisplaySummary] = useState<string>('');
   const [isLoading, setIsLoading] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -27,6 +30,24 @@ export const SummaryScreen: React.FC = () => {
   useEffect(() => {
     loadDocumentAndSummary();
   }, []);
+
+  // Parse summary for images whenever it changes
+  useEffect(() => {
+    if (summary) {
+      // Check for markdown image at the start: ![Alt](Url)
+      const imgMatch = summary.match(/^!\[.*?\]\((.*?)\)\n\n/);
+      if (imgMatch) {
+        setSummaryImage(imgMatch[1]);
+        setDisplaySummary(summary.replace(imgMatch[0], ''));
+      } else {
+        setSummaryImage(null);
+        setDisplaySummary(summary);
+      }
+    } else {
+      setSummaryImage(null);
+      setDisplaySummary('');
+    }
+  }, [summary]);
 
   const loadDocumentAndSummary = async () => {
     const doc = await getDocument(route.params. documentId);
@@ -51,14 +72,20 @@ export const SummaryScreen: React.FC = () => {
     setProgressMessage('Starting...');
 
     try {
+      // Pass existing extracted data to avoid re-uploading to cloud
       const generatedSummary = await generateSummary(
         document.content || '',
         document.chunks,
         handleProgress,
         document.fileUri,
-        document.fileType
+        document.fileType,
+        document.pdfCloudUrl,  // Pass existing cloud URL
+        document.extractedData  // Pass existing extracted data
       );
       setSummary(generatedSummary);
+      
+      // Save summary to document for future instant access
+      await updateDocumentSummary(document.id, generatedSummary);
     } catch (error:  any) {
       console.error('Error generating summary:', error);
       setSummary('Failed to generate summary:  ' + (error.message || 'Unknown error'));
@@ -133,7 +160,16 @@ export const SummaryScreen: React.FC = () => {
         {summary && ! isGenerating && (
           <Card>
             <Text style={styles.sectionTitle}>AI Summary</Text>
-            <Text style={styles.summaryText}>{summary}</Text>
+            
+            {summaryImage && (
+              <Image 
+                source={{ uri: summaryImage }} 
+                style={styles.summaryImage} 
+                resizeMode="cover"
+              />
+            )}
+            
+            <Text style={styles.summaryText}>{displaySummary}</Text>
             <Button
               title="Regenerate"
               onPress={handleGenerateSummary}
@@ -161,6 +197,13 @@ const styles = StyleSheet. create({
     fontWeight: 'bold',
     color: colors.text,
     marginBottom: 12,
+  },
+  summaryImage: {
+    width: '100%',
+    height: 200,
+    borderRadius: 8,
+    marginBottom: 16,
+    backgroundColor: colors.surface,
   },
   summaryText:  {
     fontSize:  16,

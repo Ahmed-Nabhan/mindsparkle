@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator, Alert, Animated, Image, Dimensions } from "react-native";
 import * as Speech from "expo-speech";
 import { useRoute, useNavigation } from "@react-navigation/native";
@@ -6,6 +7,7 @@ import Config from "../services/config";
 import PdfService from "../services/pdfService";
 import ApiService from "../services/apiService";
 import { colors } from "../constants/colors";
+import { usePremiumContext } from "../context/PremiumContext";
 import type { MainDrawerScreenProps } from "../navigation/types";
 
 // Type definitions
@@ -17,6 +19,7 @@ interface VideoSection {
   keyPoints?: string[];
   visualType?: string;
   timestamp?: string;
+  visualDirections?: string[];
 }
 
 interface VideoTable {
@@ -87,15 +90,21 @@ var TEACHERS: Teacher[] = [
   { id: "male2", name:  "James", gender: "male", avatar:  "🧑‍💼", color: "#2196F3", voiceConfig: { language:  "en-GB", pitch: 95 / 100, rate: 9 / 10 } },
   { id: "female1", name: "Sarah", gender: "female", avatar:  "👩‍🏫", color: "#E91E63", voiceConfig:  { language: "en-US", pitch: 11 / 10, rate: 85 / 100 } },
   { id: "female2", name: "Emma", gender: "female", avatar:  "👩‍💼", color: "#9C27B0", voiceConfig: { language: "en-GB", pitch: 105 / 100, rate: 9 / 10 } },
+  // Arabic Teachers
+  { id: "male_ar", name: "Ahmed", gender: "male", avatar: "👨🏽‍🏫", color: "#009688", voiceConfig: { language: "ar-SA", pitch: 1, rate: 9 / 10 } },
+  { id: "female_ar", name: "Layla", gender: "female", avatar: "🧕", color: "#E91E63", voiceConfig: { language: "ar-SA", pitch: 11 / 10, rate: 9 / 10 } },
 ];
 
 export var VideoScreen: React.FC = function() {
   var route = useRoute<VideoScreenProps['route']>();
   var navigation = useNavigation<VideoScreenProps['navigation']>();
+  var { isPremium, features } = usePremiumContext();
   var params = route.params;
   var content = params.content || "";
   var fileUri = params.fileUri || "";
   var documentId = params.documentId;
+  var cachedPdfUrl = (params as any).pdfCloudUrl || "";
+  var cachedExtractedData = (params as any).extractedData || null;
 
   var [isLoading, setIsLoading] = useState(true);
   var [loadingMessage, setLoadingMessage] = useState("Preparing your lesson...");
@@ -106,6 +115,23 @@ export var VideoScreen: React.FC = function() {
   var [showTeacherSelect, setShowTeacherSelect] = useState(true);
   var [isPlaying, setIsPlaying] = useState(false);
   var [isPaused, setIsPaused] = useState(false);
+  // Video generation options
+  var [videoLanguage, setVideoLanguage] = useState<'en' | 'ar' | string>('en');
+  var [useAnimationsOption, setUseAnimationsOption] = useState(true);
+
+  // Load saved user preferences (video language and animations)
+  useEffect(() => {
+    (async () => {
+      try {
+        const lang = await AsyncStorage.getItem('videoLanguage');
+        const anim = await AsyncStorage.getItem('videoUseAnimations');
+        if (lang) setVideoLanguage(lang);
+        if (anim !== null) setUseAnimationsOption(anim === 'true');
+      } catch (e) {
+        console.warn('Failed to load video settings', e);
+      }
+    })();
+  }, []);
   var [currentSectionIndex, setCurrentSectionIndex] = useState(-1);
   var [activeTab, setActiveTab] = useState("video");
   
@@ -146,13 +172,62 @@ export var VideoScreen: React.FC = function() {
 
   var loadVideoContent = async function() {
     try {
-      setLoadingMessage("Analyzing your document...");
+      setLoadingMessage("Preparing your lesson...");
       setLoadingProgress(10);
 
       var pages: { pageNum: number; text: string; imageUrl?: string }[] = [];
 
-      // Process PDF with slides
-      if (fileUri) {
+      // PRIORITY 1: Use cached extracted data from document upload (already processed!)
+      if (cachedExtractedData && cachedExtractedData.pages && cachedExtractedData.pages.length > 0) {
+        console.log('Using cached data - no cloud upload needed!');
+        setLoadingMessage("Loading your document...");
+        setLoadingProgress(50);
+        
+        // Use cached data - much faster, no API calls!
+        pages = cachedExtractedData.pages.map(function(p: any) {
+          return {
+            pageNum: p.pageNumber || p.pageNum,
+            text: p.text || '',
+            imageUrl: p.images && p.images.length > 0 ? p.images[0].url : undefined,
+          };
+        });
+        
+        // Store slides for display
+        var cachedSlideImages = pages.filter(function(p) { return p.imageUrl; }).map(function(p) {
+          return { pageNum: p.pageNum, imageUrl: p.imageUrl! };
+        });
+        setSlides(cachedSlideImages);
+        
+        if (cachedSlideImages.length > 0) {
+          setCurrentSlide(cachedSlideImages[0].imageUrl);
+        }
+
+        setExtractedData({ pages, pageCount: cachedExtractedData.totalPages || pages.length });
+        setLoadingProgress(70);
+        
+        console.log('Using cached data:', pages.length, 'pages');
+      }
+      // PRIORITY 2: Use document content directly if available (no API needed)
+      else if (content && content.trim().length > 100) {
+        console.log('Using document content directly - no cloud processing needed!');
+        setLoadingMessage("Processing content...");
+        setLoadingProgress(40);
+        
+        // Split content into chunks for video sections
+        var contentChunks = content.match(/.{1,2000}/g) || [];
+        pages = contentChunks.slice(0, 15).map(function(chunk, index) {
+          return { 
+            pageNum: index + 1, 
+            text: '=== PAGE ' + (index + 1) + ' ===\n' + chunk 
+          };
+        });
+        
+        setExtractedData({ pages, pageCount: pages.length });
+        setLoadingProgress(70);
+        console.log('Created', pages.length, 'sections from document content');
+      }
+      // PRIORITY 3: Process PDF only if no cached data (uses API, may fail if credits exhausted)
+      else if (fileUri) {
         setLoadingMessage("Reading PDF file...");
         setLoadingProgress(15);
 
@@ -178,15 +253,31 @@ export var VideoScreen: React.FC = function() {
         setLoadingProgress(70);
       }
 
+      // Check if pages have actual text content
+      var pagesWithText = pages.filter(function(p) { return p.text && p.text.trim().length > 50; });
+
+      // If no pages with meaningful text, create text-based pages from document content
+      if (pagesWithText.length === 0 && content && content.trim().length > 50) {
+        // Split content into chunks for video sections
+        var contentChunks = content.match(/.{1,2000}/g) || [];
+        pages = contentChunks.slice(0, 10).map(function(chunk, index) {
+          return { pageNum: index + 1, text: chunk };
+        });
+      } else if (pagesWithText.length > 0) {
+        pages = pagesWithText;
+      }
+
       if (pages.length === 0) {
-        throw new Error("Could not extract content from document");
+        // Last resort - create a simple lesson from any available content
+        var fallbackContent = content || "This document could not be processed for video. Please try uploading a text-based PDF.";
+        pages = [{ pageNum: 1, text: fallbackContent.substring(0, 2000) }];
       }
 
       setLoadingMessage("Creating video lesson with " + selectedTeacher.name + "...");
       setLoadingProgress(75);
 
-      // Generate video script with slide references
-      var script: VideoScript = await ApiService.generateVideoScript(pages);
+      // Generate video script with slide references (pass selected language/animation options)
+      var script: VideoScript = await ApiService.generateVideoScript(pages, { language: videoLanguage, style: 'educational', useAnimations: useAnimationsOption });
       
       // Ensure sections have slide URLs
       if (script.sections) {
@@ -380,6 +471,7 @@ export var VideoScreen: React.FC = function() {
     | { type: "table"; data: VideoTable }
     | { type: "image"; url: string }
     | { type: "points"; data: string[] }
+    | { type: "directions"; data: string[] }
     | null;
 
   var getCurrentVisual = function(): VisualResult {
@@ -387,6 +479,11 @@ export var VideoScreen: React.FC = function() {
     var sections = videoScript.sections || [];
     if (currentSectionIndex >= sections. length) return null;
     var section = sections[currentSectionIndex];
+
+    // Priority 1: Visual Directions (Smart Screen)
+    if (section.visualDirections && section.visualDirections.length > 0) {
+      return { type: "directions", data: section.visualDirections };
+    }
 
     if (section.visualType === "table" && videoScript.tables && videoScript.tables.length > 0) {
       var tableIdx = Math.min(currentSectionIndex, videoScript.tables.length - 1);
@@ -412,6 +509,24 @@ export var VideoScreen: React.FC = function() {
         <View style={[styles.visualCard, { borderColor: sectionColor }]}>
           <Text style={styles.welcomeEmoji}>📚</Text>
           <Text style={styles.welcomeText}>{currentSectionIndex < 0 ? "Welcome to Your Lesson!" : "Lesson Complete!"}</Text>
+        </View>
+      );
+    }
+
+    if (visual.type === "directions") {
+      return (
+        <View style={[styles.pointsCard, { borderColor: sectionColor, backgroundColor: '#0d1117', borderWidth: 4, borderStyle: 'solid' }]}>
+          <View style={{flexDirection: 'row', alignItems: 'center', marginBottom: 12, borderBottomWidth: 1, borderBottomColor: '#30363d', paddingBottom: 8}}>
+            <Text style={{fontSize: 20, marginRight: 8}}>🖥️</Text>
+            <Text style={{color: sectionColor, fontWeight: 'bold', fontSize: 16}}>Smart Board</Text>
+          </View>
+          {visual.data.map(function(point: string, i: number) {
+            return (
+              <View key={i} style={[styles.pointRow, { marginBottom: 16 }]}>
+                <Text style={[styles.pointText, { fontSize: 18, color: '#fff', textAlign: 'center', fontWeight: '600' }]}>{point}</Text>
+              </View>
+            );
+          })}
         </View>
       );
     }
@@ -491,7 +606,30 @@ export var VideoScreen: React.FC = function() {
             );
           })}
         </View>
-        <TouchableOpacity style={[styles.startLessonButton, { backgroundColor: selectedTeacher.color }]} onPress={function() { setShowTeacherSelect(false); }}>
+        {/* Language and animation options for generated video */}
+        <View style={{ marginTop: 12, marginBottom: 8, flexDirection: 'row', justifyContent: 'space-between' }}>
+          <TouchableOpacity style={[styles.optionBtn, { borderColor: selectedTeacher.color }]} onPress={async function() { const newLang = videoLanguage === 'en' ? 'ar' : 'en'; setVideoLanguage(newLang); try { await AsyncStorage.setItem('videoLanguage', newLang); } catch(e){console.warn('Failed to save language', e);} }}>
+            <Text style={styles.optionText}>Language: {videoLanguage === 'en' ? 'English' : 'Arabic'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.optionBtn, useAnimationsOption ? { backgroundColor: selectedTeacher.color } : {}]} onPress={async function() { const newVal = !useAnimationsOption; setUseAnimationsOption(newVal); try { await AsyncStorage.setItem('videoUseAnimations', String(newVal)); } catch(e){console.warn('Failed to save animation setting', e);} }}>
+            <Text style={[styles.optionText, useAnimationsOption ? { color: '#fff' } : {}]}>{useAnimationsOption ? 'Animations: ON' : 'Animations: OFF'}</Text>
+          </TouchableOpacity>
+        </View>
+        <TouchableOpacity style={[styles.startLessonButton, { backgroundColor: selectedTeacher.color }]} onPress={function() { 
+          // Check if user has access to video generation
+          if (!isPremium && !features.canUseVideoGen) {
+            Alert.alert(
+              '🎬 Pro Feature',
+              'Video summaries are a Pro feature. Upgrade to create AI-powered video lessons from your documents!',
+              [
+                { text: 'Maybe Later', style: 'cancel', onPress: function() { navigation.goBack(); } },
+                { text: 'Upgrade to Pro', onPress: function() { navigation.navigate('Paywall', { source: 'video' }); } },
+              ]
+            );
+            return;
+          }
+          setShowTeacherSelect(false); 
+        }}>
           <Text style={styles.startLessonText}>Start Lesson with {selectedTeacher.name} →</Text>
         </TouchableOpacity>
       </View>
@@ -790,6 +928,8 @@ var styles = StyleSheet.create({
   autoAdvanceLabel: { color: "#c9d1d9", fontSize: 14 },
   autoAdvanceToggle: { paddingVertical: 6, paddingHorizontal: 16, borderRadius: 20, backgroundColor: "#30363d" },
   autoAdvanceToggleText: { color: "#fff", fontSize: 12, fontWeight: "bold" },
+  optionBtn: { paddingVertical: 10, paddingHorizontal: 14, borderRadius: 10, borderWidth: 2, borderColor: '#30363d', backgroundColor: '#0d1117' },
+  optionText: { color: '#c9d1d9', fontSize: 14, fontWeight: '600' },
   tabsRow:  { flexDirection: "row", borderBottomWidth: 1, borderBottomColor: "#30363d" },
   tabBtn: { flex: 1, padding: 14, alignItems: "center", borderBottomWidth: 2, borderBottomColor: "transparent" },
   tabLabel:  { fontSize: 13, color: "#8b949e" },

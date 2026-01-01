@@ -12,6 +12,7 @@ export interface Document {
   isLargeFile?: boolean;
   summary?: string;
   userId?: string;
+  pdfCloudUrl?: string;
   extractedData?: ExtractedData;
 }
 

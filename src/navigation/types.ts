@@ -21,6 +21,8 @@ export type MainDrawerParamList = {
     documentId: string;
     content?: string;
     fileUri?: string;
+    pdfCloudUrl?: string;
+    extractedData?: any;
   };
   Test: { documentId: string };
   Labs: { documentId: string };

@@ -1,6 +1,10 @@
 // Cloud Sync Service - Backup and sync data to Supabase
 
 import { supabase } from './supabase';
+import { saveDocument, saveFolder, saveTestResult } from './storage';
+import { Document } from '../types/document';
+import { Folder } from '../types/folder';
+import { TestResult } from '../types/performance';
 
 export interface SyncableData {
   documents: any[];
@@ -119,7 +123,30 @@ class CloudSyncService {
 
       if (error) throw error;
 
-      return data || [];
+      const documents = data || [];
+      
+      // Save downloaded documents to local storage
+      for (const doc of documents) {
+        try {
+          const document: Document = {
+            id: doc.id,
+            title: doc.title,
+            content: doc.content,
+            fileType: doc.file_type,
+            fileSize: doc.file_size,
+            fileName: doc.title, // Fallback
+            fileUri: '', // Cannot restore local URI
+            uploadedAt: new Date(doc.created_at),
+            userId: doc.user_id,
+            // Add other fields if available in Supabase schema
+          };
+          await saveDocument(document);
+        } catch (e) {
+          console.error(`Failed to save synced document ${doc.id}:`, e);
+        }
+      }
+
+      return documents;
     } catch (error: any) {
       this.syncStatus.syncError = error.message;
       console.error('Error downloading documents:', error);
@@ -180,7 +207,26 @@ class CloudSyncService {
 
       if (error) throw error;
 
-      return data || [];
+      const folders = data || [];
+      
+      // Save downloaded folders to local storage
+      for (const f of folders) {
+        try {
+          const folder: Folder = {
+            id: f.id,
+            name: f.name,
+            emoji: f.emoji,
+            color: f.color,
+            documentIds: f.document_ids || [], // Assuming array in DB
+            createdAt: new Date(f.created_at),
+          };
+          await saveFolder(folder);
+        } catch (e) {
+          console.error(`Failed to save synced folder ${f.id}:`, e);
+        }
+      }
+
+      return folders;
     } catch (error: any) {
       this.syncStatus.syncError = error.message;
       console.error('Error downloading folders:', error);
@@ -240,7 +286,29 @@ class CloudSyncService {
 
       if (error) throw error;
 
-      return data || [];
+      const results = data || [];
+      
+      // Save downloaded test results to local storage
+      for (const r of results) {
+        try {
+          const result: TestResult = {
+            id: r.id,
+            documentId: r.document_id,
+            userId: r.user_id,
+            score: r.score,
+            totalQuestions: r.total_questions,
+            correctAnswers: Math.round((r.score / 100) * r.total_questions), // Approximate if not stored
+            completedAt: new Date(r.completed_at),
+            timeSpent: r.time_spent,
+            testType: r.test_type,
+          };
+          await saveTestResult(result);
+        } catch (e) {
+          console.error(`Failed to save synced test result ${r.id}:`, e);
+        }
+      }
+
+      return results;
     } catch (error: any) {
       this.syncStatus.syncError = error.message;
       console.error('Error downloading test results:', error);

@@ -59,10 +59,8 @@ export const PaywallScreen: React.FC = () => {
   const getProductDetails = (productId: string) => {
     return products.find(p => p.identifier === productId) || {
       identifier: productId,
-      priceString: productId === PRODUCT_IDS.MONTHLY ? '$4.99/mo' : 
-                   productId === PRODUCT_IDS.YEARLY ? '$29.99/yr' : '$79.99',
-      title: productId === PRODUCT_IDS.MONTHLY ? 'Monthly' : 
-             productId === PRODUCT_IDS.YEARLY ? 'Yearly' : 'Lifetime',
+      priceString: productId === PRODUCT_IDS.MONTHLY ? '$4.99/mo' : '$29.99/yr',
+      title: productId === PRODUCT_IDS.MONTHLY ? 'Monthly' : 'Yearly',
     };
   };
 
@@ -178,35 +176,12 @@ export const PaywallScreen: React.FC = () => {
           </View>
         </TouchableOpacity>
 
-        {/* Lifetime */}
-        <TouchableOpacity
-          style={[
-            styles.planCard,
-            selectedProduct === PRODUCT_IDS.LIFETIME && styles.planCardSelected,
-          ]}
-          onPress={() => setSelectedProduct(PRODUCT_IDS.LIFETIME)}
-        >
-          <View style={styles.planInfo}>
-            <Text style={styles.planName}>Lifetime</Text>
-            <Text style={styles.planPrice}>
-              {getProductDetails(PRODUCT_IDS.LIFETIME).priceString}
-            </Text>
-            <Text style={styles.planDesc}>One-time purchase</Text>
-          </View>
-          <View style={styles.radioOuter}>
-            {selectedProduct === PRODUCT_IDS.LIFETIME && (
-              <View style={styles.radioInner} />
-            )}
-          </View>
-        </TouchableOpacity>
       </View>
 
       {/* Free Trial Badge */}
-      {selectedProduct !== PRODUCT_IDS.LIFETIME && (
-        <View style={styles.trialBadge}>
-          <Text style={styles.trialText}>🎁 7-day free trial included</Text>
-        </View>
-      )}
+      <View style={styles.trialBadge}>
+        <Text style={styles.trialText}>🎁 7-day free trial included</Text>
+      </View>
 
       {/* Purchase Button */}
       <TouchableOpacity
@@ -217,12 +192,7 @@ export const PaywallScreen: React.FC = () => {
         {purchasing ? (
           <ActivityIndicator color="#fff" />
         ) : (
-          <Text style={styles.purchaseButtonText}>
-            {selectedProduct === PRODUCT_IDS.LIFETIME 
-              ? 'Get Lifetime Access'
-              : 'Start Free Trial'
-            }
-          </Text>
+          <Text style={styles.purchaseButtonText}>Start Free Trial</Text>
         )}
       </TouchableOpacity>
 
@@ -237,10 +207,7 @@ export const PaywallScreen: React.FC = () => {
 
       {/* Terms */}
       <Text style={styles.terms}>
-        {selectedProduct !== PRODUCT_IDS.LIFETIME 
-          ? 'After the free trial, subscription will automatically renew. Cancel anytime in Settings.'
-          : 'One-time purchase. Access all Pro features forever.'
-        }
+        After the free trial, subscription will automatically renew. Cancel anytime in Settings.
       </Text>
       
       <View style={styles.legalLinks}>

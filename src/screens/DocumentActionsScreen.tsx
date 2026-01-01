@@ -44,7 +44,18 @@ export const DocumentActionsScreen:  React.FC = () => {
 
   const handleGenerateVideo = () => {
     if (!document) return;
-    navigation.navigate('Video', { documentId: document.id });
+    // Check if user can access video generation
+    if (!features.canUseVideoGen) {
+      navigation.navigate('Paywall', { source: 'video' });
+      return;
+    }
+    navigation.navigate('Video', { 
+      documentId: document.id,
+      content: document.content || '',
+      fileUri: document.fileUri || '',
+      pdfCloudUrl: document.pdfCloudUrl,
+      extractedData: document.extractedData,
+    });
   };
 
   const handleTest = () => {

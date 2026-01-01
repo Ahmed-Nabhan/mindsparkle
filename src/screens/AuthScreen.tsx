@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -10,9 +10,13 @@ import {
   Platform,
   ScrollView,
   Alert,
+  Linking,
 } from 'react-native';
+import * as AppleAuthentication from 'expo-apple-authentication';
+import * as Crypto from 'expo-crypto';
 import { colors } from '../constants/colors';
 import { useAuth } from '../context/AuthContext';
+import { supabase } from '../services/supabase';
 
 interface AuthScreenProps {
   navigation: any;
@@ -29,6 +33,94 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [appleAuthAvailable, setAppleAuthAvailable] = useState(false);
+
+  // Check if Apple Authentication is available
+  useEffect(() => {
+    const checkAppleAuth = async () => {
+      const isAvailable = await AppleAuthentication.isAvailableAsync();
+      setAppleAuthAvailable(isAvailable);
+    };
+    checkAppleAuth();
+  }, []);
+
+  // Native Apple Sign In with Face ID/Touch ID
+  const handleAppleSignIn = async () => {
+    try {
+      setIsLoading(true);
+      
+      // Generate a secure nonce for security
+      const rawNonce = Crypto.randomUUID();
+      const hashedNonce = await Crypto.digestStringAsync(
+        Crypto.CryptoDigestAlgorithm.SHA256,
+        rawNonce
+      );
+
+      console.log('Starting Apple Sign In with nonce...');
+
+      // This shows the native Apple Sign In sheet with Face ID/Touch ID
+      const credential = await AppleAuthentication.signInAsync({
+        requestedScopes: [
+          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+          AppleAuthentication.AppleAuthenticationScope.EMAIL,
+        ],
+        nonce: hashedNonce,
+      });
+
+      console.log('Apple credential received, identity token present:', !!credential.identityToken);
+
+      // Sign in with Supabase using the Apple ID token
+      if (credential.identityToken) {
+        console.log('Sending token to Supabase...');
+        
+        const { data, error } = await supabase.auth.signInWithIdToken({
+          provider: 'apple',
+          token: credential.identityToken,
+          nonce: rawNonce,
+        });
+
+        if (error) {
+          console.error('Supabase auth error:', JSON.stringify(error));
+          // Throw with the specific message from Supabase
+          throw new Error(error.message || 'Supabase authentication failed');
+        }
+        
+        console.log('Apple Sign In successful!');
+        // Success! User is now signed in
+        // Navigation will happen automatically through auth state change
+      } else {
+        throw new Error('No identity token received from Apple');
+      }
+    } catch (error: any) {
+      if (error.code === 'ERR_REQUEST_CANCELED') {
+        // User cancelled - do nothing
+        console.log('Apple Sign In cancelled by user');
+        return;
+      }
+      
+      console.error('Apple Sign In error:', error);
+      
+      // Provide more helpful error messages
+      let errorMessage = 'Could not sign in with Apple. Please try again.';
+      
+      if (error.message) {
+        // Show the actual error message for debugging
+        errorMessage = error.message;
+        
+        if (errorMessage.includes('Network')) {
+          errorMessage = 'Network connection error. Please check your internet and try again.';
+        } else if (errorMessage.includes('invalid_grant')) {
+          errorMessage = 'Apple Sign In session expired. Please try again.';
+        } else if (errorMessage.includes('client_id')) {
+          errorMessage = 'App configuration error (Bundle ID mismatch). Please contact support.';
+        }
+      }
+      
+      Alert.alert('Sign In Failed', errorMessage);
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   const validateEmail = (email: string): boolean => {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -274,14 +366,25 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
 
               {/* Social Login Buttons */}
               <View style={styles.socialButtons}>
-                <TouchableOpacity style={styles.socialButton}>
-                  <Text style={styles.socialIcon}>🍎</Text>
-                  <Text style={styles.socialText}>Apple</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.socialButton}>
-                  <Text style={styles.socialIcon}>🔷</Text>
-                  <Text style={styles.socialText}>Google</Text>
-                </TouchableOpacity>
+                {/* Native Apple Sign In Button - Only show on iOS if available */}
+                {Platform.OS === 'ios' && appleAuthAvailable ? (
+                  <AppleAuthentication.AppleAuthenticationButton
+                    buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
+                    buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+                    cornerRadius={12}
+                    style={styles.appleButton}
+                    onPress={handleAppleSignIn}
+                  />
+                ) : (
+                  <TouchableOpacity 
+                    style={styles.socialButton}
+                    onPress={handleAppleSignIn}
+                    disabled={!appleAuthAvailable}
+                  >
+                    <Text style={styles.socialIcon}>🍎</Text>
+                    <Text style={styles.socialText}>Apple</Text>
+                  </TouchableOpacity>
+                )}
               </View>
             </>
           )}
@@ -456,6 +559,11 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'center',
     gap: 16,
+    alignItems: 'center',
+  },
+  appleButton: {
+    width: 140,
+    height: 48,
   },
   socialButton: {
     flexDirection: 'row',

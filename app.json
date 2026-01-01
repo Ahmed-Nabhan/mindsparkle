@@ -4,7 +4,7 @@
     "slug": "mindsparkle",
     "version": "1.0.0",
     "scheme": "mindsparkle",
-    "newArchEnabled": false,
+    "newArchEnabled": true,
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -17,6 +17,7 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.ahmednabhan.mindsparkle",
       "buildNumber": "1",
+      "usesAppleSignIn": true,
       "infoPlist": {
         "NSMicrophoneUsageDescription": "MindSparkle needs microphone access for voice recording features.",
         "NSSpeechRecognitionUsageDescription": "MindSparkle uses speech recognition for voice commands.",
@@ -32,14 +33,14 @@
       "versionCode": 1,
       "permissions": [
         "RECORD_AUDIO"
-      ],
-      "targetSdkVersion": 35
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
       "expo-asset",
+      "expo-apple-authentication",
       [
         "expo-document-picker",
         {
@@ -50,7 +51,9 @@
     "extra": {
       "eas": {
         "projectId": "091c8366-02aa-4af6-a727-252b7b4338a8"
-      }
+      },
+      "supabaseUrl": "https://cszorvgzihzamgezlfjj.supabase.co",
+      "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNzem9ydmd6aWh6YW1nZXpsZmpqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjYwNDAzNDYsImV4cCI6MjA4MTYxNjM0Nn0.FWuTPGrWNGLC1TATYYxUiC48QS8GSP5jytkR-Dwq2qM"
     },
     "owner": "ahmed_nabhan"
   }

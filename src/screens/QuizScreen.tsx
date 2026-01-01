@@ -10,6 +10,7 @@ import {
   Modal,
 } from 'react-native';
 import { colors } from '../constants/colors';
+import { usePremiumContext } from '../context/PremiumContext';
 
 interface QuizQuestion {
   question: string;
@@ -52,6 +53,7 @@ const DIFFICULTY_SETTINGS = {
 
 export const QuizScreen: React.FC<QuizScreenProps> = ({ route, navigation }) => {
   const { content, chunks, fileUri, fileType } = route.params;
+  const { isPremium, features, dailyQuizCount, incrementQuizCount } = usePremiumContext();
   
   const [questions, setQuestions] = useState<QuizQuestion[]>([]);
   const [currentQuestion, setCurrentQuestion] = useState(0);
@@ -145,7 +147,21 @@ export const QuizScreen: React.FC<QuizScreenProps> = ({ route, navigation }) => 
   };
 
   const startQuiz = () => {
+    // Check daily quiz limit for free users
+    if (!isPremium && features.maxQuizzesPerDay !== -1 && dailyQuizCount >= features.maxQuizzesPerDay) {
+      Alert.alert(
+        '📝 Daily Quiz Limit Reached',
+        `Free users can take ${features.maxQuizzesPerDay} quizzes per day. Upgrade to Pro for unlimited quizzes!`,
+        [
+          { text: 'Maybe Later', style: 'cancel', onPress: () => navigation.goBack() },
+          { text: 'Upgrade to Pro', onPress: () => navigation.navigate('Paywall', { source: 'quiz' }) },
+        ]
+      );
+      return;
+    }
+    
     setShowSettings(false);
+    incrementQuizCount();
     loadQuiz();
   };
 

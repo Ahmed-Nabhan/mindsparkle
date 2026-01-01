@@ -1,614 +1,372 @@
-// Centralized PDF Processing Service
-// All PDF operations go through here - update once, reflects everywhere
+// PDF Processing Service - 100% FREE local extraction
+// Falls back to OpenAI Vision OCR for scanned PDFs (uses your existing OpenAI credits)
 
-import axios from 'axios';
-import * as FileSystem from 'expo-file-system';
-import Config from './config';
+import * as FileSystem from 'expo-file-system/legacy';
+import { extractPdfText, extractTextFromChunk } from './pdfExtractor';
+import { callApi } from './apiService';
 
-var pdfCoClient = axios.create({
-  timeout: Config.UPLOAD_TIMEOUT,
-  headers: { 'x-api-key': Config.PDFCO_API_KEY },
-  maxContentLength: Infinity,
-  maxBodyLength: Infinity,
-});
+// Types
+interface PDFPage {
+  pageNum: number;
+  text: string;
+  imageUrl?: string;
+}
 
-// Read file as base64
-export var readFileAsBase64 = async function(fileUri: string): Promise<string> {
-  console.log('Reading file as base64...');
-  var base64 = await FileSystem.readAsStringAsync(fileUri, {
+interface ProcessedDocument {
+  pdfUrl: string;
+  pageCount: number;
+  pages: PDFPage[];
+  fullText: string;
+  needsOcr?: boolean;
+}
+
+/**
+ * Read file as base64
+ */
+
+// Refactored: Avoid global regex on large strings, use iterative chunked extraction
+export const basicBinaryExtraction = async (fileUri: string): Promise<ProcessedDocument> => {
+  const base64 = await FileSystem.readAsStringAsync(fileUri, {
     encoding: FileSystem.EncodingType.Base64,
   });
-  console.log('File size:', Math.round(base64.length / 1024), 'KB');
+  const binaryString = atob(base64);
+  const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
+  const OVERLAP = 10000; // 10KB
+  const totalSize = binaryString.length;
+  let position = 0;
+  let chunkNum = 0;
+  const allTexts: string[] = [];
+  while (position < totalSize) {
+    const chunkEnd = Math.min(position + CHUNK_SIZE + OVERLAP, totalSize);
+    const chunk = binaryString.substring(position, chunkEnd);
+    // Use the same iterative extraction as in pdfExtractor
+    const texts = extractTextFromChunk(chunk);
+    allTexts.push(...texts);
+    chunkNum++;
+    position += CHUNK_SIZE;
+  }
+  // Remove duplicates
+  const uniqueTexts = [...new Set(allTexts)];
+  let extractedText = uniqueTexts
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .replace(/([.!?])\s*/g, '$1\n')
+    .trim();
+  // Remove duplicate sentences
+  const sentences = extractedText.split('\n').filter(s => s.trim().length > 5);
+  const uniqueSentences = [...new Set(sentences)];
+  extractedText = uniqueSentences.join('\n');
+  // Estimate pages
+  const estimatedPages = Math.max(Math.ceil(extractedText.length / 3000), 1);
+  // Create pages
+  const pages: PDFPage[] = [];
+  const avgPageLength = Math.max(Math.ceil(extractedText.length / estimatedPages), 1500);
+  let pos = 0;
+  let pageNum = 1;
+  while (pos < extractedText.length && pageNum <= estimatedPages + 10) {
+    let endPos = Math.min(pos + avgPageLength, extractedText.length);
+    const breakPos = extractedText.lastIndexOf('.', endPos);
+    if (breakPos > pos + avgPageLength / 2) {
+      endPos = breakPos + 1;
+    }
+    const pageText = extractedText.slice(pos, endPos).trim();
+    if (pageText.length > 20) {
+      pages.push({ pageNum, text: pageText, imageUrl: undefined });
+      pageNum++;
+    }
+    pos = endPos;
+  }
+  return {
+    pdfUrl: fileUri,
+    pageCount: pages.length || 1,
+    pages,
+    fullText: extractedText,
+  };
+};
+export const readFileAsBase64 = async (fileUri: string): Promise<string> => {
+  console.log('[PDFService] Reading file as base64...');
+  const base64 = await FileSystem.readAsStringAsync(fileUri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+  console.log('[PDFService] File size:', Math.round(base64.length / 1024), 'KB');
   return base64;
 };
 
-// Upload PDF using presigned URL (much faster for large files)
-async function uploadWithPresignedUrl(base64: string): Promise<string> {
-  console.log('Getting presigned URL for upload...');
+/**
+ * Main document processor - 100% FREE local extraction
+ */
+export const processDocument = async (
+  fileUri: string,
+  onProgress?: (progress: number, message: string) => void,
+  existingPdfUrl?: string,
+  existingExtractedData?: any
+): Promise<ProcessedDocument> => {
   
-  // Step 1: Get presigned URL
-  var presignedResp = await pdfCoClient.get(Config.PDFCO_PRESIGNED_URL, {
-    params: { name: 'document.pdf', contenttype: 'application/pdf' },
-    timeout: 30000,
-  });
-  
-  if (presignedResp.data.error || !presignedResp.data.presignedUrl) {
-    throw new Error('Failed to get presigned URL: ' + (presignedResp.data.message || 'Unknown error'));
+  // PRIORITY 1: Use existing/cached data if available
+  if (existingExtractedData?.pages?.length > 0) {
+    console.log('[PDFService] Using cached data');
+    if (onProgress) onProgress(100, 'Using cached data...');
+    
+    return {
+      pdfUrl: existingPdfUrl || fileUri,
+      pageCount: existingExtractedData.totalPages || existingExtractedData.pages.length,
+      pages: existingExtractedData.pages.map((p: any) => ({
+        pageNum: p.pageNumber || p.pageNum,
+        text: p.text || '',
+        imageUrl: p.images?.[0]?.url,
+      })),
+      fullText: existingExtractedData.text || existingExtractedData.pages.map((p: any) => p.text).join('\n'),
+    };
   }
-  
-  var presignedUrl = presignedResp.data.presignedUrl;
-  var fileUrl = presignedResp.data.url;
-  
-  console.log('Uploading via presigned URL...');
-  
-  // Step 2: Convert base64 to binary and upload
-  var binaryData = Uint8Array.from(atob(base64), function(c) { return c.charCodeAt(0); });
-  
-  await axios.put(presignedUrl, binaryData, {
-    headers: { 'Content-Type': 'application/pdf' },
-    timeout: Config.UPLOAD_TIMEOUT,
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-  });
-  
-  console.log('Upload complete via presigned URL');
-  return fileUrl;
+
+  console.log('[PDFService] Starting FREE local extraction...');
+  if (onProgress) onProgress(5, 'Starting extraction...');
+
+  // PRIORITY 2: Try native PdfExtractor (best local extraction)
+  try {
+    if (onProgress) onProgress(10, 'Extracting text...');
+    
+    const extractorResult = await extractPdfText(fileUri, onProgress);
+    
+    if (extractorResult.fullText && extractorResult.fullText.length > 100) {
+      console.log('[PDFService] Native extraction successful:', extractorResult.pageCount, 'pages,', extractorResult.fullText.length, 'chars');
+      
+      if (onProgress) onProgress(100, 'Extraction complete!');
+      
+      return {
+        pdfUrl: fileUri,
+        pageCount: extractorResult.pageCount,
+        pages: extractorResult.pages.map((p: any) => ({
+          pageNum: p.pageNum,
+          text: `=== PAGE ${p.pageNum} ===\n${p.text}`,
+          imageUrl: undefined,
+        })),
+        fullText: extractorResult.fullText,
+      };
+    }
+    
+    console.log('[PDFService] Native extraction got limited text');
+  } catch (error: any) {
+    console.log('[PDFService] Native extraction failed:', error.message);
+  }
+
+  // PRIORITY 3: Basic binary extraction (fallback)
+  try {
+    if (onProgress) onProgress(50, 'Extracting text (method 2)...');
+    
+    const result = await basicBinaryExtraction(fileUri);
+    
+    if (result.fullText && result.fullText.length > 50) {
+      console.log('[PDFService] Basic extraction got:', result.fullText.length, 'chars');
+      
+      if (onProgress) onProgress(100, 'Extraction complete!');
+      return result;
+    }
+  } catch (error: any) {
+    console.log('[PDFService] Basic extraction failed:', error.message);
+  }
+
+  // PRIORITY 4: Google Document AI (1000 pages FREE/month, then $0.001/page)
+  try {
+    if (onProgress) onProgress(60, 'Using Google Document AI...');
+    console.log('[PDFService] Trying Google Document AI...');
+    
+    const base64 = await FileSystem.readAsStringAsync(fileUri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    
+    const result = await callApi('extractPdf', { pdfBase64: base64 });
+    
+    if (result.success && result.text && result.text.length > 50) {
+      console.log('[PDFService] Google Document AI successful:', result.pageCount, 'pages,', result.text.length, 'chars');
+      
+      if (onProgress) onProgress(100, 'Extraction complete!');
+      
+      return {
+        pdfUrl: fileUri,
+        pageCount: result.pageCount || result.pages?.length || 1,
+        pages: (result.pages || []).map((p: any) => ({
+          pageNum: p.pageNum,
+          text: `=== PAGE ${p.pageNum} ===\n${p.text}`,
+          imageUrl: undefined,
+        })),
+        fullText: result.text,
+      };
+    }
+  } catch (error: any) {
+    console.log('[PDFService] Google Document AI failed:', error.message);
+  }
+
+  // If all methods fail, return with flag for manual intervention
+  console.log('[PDFService] All extraction methods failed');
+  if (onProgress) onProgress(100, 'Extraction complete');
+  return {
+    pdfUrl: fileUri,
+    pageCount: 1,
+    pages: [{
+      pageNum: 1,
+      text: '__NEEDS_OCR__', // Flag for the app to try OpenAI Vision OCR
+      imageUrl: undefined,
+    }],
+    fullText: '__NEEDS_OCR__',
+    needsOcr: true, // Flag to trigger OCR in the app
+  };
 }
-
-// Upload PDF to PDF.co cloud (auto-selects best method)
-export var uploadPdf = async function(base64: string): Promise<string> {
-  var fileSizeBytes = base64.length * 0.75; // base64 is ~33% larger than binary
-  
-  // For large files (>10MB), use presigned URL upload
-  if (fileSizeBytes > Config.LARGE_FILE_THRESHOLD) {
-    console.log('Large file detected (' + Math.round(fileSizeBytes / 1024 / 1024) + 'MB), using presigned upload...');
-    try {
-      return await uploadWithPresignedUrl(base64);
-    } catch (err: any) {
-      console.log('Presigned upload failed, falling back to base64:', err.message);
-      // Fall through to base64 upload
-    }
-  }
-  
-  // Standard base64 upload for smaller files
-  console.log('Uploading PDF to cloud...');
-  var response = await pdfCoClient.post(Config.PDFCO_UPLOAD_URL, {
-    file: base64,
-    name: 'document.pdf'
-  });
-  
-  if (response.data.error || !response.data.url) {
-    throw new Error('Upload failed: ' + (response.data.message || 'No URL'));
-  }
-  
-  console.log('Uploaded successfully');
-  return response.data.url;
+export const extractAllText = async (pdfUrl: string, pageCount: number) => {
+  return { text: '', pages: [] };
 };
 
-// Get PDF info (page count, etc)
-export var getPdfInfo = async function(pdfUrl: string): Promise<{ pageCount: number; bookmarks?: string; title?: string }> {
-  try {
-    console.log('Getting PDF info...');
-    var response = await pdfCoClient.post(Config.PDFCO_INFO_URL, { url: pdfUrl }, {
-      timeout: Config.EXTRACT_TIMEOUT,
-    });
-    
-    console.log('PDF info response:', JSON.stringify(response.data));
-    
-    // PDF.co returns "info" object with "PageCount" (capital P)
-    var pageCount = 1;
-    var bookmarks = '';
-    var title = '';
-    
-    if (response.data.info) {
-      pageCount = response.data.info.PageCount || response.data.info.pageCount || 1;
-      bookmarks = response.data.info.Bookmarks || '';
-      title = response.data.info.Title || '';
-    } else if (response.data.pageCount) {
-      pageCount = response.data.pageCount;
-    } else if (response.data.PageCount) {
-      pageCount = response.data.PageCount;
-    }
-    
-    console.log('Detected page count:', pageCount);
-    return { pageCount, bookmarks, title };
-  } catch (err: any) {
-    console.log('Error getting PDF info:', err.message);
-    // If info fails, try to extract text and count pages that way
-    return { pageCount: 1 }; // Will be corrected later
-  }
+export const extractTextWithPages = async (pdfUrl: string, pageCount: number, onProgress?: any) => {
+  return [];
 };
 
-// Extract ALL text from entire PDF at once (much faster and more reliable)
-export var extractAllText = async function(
-  pdfUrl: string,
-  pageCount: number
-): Promise<{ text: string; pages: { pageNum: number; text: string }[] }> {
-  console.log('Extracting text from ALL', pageCount, 'pages...');
-  
-  var pages: { pageNum: number; text: string }[] = [];
-  var allText = '';
-  
-  try {
-    // Extract ALL pages at once using range 1-pageCount
-    var response = await pdfCoClient.post(Config.PDFCO_TEXT_URL, {
-      url: pdfUrl,
-      pages: '1-' + pageCount, // ALL pages
-      inline: true,
-    }, { timeout: Config.EXTRACT_TIMEOUT * 3 }); // Triple timeout for large docs
-    
-    var fullText = '';
-    if (response.data.body) {
-      fullText = response.data.body;
-    } else if (response.data.url) {
-      console.log('Fetching text from URL...');
-      var textResp = await axios.get(response.data.url, { timeout: Config.EXTRACT_TIMEOUT });
-      fullText = textResp.data;
-    }
-    
-    console.log('Extracted', fullText.length, 'characters total');
-    allText = fullText;
-    
-    // PDF.co often separates pages with form feeds or multiple newlines
-    // Split into approximate pages based on content length
-    if (fullText && fullText.length > 0) {
-      // Try to split by form feed character (common page separator)
-      var pageSplit = fullText.split(/\f|\n{4,}/);
-      
-      if (pageSplit.length >= 2 && pageSplit.length <= pageCount * 2) {
-        // Good split - use it
-        var pageNum = 1;
-        pageSplit.forEach(function(pageText: string) {
-          var trimmed = pageText.trim();
-          if (trimmed.length > 20) {
-            pages.push({
-              pageNum: pageNum,
-              text: trimmed,
-            });
-            pageNum++;
-          }
-        });
-      } else {
-        // Split by estimated page length if form feed didn't work
-        var avgPageLength = Math.ceil(fullText.length / pageCount);
-        var chunks = [];
-        var pos = 0;
-        
-        while (pos < fullText.length) {
-          // Try to break at paragraph boundaries
-          var endPos = Math.min(pos + avgPageLength, fullText.length);
-          var breakPos = fullText.lastIndexOf('\n\n', endPos);
-          
-          if (breakPos > pos + avgPageLength / 2) {
-            endPos = breakPos;
-          }
-          
-          chunks.push(fullText.slice(pos, endPos).trim());
-          pos = endPos;
-        }
-        
-        chunks.forEach(function(pageText: string, index: number) {
-          if (pageText.length > 20) {
-            pages.push({
-              pageNum: index + 1,
-              text: pageText,
-            });
-          }
-        });
-      }
-    }
-    
-    console.log('Split into', pages.length, 'content sections');
-    
-  } catch (err: any) {
-    console.log('Error extracting full text:', err.message);
-    // If bulk extraction fails, fall back to chunk extraction
-    pages = await extractTextInChunks(pdfUrl, pageCount);
-    allText = pages.map(p => p.text).join('\n\n');
-  }
-  
-  return { text: allText, pages };
+export const extractTextBulk = async (pdfUrl: string, startPage: number, endPage: number, onProgress?: any) => {
+  return [];
 };
 
-// Fallback: Extract text in chunks if bulk fails
-var extractTextInChunks = async function(
-  pdfUrl: string,
-  pageCount: number
-): Promise<{ pageNum: number; text: string }[]> {
-  console.log('Falling back to chunk extraction...');
-  var pages: { pageNum: number; text: string }[] = [];
-  var chunkSize = 20; // 20 pages per chunk
-  
-  for (var start = 1; start <= pageCount; start += chunkSize) {
-    var end = Math.min(start + chunkSize - 1, pageCount);
-    console.log('Extracting chunk pages', start, '-', end);
-    
-    try {
-      var response = await pdfCoClient.post(Config.PDFCO_TEXT_URL, {
-        url: pdfUrl,
-        pages: start + '-' + end,
-        inline: true,
-      }, { timeout: Config.EXTRACT_TIMEOUT });
-      
-      var chunkText = '';
-      if (response.data.body) {
-        chunkText = response.data.body;
-      } else if (response.data.url) {
-        var textResp = await axios.get(response.data.url);
-        chunkText = textResp.data;
-      }
-      
-      if (chunkText && chunkText.length > 0) {
-        // Assign text to page range
-        var pagesInChunk = end - start + 1;
-        var avgLen = Math.ceil(chunkText.length / pagesInChunk);
-        
-        for (var p = start; p <= end; p++) {
-          var idx = p - start;
-          var pageText = chunkText.slice(idx * avgLen, (idx + 1) * avgLen).trim();
-          if (pageText.length > 20) {
-            pages.push({ pageNum: p, text: pageText });
-          }
-        }
-      }
-    } catch (err) {
-      console.log('Error extracting chunk', start, '-', end);
-    }
-  }
-  
-  return pages;
+export const extractPageImages = async (pdfUrl: string, pages: number[], onProgress?: any) => {
+  return [];
 };
 
-// Legacy: Extract text from specific pages with page numbers (kept for compatibility)
-export var extractTextWithPages = async function(
-  pdfUrl: string, 
-  startPage: number, 
-  endPage: number
-): Promise<{ text: string; pages: { pageNum: number; text: string }[] }> {
-  // Just delegate to extractAllText
-  return await extractAllText(pdfUrl, endPage);
-};
-
-// Extract text from page range (bulk - faster but no page numbers)
-export var extractTextBulk = async function(pdfUrl: string, startPage: number, endPage: number): Promise<string> {
-  var response = await pdfCoClient.post(Config.PDFCO_TEXT_URL, {
-    url: pdfUrl,
-    pages: startPage + '-' + endPage,
-    inline: true,
-  }, { timeout: Config.EXTRACT_TIMEOUT });
-  
-  if (response.data.body) return response.data.body;
-  if (response.data.url) {
-    var textResp = await axios.get(response.data.url);
-    return textResp.data;
-  }
-  return '';
-};
-
-// Convert PDF pages to images (for slides/visual content)
-export var extractPageImages = async function(
-  pdfUrl: string, 
-  startPage: number, 
-  endPage: number
-): Promise<{ pageNum: number; imageUrl: string }[]> {
-  console.log('Converting pages', startPage, '-', endPage, 'to images');
-  
-  var response = await pdfCoClient.post(Config.PDFCO_IMAGES_URL, {
-    url: pdfUrl,
-    pages: startPage + '-' + endPage,
-  }, { timeout: Config.EXTRACT_TIMEOUT });
-  
-  if (response.data.error) {
-    console.log('Image extraction error:', response.data.message);
-    return [];
-  }
-  
-  var images: { pageNum: number; imageUrl: string }[] = [];
-  if (response.data.urls && Array.isArray(response.data.urls)) {
-    response.data.urls.forEach(function(url: string, index: number) {
-      images.push({
-        pageNum: startPage + index,
-        imageUrl: url,
-      });
-    });
-  }
-  
-  console.log('Extracted', images.length, 'page images');
-  return images;
-};
-
-// Full document processing - extracts ALL text from entire PDF
-export var processDocument = async function(
+/**
+ * OCR for scanned PDFs using OpenAI Vision
+ * This uses your existing OpenAI credits (~$0.001-0.003 per page)
+ * Much cheaper than PDF.co!
+ */
+export const performOcrWithOpenAI = async (
   fileUri: string,
   onProgress?: (progress: number, message: string) => void
-): Promise<{
-  pdfUrl: string;
-  pageCount: number;
-  pages: { pageNum: number; text: string; imageUrl?: string }[];
-  fullText: string;
-}> {
-  if (onProgress) onProgress(5, 'Reading document...');
-  var base64 = await readFileAsBase64(fileUri);
-  var fileSizeKB = base64.length / 1024;
-  
-  if (onProgress) onProgress(15, 'Uploading to cloud...');
-  var pdfUrl = await uploadPdf(base64);
-  
-  if (onProgress) onProgress(25, 'Analyzing document structure...');
-  var info = await getPdfInfo(pdfUrl);
-  var pageCount = info.pageCount;
-  var bookmarks = info.bookmarks || '';
-  var title = info.title || '';
-  
-  console.log('Bookmarks length:', bookmarks.length);
-  console.log('Title:', title);
-  
-  // If page count is 1 but file is large, PDF.co info might have failed
-  // Estimate pages based on file size (roughly 100KB per page average for text-heavy PDFs)
-  if (pageCount <= 1 && fileSizeKB > 1000) {
-    // Estimate pages - be generous to ensure we don't miss content
-    var estimatedPages = Math.max(Math.ceil(fileSizeKB / 100), 50);
-    console.log('Page count seems wrong for', fileSizeKB, 'KB file. Estimated pages:', estimatedPages);
-    pageCount = estimatedPages;
-  }
-  
-  console.log('Document has approximately', pageCount, 'pages');
-  
-  if (onProgress) onProgress(35, 'Extracting ALL content...');
-  
-  // Extract ALL text - use "0" for all pages in PDF.co
-  var textResult = await extractAllPagesText(pdfUrl, pageCount);
-  
-  // If text extraction failed but we have bookmarks (table of contents), use that as fallback
-  console.log('Checking bookmarks fallback - text length:', textResult.text.length, ', bookmarks length:', bookmarks.length);
-  
-  if ((!textResult.text || textResult.text.length < 500) && bookmarks && bookmarks.length > 100) {
-    console.log('Text extraction limited, using bookmarks/TOC as content source...');
-    // Parse bookmarks into sections - they contain the full document structure
-    var tocContent = (title ? '# ' + title + '\n\n' : '') + 
-      '## Document Structure and Table of Contents\n\n' + 
-      'This document appears to be scanned/image-based. Here is the complete table of contents:\n\n' +
-      bookmarks.replace(/\\r\\n/g, '\n').replace(/\r\n/g, '\n');
+): Promise<string> => {
+  try {
+    if (onProgress) onProgress(10, 'Preparing for OCR...');
     
-    // Create multiple page entries spread across the actual document
-    // This ensures images from different parts of the document are associated
-    var bookmarkPages: { pageNum: number; text: string }[] = [];
-    var bookmarkLines = tocContent.split('\n').filter(function(l) { return l.trim().length > 10; });
-    var linesPerPage = Math.ceil(bookmarkLines.length / Math.min(pageCount, 50));
+    // Read PDF as base64
+    const base64 = await FileSystem.readAsStringAsync(fileUri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
     
-    for (var i = 0; i < Math.min(pageCount, 50); i++) {
-      var startIdx = i * linesPerPage;
-      var endIdx = Math.min(startIdx + linesPerPage, bookmarkLines.length);
-      var pageText = bookmarkLines.slice(startIdx, endIdx).join('\n');
-      if (pageText.trim().length > 20) {
-        bookmarkPages.push({ pageNum: i + 1, text: pageText });
-      }
+    if (onProgress) onProgress(30, 'Sending to AI for text recognition...');
+    
+    // Create data URL for the image/PDF
+    const dataUrl = `data:application/pdf;base64,${base64}`;
+    
+    // Call OpenAI Vision OCR through your Supabase function
+    const response = await callApi('ocr', {
+      imageUrls: [dataUrl],
+    });
+    
+    if (onProgress) onProgress(90, 'Processing OCR results...');
+    
+    const text = response?.text || '';
+    
+    if (text && text.length > 50) {
+      console.log('[PDFService] OCR successful:', text.length, 'chars');
+      if (onProgress) onProgress(100, 'OCR complete!');
+      return text;
     }
     
-    // If we couldn't split well, create pages with full content but different page numbers
-    if (bookmarkPages.length < 3) {
-      bookmarkPages = [];
-      for (var p = 1; p <= Math.min(pageCount, 30); p++) {
-        bookmarkPages.push({ pageNum: p, text: tocContent });
-      }
-    }
-    
-    textResult = {
-      text: tocContent,
-      pages: bookmarkPages
-    };
-    
-    console.log('Created', bookmarkPages.length, 'page entries from bookmarks');
-    console.log('Bookmarks content length:', tocContent.length);
-    
-    if (onProgress) onProgress(50, 'Using document structure (scanned PDF detected)...');
+    throw new Error('OCR returned insufficient text');
+  } catch (error: any) {
+    console.error('[PDFService] OCR failed:', error.message);
+    throw new Error('Could not read scanned PDF. Please try a text-based PDF.');
   }
-  
-  // Update actual page count based on what we extracted
-  if (textResult.pages.length > 0) {
-    pageCount = Math.max(pageCount, textResult.pages[textResult.pages.length - 1].pageNum);
-  }
-  
-  console.log('Extracted text from', textResult.pages.length, 'sections');
-  console.log('Total text length:', textResult.text.length, 'characters');
-  
-  if (onProgress) onProgress(60, 'Processing visual content...');
-  
-  // Extract page images from across the entire document (for slides in video)
-  // For large documents, extract images from throughout, not just the beginning
-  var totalPagesToExtract = Math.min(pageCount, 50); // Limit to 50 images max
-  var imagePages: { pageNum: number; imageUrl: string }[] = [];
-  
-  if (pageCount <= 50) {
-    // Small document - extract all pages
-    imagePages = await extractPageImages(pdfUrl, 1, pageCount);
-  } else {
-    // Large document - extract evenly distributed pages
-    var step = Math.floor(pageCount / 50);
-    var pagesToExtract: number[] = [];
-    for (var i = 1; i <= pageCount && pagesToExtract.length < 50; i += step) {
-      pagesToExtract.push(i);
-    }
-    console.log('Extracting images from distributed pages:', pagesToExtract.length, 'pages across', pageCount, 'total');
-    
-    // Extract in batches
-    for (var batch = 0; batch < pagesToExtract.length; batch += 10) {
-      var batchPages = pagesToExtract.slice(batch, batch + 10);
-      var startPage = batchPages[0];
-      var endPage = batchPages[batchPages.length - 1];
-      try {
-        var batchImages = await extractPageImages(pdfUrl, startPage, endPage);
-        imagePages = imagePages.concat(batchImages);
-      } catch (err: any) {
-        console.log('Error extracting batch', startPage, '-', endPage, ':', err.message);
-      }
-    }
-  }
-  
-  console.log('Extracted', imagePages.length, 'page images total');
-  
-  var imageMap: { [key: number]: string } = {};
-  imagePages.forEach(function(img) {
-    imageMap[img.pageNum] = img.imageUrl;
-  });
-  
-  // Combine text pages with available images
-  var pages = textResult.pages.map(function(page) {
-    return {
-      pageNum: page.pageNum,
-      text: page.text,
-      imageUrl: imageMap[page.pageNum],
-    };
-  });
-  
-  if (onProgress) onProgress(80, 'Extracted ' + pages.length + ' content sections');
-  
-  return { 
-    pdfUrl, 
-    pageCount: textResult.pages.length || pageCount, 
-    pages, 
-    fullText: textResult.text,
-  };
 };
 
-// Extract ALL pages using "0" parameter (PDF.co means all pages)
-async function extractAllPagesText(
-  pdfUrl: string,
-  estimatedPageCount: number
-): Promise<{ text: string; pages: { pageNum: number; text: string }[] }> {
-  console.log('Extracting ALL pages from PDF...');
+/**
+ * Check if document needs OCR and perform it if needed
+ */
+export const processDocumentWithOcrFallback = async (
+  fileUri: string,
+  onProgress?: (progress: number, message: string) => void
+): Promise<ProcessedDocument> => {
+  // First try local extraction
+  const result = await processDocument(fileUri, onProgress);
   
-  try {
-    // First try regular text extraction
-    var response = await pdfCoClient.post(Config.PDFCO_TEXT_URL, {
-      url: pdfUrl,
-      pages: '0', // 0 = ALL pages
-      inline: true,
-    }, { timeout: Config.EXTRACT_TIMEOUT * 3 }); // Triple timeout for large docs
+  // If local extraction failed (needs OCR), try OpenAI Vision
+  if (result.fullText === '__NEEDS_OCR__' || result.needsOcr) {
+    console.log('[PDFService] Local extraction failed, trying OpenAI Vision OCR...');
     
-    var fullText = '';
-    if (response.data.body) {
-      fullText = response.data.body;
-    } else if (response.data.url) {
-      console.log('Fetching text from URL...');
-      var textResp = await axios.get(response.data.url, { timeout: Config.EXTRACT_TIMEOUT });
-      fullText = textResp.data;
+    if (onProgress) onProgress(50, 'PDF appears scanned, using AI to read...');
+    
+    try {
+      const ocrText = await performOcrWithOpenAI(fileUri, onProgress);
+      
+      return {
+        pdfUrl: fileUri,
+        pageCount: 1,
+        pages: [{ pageNum: 1, text: ocrText, imageUrl: undefined }],
+        fullText: ocrText,
+      };
+    } catch (ocrError: any) {
+      console.error('[PDFService] OCR also failed:', ocrError.message);
+      
+      return {
+        pdfUrl: fileUri,
+        pageCount: 1,
+        pages: [{
+          pageNum: 1,
+          text: 'Could not extract text from this PDF. It may be:\n• A heavily scanned document\n• Password protected\n• Corrupted\n\nTip: Try exporting your document to a new PDF from the original source.',
+          imageUrl: undefined,
+        }],
+        fullText: 'Could not extract text from this PDF.',
+      };
     }
-    
-    console.log('Extracted', fullText.length, 'characters total');
-    
-    // If text extraction got very little content, try OCR mode
-    if (!fullText || fullText.length < 500) {
-      console.log('Low text content, trying OCR extraction...');
-      try {
-        var ocrResponse = await pdfCoClient.post(Config.PDFCO_TEXT_URL, {
-          url: pdfUrl,
-          pages: '0',
-          inline: true,
-          ocrMode: 'auto', // Enable OCR for scanned PDFs
-          ocrLanguages: 'eng',
-        }, { timeout: Config.EXTRACT_TIMEOUT * 4 });
-        
-        if (ocrResponse.data.body && ocrResponse.data.body.length > fullText.length) {
-          fullText = ocrResponse.data.body;
-          console.log('OCR extracted', fullText.length, 'characters');
-        } else if (ocrResponse.data.url) {
-          var ocrTextResp = await axios.get(ocrResponse.data.url, { timeout: Config.EXTRACT_TIMEOUT });
-          if (ocrTextResp.data && ocrTextResp.data.length > fullText.length) {
-            fullText = ocrTextResp.data;
-            console.log('OCR extracted', fullText.length, 'characters');
-          }
-        }
-      } catch (ocrErr: any) {
-        console.log('OCR extraction failed:', ocrErr.message);
-      }
-    }
-    
-    if (!fullText || fullText.length < 100) {
-      console.log('Empty result, trying page range...');
-      // Try explicit range
-      return await extractAllText(pdfUrl, estimatedPageCount);
-    }
-    
-    // Split into pages
-    var pages = splitTextIntoPages(fullText, estimatedPageCount);
-    
-    return { text: fullText, pages };
-    
-  } catch (err: any) {
-    console.log('Error extracting all pages:', err.message);
-    // Fall back to range extraction
-    return await extractAllText(pdfUrl, estimatedPageCount);
   }
-}
+  
+  return result;
+};
 
-// Split extracted text into page sections
-function splitTextIntoPages(
-  fullText: string,
-  estimatedPageCount: number
-): { pageNum: number; text: string }[] {
-  var pages: { pageNum: number; text: string }[] = [];
-  
-  // Try form feed split first (most PDFs use this)
-  var formFeedSplit = fullText.split(/\f/);
-  if (formFeedSplit.length > 1) {
-    console.log('Split by form feed into', formFeedSplit.length, 'pages');
-    formFeedSplit.forEach(function(pageText, index) {
-      var trimmed = pageText.trim();
-      if (trimmed.length > 20) {
-        pages.push({ pageNum: index + 1, text: trimmed });
-      }
-    });
-    if (pages.length > 0) return pages;
-  }
-  
-  // Try double newline split
-  var newlineSplit = fullText.split(/\n{3,}/);
-  if (newlineSplit.length > 2 && newlineSplit.length <= estimatedPageCount * 2) {
-    console.log('Split by newlines into', newlineSplit.length, 'sections');
-    newlineSplit.forEach(function(pageText, index) {
-      var trimmed = pageText.trim();
-      if (trimmed.length > 50) {
-        pages.push({ pageNum: index + 1, text: trimmed });
-      }
-    });
-    if (pages.length > 0) return pages;
-  }
-  
-  // If no good split found, divide by estimated page length
-  var avgPageLength = Math.ceil(fullText.length / Math.max(estimatedPageCount, 10));
-  var pageNum = 1;
-  var pos = 0;
-  
-  while (pos < fullText.length) {
-    var endPos = Math.min(pos + avgPageLength, fullText.length);
+/**
+ * OCR with Vision - wrapper for openai.ts to call
+ */
+export const ocrWithVision = async (
+  fileUri: string,
+  onProgress?: (progress: number, message: string) => void
+): Promise<ProcessedDocument> => {
+  try {
+    const ocrText = await performOcrWithOpenAI(fileUri, onProgress);
     
-    // Try to break at paragraph boundary
-    var breakPos = fullText.lastIndexOf('\n\n', endPos);
-    if (breakPos > pos + avgPageLength / 2) {
-      endPos = breakPos + 2;
+    // Split into pages if text is long enough
+    const pages: PDFPage[] = [];
+    const avgPageLength = 3000;
+    let pos = 0;
+    let pageNum = 1;
+    
+    while (pos < ocrText.length) {
+      let endPos = Math.min(pos + avgPageLength, ocrText.length);
+      // Try to break at sentence boundary
+      const breakPos = ocrText.lastIndexOf('.', endPos);
+      if (breakPos > pos + avgPageLength / 2) {
+        endPos = breakPos + 1;
+      }
+      
+      const pageText = ocrText.slice(pos, endPos).trim();
+      if (pageText.length > 20) {
+        pages.push({ pageNum, text: pageText });
+        pageNum++;
+      }
+      pos = endPos;
     }
     
-    var pageText = fullText.slice(pos, endPos).trim();
-    if (pageText.length > 50) {
-      pages.push({ pageNum, text: pageText });
-      pageNum++;
-    }
-    
-    pos = endPos;
+    return {
+      pdfUrl: fileUri,
+      pageCount: pages.length || 1,
+      pages: pages.length > 0 ? pages : [{ pageNum: 1, text: ocrText }],
+      fullText: ocrText,
+    };
+  } catch (error: any) {
+    throw new Error('Vision OCR failed: ' + (error.message || 'Unknown error'));
   }
-  
-  console.log('Split into', pages.length, 'sections by length');
-  return pages;
-}
+};
 
 export default {
   readFileAsBase64,
-  uploadPdf,
-  getPdfInfo,
   extractAllText,
   extractTextWithPages,
   extractTextBulk,
   extractPageImages,
   processDocument,
+  processDocumentWithOcrFallback,
+  performOcrWithOpenAI,
+  ocrWithVision,
 };

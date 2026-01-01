@@ -2,6 +2,7 @@
 // All backend calls go through here - update once, reflects everywhere
 
 import axios from 'axios';
+import { Alert } from 'react-native';
 import Config from './config';
 
 var apiClient = axios.create({
@@ -15,18 +16,56 @@ var apiClient = axios.create({
   maxBodyLength: Infinity,
 });
 
-// Generic API call
-export var callApi = async function(action: string, data: any): Promise<any> {
-  var response = await apiClient.post(Config.SUPABASE_URL, {
-    action,
-    ...data,
-  });
+// Handle API errors gracefully - show user-friendly message
+var handleAPIError = function(error: any): void {
+  var errorMessage = error?.message || error?.toString() || '';
   
-  if (response.data.error) {
-    throw new Error(response.data.error);
+  // Check if it's a quota/credit error (don't tell user about credits)
+  if (
+    errorMessage.includes('QUOTA_EXCEEDED') ||
+    errorMessage.toLowerCase().includes('quota') ||
+    errorMessage.toLowerCase().includes('insufficient') ||
+    errorMessage.toLowerCase().includes('billing')
+  ) {
+    // Show generic message to user - don't mention credits
+    Alert.alert(
+      '🔧 Service Temporarily Unavailable',
+      'Our AI service is experiencing high demand. Please try again in a few minutes.\n\nIf the problem persists, try again later.',
+      [{ text: 'OK' }]
+    );
   }
-  
-  return response.data;
+};
+
+// Generic API call with error handling
+export var callApi = async function(action: string, data: any): Promise<any> {
+  try {
+    console.log(`API Call: ${action}, data size: ${JSON.stringify(data).length} chars`);
+    
+    var response = await apiClient.post(Config.OPENAI_PROXY_URL, {
+      action,
+      ...data,
+    });
+    
+    console.log(`API Response status: ${response.status}`);
+    
+    if (response.data.error) {
+      console.error(`API Error: ${response.data.error}`);
+      // Check if it's a credit error - show friendly message
+      handleAPIError(response.data.error);
+      throw new Error(response.data.error);
+    }
+    
+    return response.data;
+  } catch (error: any) {
+    console.error('API call failed:', error?.message || error);
+    console.error('Error details:', JSON.stringify(error?.response?.data || {}));
+    
+    // Check for API errors
+    if (error.response?.status === 429 || error.response?.status === 402) {
+      handleAPIError(error);
+    }
+    throw error;
+  }
 };
 
 // Split content into chunks
@@ -54,19 +93,25 @@ var splitIntoChunks = function(content: string, maxSize: number): string[] {
 
 // Summarize content - handles large documents by chunking
 export var summarize = async function(
-  content: string, 
-  options?: { chunkInfo?: string; isCombine?: boolean; includePageRefs?: boolean }
+  content: string,
+  options?: { chunkInfo?: string; isCombine?: boolean; includePageRefs?: boolean; imageUrls?: string[]; includeImages?: boolean }
 ): Promise<string> {
   console.log('Summarizing content of length:', content.length);
   
   // If content fits in one request, send it directly
   if (content.length <= Config.MAX_CONTENT_LENGTH) {
-    var response = await callApi('summarize', {
+    // If images are provided and requested, include them for a richer multimodal summary
+    var payload: any = {
       content: content,
       chunkInfo: options?.chunkInfo,
       isCombine: options?.isCombine,
       includePageRefs: options?.includePageRefs,
-    });
+    };
+    if (options?.includeImages && options?.imageUrls && options.imageUrls.length > 0) {
+      payload.imageUrls = options.imageUrls.slice(0, 20);
+    }
+
+    var response = await callApi('summarize', payload);
     return response.summary || '';
   }
   
@@ -79,11 +124,16 @@ export var summarize = async function(
   
   for (var i = 0; i < chunks.length; i++) {
     console.log('Processing chunk', i + 1, 'of', chunks.length);
-    var chunkResponse = await callApi('summarize', {
+    // Include images only in the first chunk to help grounding without resending many images
+    var chunkPayload: any = {
       content: chunks[i],
       chunkInfo: 'Part ' + (i + 1) + ' of ' + chunks.length,
       includePageRefs: options?.includePageRefs,
-    });
+    };
+    if (i === 0 && options?.includeImages && options?.imageUrls) {
+      chunkPayload.imageUrls = options.imageUrls.slice(0, 20);
+    }
+    var chunkResponse = await callApi('summarize', chunkPayload);
     if (chunkResponse.summary) {
       chunkSummaries.push('## Part ' + (i + 1) + '\n' + chunkResponse.summary);
     }
@@ -95,11 +145,13 @@ export var summarize = async function(
     var combinedContent = chunkSummaries.join('\n\n---\n\n');
     
     // Final combination pass to create coherent summary
-    var combineResponse = await callApi('summarize', {
+    var combinePayload: any = {
       content: combinedContent,
       isCombine: true,
       includePageRefs: options?.includePageRefs,
-    });
+    };
+    if (options?.includeImages && options?.imageUrls) combinePayload.imageUrls = options.imageUrls.slice(0, 20);
+    var combineResponse = await callApi('summarize', combinePayload);
     return combineResponse.summary || combinedContent;
   }
   
@@ -164,7 +216,8 @@ export var generateStudyGuide = async function(
 
 // Generate video script with slides - covers entire document
 export var generateVideoScript = async function(
-  pages: { pageNum: number; text: string; imageUrl?: string }[]
+  pages: { pageNum: number; text: string; imageUrl?: string }[],
+  options?: { language?: 'en' | 'ar' | string; style?: string; useAnimations?: boolean }
 ): Promise<{
   introduction: string;
   sections: { 
@@ -173,6 +226,7 @@ export var generateVideoScript = async function(
     pageRef: number;
     slideUrl?: string;
     keyPoints: string[];
+    visualDirections?: string[];
   }[];
   conclusion: string;
 }> {
@@ -183,11 +237,16 @@ export var generateVideoScript = async function(
   
   console.log('Generating video script for', pages.length, 'pages');
   
-  var response = await callApi('videoWithSlides', {
+  var payload: any = {
     content: (content || '').substring(0, Config.MAX_CONTENT_LENGTH),
     pageCount: pages.length,
     totalPages: pages[pages.length - 1]?.pageNum || pages.length,
-  });
+    language: options?.language || 'en',
+    style: options?.style || 'educational',
+    useAnimations: options?.useAnimations === undefined ? true : !!options?.useAnimations,
+  };
+
+  var response = await callApi('videoWithSlides', payload);
   
   var script = response.videoScript || {
     introduction: 'Welcome to this lesson.',

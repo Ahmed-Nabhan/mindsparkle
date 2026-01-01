@@ -19,6 +19,7 @@ export const colors = {
   disabled: '#9CA3AF',
   
   // Functional colors
+  card: '#FFFFFF',           // Card background
   cardBackground: '#F9FAFB',
   surface: '#F3F4F6',
   shadowColor: '#000000',

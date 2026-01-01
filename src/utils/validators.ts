@@ -30,8 +30,8 @@ export const isValidFileType = (fileName: string, allowedTypes: string[]): boole
   if (isValidExt) return true;
   
   // Also check if filename contains known extensions (for edge cases)
-  const validExtensions = ['.pdf', '. doc', '.docx', '.txt'];
-  return validExtensions. some(function(ext) {
+  const validExtensions = ['.pdf', '.doc', '.docx', '.ppt', '.pptx', '.txt'];
+  return validExtensions.some(function(ext) {
     return lowerFileName.endsWith(ext);
   });
 };

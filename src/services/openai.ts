@@ -10,7 +10,9 @@ export var generateSummary = async function(
   chunks?: string[],
   onProgress?: (progress: number, message: string) => void,
   fileUri?: string,
-  fileType?: string
+  fileType?: string,
+  existingPdfUrl?: string,
+  existingExtractedData?: any
 ): Promise<string> {
   try {
     if (onProgress) onProgress(5, 'Preparing document...');
@@ -20,41 +22,100 @@ export var generateSummary = async function(
       textContent = chunks.join('\n\n');
     }
 
-    // Handle PDF files - extract with page references
+    // PRIORITY 1: Use existing extracted data if available (no API calls needed!)
+    if (existingExtractedData && existingExtractedData.pages && existingExtractedData.pages.length > 0) {
+      console.log('Using cached extracted data for summary');
+      if (onProgress) onProgress(50, 'Generating summary...');
+      
+      var contentWithPages = existingExtractedData.pages.map(function(p: any) {
+        var pageNum = p.pageNumber || p.pageNum;
+        return '=== PAGE ' + pageNum + ' ===\n' + (p.text || '');
+      }).join('\n\n');
+      
+      if (contentWithPages.length < 50) {
+        contentWithPages = existingExtractedData.text || content || '';
+      }
+      
+      // Include images from pages if available to improve multimodal summarization
+      const existingImageUrls = existingExtractedData.pages
+        .filter((p: any) => p.imageUrl)
+        .map((p: any) => p.imageUrl);
+      var summary = await ApiService.summarize(contentWithPages, { includePageRefs: true, includeImages: existingImageUrls.length > 0, imageUrls: existingImageUrls });
+      if (onProgress) onProgress(100, 'Done!');
+      return '# 📚 Document Summary\n*Using cached data - ' + existingExtractedData.totalPages + ' pages*\n\n---\n\n' + summary;
+    }
+    
+    // PRIORITY 2: Use document content directly if sufficient
+    if (textContent && textContent.length > 200) {
+      console.log('Using document content directly');
+      if (onProgress) onProgress(50, 'Analyzing content...');
+      var summary = await ApiService.summarize(textContent);
+      if (onProgress) onProgress(100, 'Done!');
+      return summary;
+    }
+
+    // PRIORITY 3: Handle PDF files - extract with page references (API may fail)
     if (fileUri && fileType && (fileType.indexOf('pdf') >= 0 || fileUri.toLowerCase().endsWith('.pdf'))) {
       
-      // Process document with page numbers and images
-      var doc = await PdfService.processDocument(fileUri, onProgress);
+      // Process document with page numbers - pass existing data to skip re-upload
+      var doc = await PdfService.processDocument(fileUri, onProgress, existingPdfUrl, existingExtractedData);
       
       if (onProgress) onProgress(85, 'Generating summary with page references...');
       
       // Build content with page markers
-      var contentWithPages = '';
+      var pdfContentWithPages = '';
       
       if (doc.pages && doc.pages.length > 0) {
         // Use extracted pages with page markers
-        contentWithPages = doc.pages.map(function(p) {
+        pdfContentWithPages = doc.pages.map(function(p) {
           return '=== PAGE ' + p.pageNum + ' ===\n' + p.text;
         }).join('\n\n');
       } else if (doc.fullText && doc.fullText.length > 50) {
         // Fall back to raw full text if pages extraction failed
-        contentWithPages = doc.fullText;
+        pdfContentWithPages = doc.fullText;
+      }
+      
+      // Check if extraction failed and we need OCR
+      var needsOcr = (doc as any).needsOcr || 
+                     pdfContentWithPages === '__NEEDS_OCR__' || 
+                     pdfContentWithPages.includes('__NEEDS_OCR__') ||
+                     !pdfContentWithPages || 
+                     pdfContentWithPages.length < 50;
+      
+      if (needsOcr) {
+        // Try OpenAI Vision OCR for scanned PDFs
+        if (onProgress) onProgress(70, 'Document appears scanned. Using AI Vision OCR...');
+        console.log('[OpenAI] Attempting Vision OCR for scanned PDF...');
+        
+        try {
+          var ocrResult = await PdfService.ocrWithVision(fileUri, onProgress);
+          if (ocrResult && ocrResult.fullText && ocrResult.fullText.length > 50) {
+            pdfContentWithPages = ocrResult.fullText;
+            if (onProgress) onProgress(85, 'OCR successful! Generating summary...');
+          } else {
+            throw new Error('OCR returned insufficient text');
+          }
+        } catch (ocrError: any) {
+          console.error('[OpenAI] Vision OCR failed:', ocrError.message);
+          throw new Error('Could not extract text from this PDF. The document may be:\n• A scanned image without OCR\n• Password protected\n• Corrupted\n\nTip: Use Google Drive to convert scanned PDFs to text first.');
+        }
       }
       
       // Check if we have enough content to summarize
-      if (!contentWithPages || contentWithPages.length < 50) {
+      if (!pdfContentWithPages || pdfContentWithPages.length < 50) {
         throw new Error('Could not extract text from this PDF. The document may be scanned images or have copy protection. Try a different PDF or upload a text-based document.');
       }
       
       // Summarize with page references
-      var summary = await ApiService.summarize(contentWithPages, { includePageRefs: true });
+      const pdfImageUrls = doc.pages.filter((p: any) => p.imageUrl).map((p: any) => p.imageUrl);
+      var pdfSummary = await ApiService.summarize(pdfContentWithPages, { includePageRefs: true, includeImages: pdfImageUrls.length > 0, imageUrls: pdfImageUrls });
       
       if (onProgress) onProgress(100, 'Done!');
       
       // Add header with document info
       return '# 📚 Document Summary\n' +
         '*' + doc.pageCount + ' pages analyzed with page references*\n\n' +
-        '---\n\n' + summary;
+        '---\n\n' + pdfSummary;
     }
 
     // Non-PDF content
@@ -171,7 +232,7 @@ export var generateVideoScript = async function(
       var doc = await PdfService.processDocument(fileUri, onProgress);
       
       if (onProgress) onProgress(75, 'Creating video lesson script...');
-      var script = await ApiService.generateVideoScript(doc.pages);
+      var script = await ApiService.generateVideoScript(doc.pages, { language: 'en', style: 'educational', useAnimations: true });
       
       if (onProgress) onProgress(100, 'Done!');
       return script;
@@ -187,7 +248,7 @@ export var generateVideoScript = async function(
     
     // Create simple pages array for text content
     var pages = [{ pageNum: 1, text: textContent }];
-    var script = await ApiService.generateVideoScript(pages);
+    var script = await ApiService.generateVideoScript(pages, { language: 'en', style: 'educational', useAnimations: true });
     
     if (onProgress) onProgress(100, 'Done!');
     return script;

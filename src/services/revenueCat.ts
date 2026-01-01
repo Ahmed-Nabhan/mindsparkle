@@ -3,19 +3,18 @@
 
 import { Platform } from 'react-native';
 
-// RevenueCat API Keys - Replace with your actual keys from RevenueCat dashboard
-const REVENUECAT_API_KEY_IOS = 'appl_YOUR_IOS_API_KEY';
+// RevenueCat API Keys
+const REVENUECAT_API_KEY_IOS = 'appl_wcbcmHnxMHWXswtgYXDNZkVrjur';
 const REVENUECAT_API_KEY_ANDROID = 'goog_YOUR_ANDROID_API_KEY';
 
 // Product identifiers - Must match what you set up in App Store Connect / Google Play Console
 export const PRODUCT_IDS = {
-  MONTHLY: 'mindsparkle_pro_monthly',
-  YEARLY: 'mindsparkle_pro_yearly',
-  LIFETIME: 'mindsparkle_pro_lifetime',
+  MONTHLY: 'com.ahmednabhan.mindsparkle.premium.monthly',
+  YEARLY: 'com.ahmednabhan.mindsparkle.premium.yearly',
 };
 
 // Entitlement identifier - The access level in RevenueCat
-export const ENTITLEMENT_ID = 'pro';
+export const ENTITLEMENT_ID = 'MindSparkle Pro';
 
 // Types
 export interface ProductInfo {
@@ -150,14 +149,6 @@ class RevenueCatService {
           period: '7 days',
           cycles: 1,
         },
-      },
-      {
-        identifier: PRODUCT_IDS.LIFETIME,
-        title: 'MindSparkle Pro Lifetime',
-        description: 'One-time purchase, lifetime access',
-        price: '79.99',
-        priceString: '$79.99',
-        currencyCode: 'USD',
       },
     ];
   }

@@ -12,7 +12,7 @@ export const strings = {
     title: 'Learning Documents',
     uploadButton: 'Upload Document',
     selectFile: 'Select a file to upload',
-    supportedFormats: 'Supported formats: PDF, DOCX, TXT',
+    supportedFormats: 'Supported formats: PDF, DOCX, PPTX, TXT',
     noDocuments: 'No documents uploaded yet',
   },
   actions: {

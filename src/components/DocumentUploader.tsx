@@ -25,7 +25,15 @@ export const DocumentUploader: React.FC<DocumentUploaderProps> = ({
     
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: ['application/pdf', 'application/msword', 'application/vnd. openxmlformats-officedocument.wordprocessingml.document', 'text/plain'],
+        type: [
+          'application/pdf',
+          'application/msword',
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'application/vnd.ms-powerpoint',
+          'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          'text/plain',
+          '*/*'  // Fallback to allow all files
+        ],
         copyToCacheDirectory: true,
       });
 
@@ -33,8 +41,8 @@ export const DocumentUploader: React.FC<DocumentUploaderProps> = ({
         const file = result.assets[0];
         
         // Validate file type
-        if (!isValidFileType(file. name, config.supportedFileTypes.documents)) {
-          Alert.alert('Invalid File', 'Please select a PDF, DOC, DOCX, or TXT file.');
+        if (!isValidFileType(file.name, config.supportedFileTypes.documents)) {
+          Alert.alert('Invalid File', 'Please select a PDF, DOC, DOCX, PPT, PPTX, or TXT file.');
           setIsPicking(false);
           return;
         }

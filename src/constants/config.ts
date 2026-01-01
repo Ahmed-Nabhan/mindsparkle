@@ -14,7 +14,7 @@ export const config = {
     freeUserQuizLimit: 5,
   },
   supportedFileTypes: {
-    documents: ['.pdf', '. doc', '.docx', '.txt'],
-    images: ['.png', '.jpg', '. jpeg'],
+    documents: ['.pdf', '.doc', '.docx', '.ppt', '.pptx', '.txt'],
+    images: ['.png', '.jpg', '.jpeg'],
   },
 };
