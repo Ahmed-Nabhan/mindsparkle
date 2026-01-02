@@ -20,6 +20,13 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 });
 
 /**
+ * Get the Supabase URL (for direct API calls like file uploads)
+ */
+export const getSupabaseUrl = (): string => {
+  return SUPABASE_URL;
+};
+
+/**
  * Sign up a new user
  */
 export const signUp = async (email: string, password: string) => {

@@ -616,18 +616,7 @@ export var VideoScreen: React.FC = function() {
           </TouchableOpacity>
         </View>
         <TouchableOpacity style={[styles.startLessonButton, { backgroundColor: selectedTeacher.color }]} onPress={function() { 
-          // Check if user has access to video generation
-          if (!isPremium && !features.canUseVideoGen) {
-            Alert.alert(
-              '🎬 Pro Feature',
-              'Video summaries are a Pro feature. Upgrade to create AI-powered video lessons from your documents!',
-              [
-                { text: 'Maybe Later', style: 'cancel', onPress: function() { navigation.goBack(); } },
-                { text: 'Upgrade to Pro', onPress: function() { navigation.navigate('Paywall', { source: 'video' }); } },
-              ]
-            );
-            return;
-          }
+          // Video generation is FREE for everyone!
           setShowTeacherSelect(false); 
         }}>
           <Text style={styles.startLessonText}>Start Lesson with {selectedTeacher.name} →</Text>

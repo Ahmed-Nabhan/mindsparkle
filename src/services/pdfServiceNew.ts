@@ -1,7 +1,7 @@
 // New PDF Processing Service - No external API needed!
 // Uses local parsing + Supabase Storage for free PDF processing
 
-import * as FileSystem from 'expo-file-system/legacy';
+import * as FileSystem from 'expo-file-system';
 import { supabase } from './supabase';
 import { generateId } from '../utils/helpers';
 
@@ -145,12 +145,15 @@ export const extractTextFromPdf = async (
     extractedText += '\n' + additionalText;
     
     // Clean up the extracted text
-    extractedText = extractedText
-      .replace(/\\n/g, '\n')
-      .replace(/\\r/g, '')
-      .replace(/\s+/g, ' ')
-      .replace(/[^\x20-\x7E\n]/g, ' ')
-      .trim();
+    // Avoid chaining massive regexes
+    extractedText = extractedText.replace(/\\n/g, '\n').replace(/\\r/g, '');
+    
+    // Only run space collapse if size is manageable
+    if (extractedText.length < 1000000) {
+        extractedText = extractedText.replace(/\s+/g, ' ');
+    }
+    
+    extractedText = extractedText.replace(/[^\x20-\x7E\n]/g, ' ').trim();
     
     if (onProgress) onProgress(60, 'Organizing content...');
     

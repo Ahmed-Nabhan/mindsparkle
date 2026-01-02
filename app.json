@@ -4,7 +4,7 @@
     "slug": "mindsparkle",
     "version": "1.0.0",
     "scheme": "mindsparkle",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -46,14 +46,17 @@
         {
           "iCloudContainerEnvironment": "Production"
         }
-      ]
+      ],
+      "expo-sqlite"
     ],
     "extra": {
       "eas": {
         "projectId": "091c8366-02aa-4af6-a727-252b7b4338a8"
       },
       "supabaseUrl": "https://cszorvgzihzamgezlfjj.supabase.co",
-      "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNzem9ydmd6aWh6YW1nZXpsZmpqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjYwNDAzNDYsImV4cCI6MjA4MTYxNjM0Nn0.FWuTPGrWNGLC1TATYYxUiC48QS8GSP5jytkR-Dwq2qM"
+      "supabaseAnonKey": "sb_publishable_n1tFW0G4BgN-bWZIg0HkGw_p3HTIPIq",
+      "revenueCatIosKey": "appl_wcbcmHnxMHWXswtgYXDNZkVrjur",
+      "revenueCatAndroidKey": "CHANGE_ME_ANDROID_KEY"
     },
     "owner": "ahmed_nabhan"
   }

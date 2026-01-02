@@ -83,6 +83,18 @@ const LAB_PLATFORMS = {
     { id: 'flutlab', name: 'FlutLab', description: 'Flutter online IDE', url: 'https://flutlab.io', icon: '🦋', tags: ['Flutter', 'Dart'], color: '#02569B' },
     { id: 'dartpad', name: 'DartPad', description: 'Dart/Flutter playground', url: 'https://dartpad.dev', icon: '🎯', tags: ['Dart', 'Flutter'], color: '#0175C2' },
   ],
+  networking: [
+    { id: 'gns3', name: 'GNS3 Academy', description: 'Network simulation & training', url: 'https://gns3.com/academy', icon: '🌐', tags: ['Cisco', 'Routing', 'Switching'], color: '#00A3E0' },
+    { id: 'packettracer', name: 'Packet Tracer', description: 'Cisco network simulator', url: 'https://www.netacad.com/courses/packet-tracer', icon: '📡', tags: ['Cisco', 'CCNA', 'Network'], color: '#1BA0D7' },
+    { id: 'eve-ng', name: 'EVE-NG Community', description: 'Multi-vendor network emulator', url: 'https://www.eve-ng.net', icon: '🔧', tags: ['Network', 'Multi-vendor', 'Lab'], color: '#4CAF50' },
+    { id: 'labex', name: 'LabEx Networking', description: 'Hands-on network labs', url: 'https://labex.io/courses/linux-networking', icon: '🖥️', tags: ['Linux', 'Networking', 'Hands-on'], color: '#FF6B6B' },
+    { id: 'ipspace', name: 'ipSpace Labs', description: 'Network automation labs', url: 'https://my.ipspace.net/bin/list?id=NetAutSol', icon: '⚙️', tags: ['Automation', 'SDN', 'Network'], color: '#2196F3' },
+    { id: 'subnetting', name: 'Subnet Calculator', description: 'Practice subnetting online', url: 'https://www.subnet-calculator.com', icon: '🔢', tags: ['Subnetting', 'IP', 'CIDR'], color: '#9C27B0' },
+    { id: 'wireshark', name: 'Wireshark SampleCaptures', description: 'Packet analysis practice', url: 'https://wiki.wireshark.org/SampleCaptures', icon: '🦈', tags: ['Wireshark', 'Packets', 'Analysis'], color: '#1679A7' },
+    { id: 'practicalnetworking', name: 'Practical Networking', description: 'Network fundamentals labs', url: 'https://www.practicalnetworking.net', icon: '📚', tags: ['Fundamentals', 'Routing', 'Switching'], color: '#FF9800' },
+    { id: 'networklessons', name: 'NetworkLessons', description: 'Cisco & Juniper labs', url: 'https://networklessons.com', icon: '📖', tags: ['Cisco', 'Juniper', 'BGP'], color: '#E91E63' },
+    { id: 'boson', name: 'Boson NetSim', description: 'Cisco exam simulator', url: 'https://www.boson.com/netsim-cisco-network-simulator', icon: '🎓', tags: ['CCNA', 'CCNP', 'Exam'], color: '#3F51B5' },
+  ],
 };
 
 const CATEGORIES = [
@@ -90,6 +102,7 @@ const CATEGORIES = [
   { id: 'programming', name: 'Programming', icon: '💻' },
   { id: 'datascience', name: 'Data Science', icon: '📊' },
   { id: 'database', name: 'Databases', icon: '🗄️' },
+  { id: 'networking', name: 'Networking', icon: '🌐' },
   { id: 'devops', name: 'DevOps', icon: '🐳' },
   { id: 'cybersecurity', name: 'Security', icon: '🔐' },
   { id: 'algorithms', name: 'Algorithms', icon: '🧩' },

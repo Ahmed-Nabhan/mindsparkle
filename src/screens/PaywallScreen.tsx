@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   Dimensions,
   Image,
+  Alert,
 } from 'react-native';
 import { useRoute, useNavigation } from '@react-navigation/native';
 import { colors } from '../constants/colors';
@@ -35,13 +36,21 @@ const FEATURES = [
 export const PaywallScreen: React.FC = () => {
   const route = useRoute<PaywallScreenProps['route']>();
   const navigation = useNavigation<PaywallScreenProps['navigation']>();
-  const { products, purchaseProduct, restorePurchases, isLoading, isPremium } = usePremiumContext();
+  const { products, purchaseProduct, restorePurchases, isLoading, isPremium, purchasesAvailable } = usePremiumContext();
   const [selectedProduct, setSelectedProduct] = useState(PRODUCT_IDS.YEARLY);
   const [purchasing, setPurchasing] = useState(false);
 
   const featureRequested = route.params?.source;
 
   const handlePurchase = async () => {
+    if (!purchasesAvailable) {
+      Alert.alert(
+        'Purchases Not Available',
+        'In-app purchases are not configured yet. The app developer needs to set up RevenueCat API keys in app.json. Please contact support.',
+        [{ text: 'OK' }]
+      );
+      return;
+    }
     setPurchasing(true);
     const success = await purchaseProduct(selectedProduct);
     setPurchasing(false);

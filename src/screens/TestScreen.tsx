@@ -64,8 +64,32 @@ export const TestScreen: React.FC = () => {
   };
 
   const handleGenerateQuiz = async () => {
-    if (!document?.content) {
-      Alert.alert('Error', 'Document content not available');
+    // ENHANCED: Try multiple sources for content
+    let contentToUse = document?.content || '';
+    
+    // Fallback 1: Try extracted data pages
+    if (!contentToUse && document?.extractedData?.pages) {
+      contentToUse = document.extractedData.pages
+        .map(p => p.text || '')
+        .join('\n\n');
+    }
+    
+    // Fallback 2: Try extracted data text
+    if (!contentToUse && document?.extractedData?.text) {
+      contentToUse = document.extractedData.text;
+    }
+    
+    // Fallback 3: Try chunks
+    if (!contentToUse && document?.chunks && document.chunks.length > 0) {
+      contentToUse = document.chunks.join('\n\n');
+    }
+    
+    // Final check
+    if (!contentToUse || contentToUse.trim().length < 50) {
+      Alert.alert(
+        'Content Not Available', 
+        'Could not extract text from this document. It may be:\n\n• A scanned PDF (image-only)\n• Password protected\n• Corrupted\n\nTry uploading a text-based PDF or different document.'
+      );
       return;
     }
 
@@ -74,12 +98,12 @@ export const TestScreen: React.FC = () => {
 
     try {
       const quiz = await generateQuiz(
-        document.content,
-        document.chunks,
+        contentToUse,
+        document?.chunks,
         questionCount,
         (progress, message) => setLoadingMessage(message),
-        document.fileUri,
-        document.fileType
+        document?.fileUri,
+        document?.fileType
       );
 
       if (quiz && quiz.length > 0) {

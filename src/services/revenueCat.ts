@@ -2,10 +2,12 @@
 // MindSparkle Premium Subscription Management
 
 import { Platform } from 'react-native';
+import Constants from 'expo-constants';
 
-// RevenueCat API Keys
-const REVENUECAT_API_KEY_IOS = 'appl_wcbcmHnxMHWXswtgYXDNZkVrjur';
-const REVENUECAT_API_KEY_ANDROID = 'goog_YOUR_ANDROID_API_KEY';
+// RevenueCat API Keys (do NOT hardcode secrets)
+const extras = Constants.expoConfig?.extra || {};
+const REVENUECAT_API_KEY_IOS = (extras as any).revenueCatIosKey || process.env.EXPO_PUBLIC_REVENUECAT_IOS_KEY || '';
+const REVENUECAT_API_KEY_ANDROID = (extras as any).revenueCatAndroidKey || process.env.EXPO_PUBLIC_REVENUECAT_ANDROID_KEY || '';
 
 // Product identifiers - Must match what you set up in App Store Connect / Google Play Console
 export const PRODUCT_IDS = {
@@ -50,6 +52,7 @@ export interface PurchaseResult {
 class RevenueCatService {
   private isInitialized = false;
   private purchases: any = null;
+  private isAvailable = false;
 
   // Initialize RevenueCat SDK
   async initialize(): Promise<void> {
@@ -64,18 +67,31 @@ class RevenueCatService {
         ? REVENUECAT_API_KEY_IOS 
         : REVENUECAT_API_KEY_ANDROID;
 
+      if (!apiKey || apiKey === 'CHANGE_ME_IOS_KEY' || apiKey === 'CHANGE_ME_ANDROID_KEY') {
+        console.warn('RevenueCat API key not configured. Please add your RevenueCat API key to app.json extra.revenueCatIosKey');
+        this.isAvailable = false;
+        return;
+      }
+
       await Purchases.configure({ apiKey });
       this.isInitialized = true;
+      this.isAvailable = true;
       console.log('RevenueCat initialized successfully');
     } catch (error) {
       console.log('RevenueCat not available (may be in development):', error);
+      this.isAvailable = false;
       // Continue without RevenueCat for development
     }
   }
 
+  // Expose availability so UI can show clear state
+  getAvailable(): boolean {
+    return this.isAvailable;
+  }
+
   // Set user ID for RevenueCat (call after user signs in)
   async setUserId(userId: string): Promise<void> {
-    if (!this.purchases) return;
+    if (!this.purchases || !this.isAvailable) return;
     
     try {
       await this.purchases.logIn(userId);
@@ -87,8 +103,8 @@ class RevenueCatService {
 
   // Get available products/packages
   async getProducts(): Promise<ProductInfo[]> {
-    if (!this.purchases) {
-      // Return mock products for development
+    if (!this.purchases || !this.isAvailable) {
+      // Return mock products for development / unavailable state
       return this.getMockProducts();
     }
 
@@ -155,10 +171,9 @@ class RevenueCatService {
 
   // Purchase a product
   async purchaseProduct(productId: string): Promise<PurchaseResult> {
-    if (!this.purchases) {
-      // Mock purchase for development
-      console.log('Mock purchase:', productId);
-      return { success: true, productIdentifier: productId };
+    if (!this.purchases || !this.isAvailable) {
+      console.log('Purchases unavailable; cannot process purchase');
+      return { success: false, error: 'Purchases unavailable' };
     }
 
     try {
@@ -190,7 +205,7 @@ class RevenueCatService {
 
   // Check subscription status
   async checkSubscriptionStatus(): Promise<SubscriptionInfo> {
-    if (!this.purchases) {
+    if (!this.purchases || !this.isAvailable) {
       // Return mock status for development - change to test different states
       return {
         isActive: false, // Set to true to test pro features in dev

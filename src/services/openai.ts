@@ -12,10 +12,11 @@ export var generateSummary = async function(
   fileUri?: string,
   fileType?: string,
   existingPdfUrl?: string,
-  existingExtractedData?: any
+  existingExtractedData?: any,
+  language?: 'en' | 'ar'
 ): Promise<string> {
   try {
-    if (onProgress) onProgress(5, 'Preparing document...');
+    if (onProgress) onProgress(5, language === 'ar' ? 'جاري تحضير المستند...' : 'Preparing document...');
 
     var textContent = content || '';
     if (chunks && chunks.length > 0) {
@@ -24,8 +25,8 @@ export var generateSummary = async function(
 
     // PRIORITY 1: Use existing extracted data if available (no API calls needed!)
     if (existingExtractedData && existingExtractedData.pages && existingExtractedData.pages.length > 0) {
-      console.log('Using cached extracted data for summary');
-      if (onProgress) onProgress(50, 'Generating summary...');
+      console.log('Using cached extracted data for summary, language:', language);
+      if (onProgress) onProgress(50, language === 'ar' ? 'جاري إنشاء الملخص...' : 'Generating summary...');
       
       var contentWithPages = existingExtractedData.pages.map(function(p: any) {
         var pageNum = p.pageNumber || p.pageNum;
@@ -40,17 +41,21 @@ export var generateSummary = async function(
       const existingImageUrls = existingExtractedData.pages
         .filter((p: any) => p.imageUrl)
         .map((p: any) => p.imageUrl);
-      var summary = await ApiService.summarize(contentWithPages, { includePageRefs: true, includeImages: existingImageUrls.length > 0, imageUrls: existingImageUrls });
-      if (onProgress) onProgress(100, 'Done!');
-      return '# 📚 Document Summary\n*Using cached data - ' + existingExtractedData.totalPages + ' pages*\n\n---\n\n' + summary;
+      var summary = await ApiService.summarize(contentWithPages, { includePageRefs: true, includeImages: existingImageUrls.length > 0, imageUrls: existingImageUrls, language: language || 'en' });
+      if (onProgress) onProgress(100, language === 'ar' ? 'تم!' : 'Done!');
+      
+      var header = language === 'ar' 
+        ? '# 📚 ملخص المستند\n*باستخدام البيانات المخزنة - ' + existingExtractedData.totalPages + ' صفحة*\n\n---\n\n'
+        : '# 📚 Document Summary\n*Using cached data - ' + existingExtractedData.totalPages + ' pages*\n\n---\n\n';
+      return header + summary;
     }
     
     // PRIORITY 2: Use document content directly if sufficient
     if (textContent && textContent.length > 200) {
       console.log('Using document content directly');
-      if (onProgress) onProgress(50, 'Analyzing content...');
-      var summary = await ApiService.summarize(textContent);
-      if (onProgress) onProgress(100, 'Done!');
+      if (onProgress) onProgress(50, language === 'ar' ? 'جاري تحليل المحتوى...' : 'Analyzing content...');
+      var summary = await ApiService.summarize(textContent, { language: language || 'en' });
+      if (onProgress) onProgress(100, language === 'ar' ? 'تم!' : 'Done!');
       return summary;
     }
 
@@ -60,7 +65,7 @@ export var generateSummary = async function(
       // Process document with page numbers - pass existing data to skip re-upload
       var doc = await PdfService.processDocument(fileUri, onProgress, existingPdfUrl, existingExtractedData);
       
-      if (onProgress) onProgress(85, 'Generating summary with page references...');
+      if (onProgress) onProgress(85, language === 'ar' ? 'جاري إنشاء الملخص مع مراجع الصفحات...' : 'Generating summary with page references...');
       
       // Build content with page markers
       var pdfContentWithPages = '';
@@ -84,14 +89,14 @@ export var generateSummary = async function(
       
       if (needsOcr) {
         // Try OpenAI Vision OCR for scanned PDFs
-        if (onProgress) onProgress(70, 'Document appears scanned. Using AI Vision OCR...');
+        if (onProgress) onProgress(70, language === 'ar' ? 'المستند ممسوح ضوئياً. جاري استخدام AI Vision OCR...' : 'Document appears scanned. Using AI Vision OCR...');
         console.log('[OpenAI] Attempting Vision OCR for scanned PDF...');
         
         try {
           var ocrResult = await PdfService.ocrWithVision(fileUri, onProgress);
           if (ocrResult && ocrResult.fullText && ocrResult.fullText.length > 50) {
             pdfContentWithPages = ocrResult.fullText;
-            if (onProgress) onProgress(85, 'OCR successful! Generating summary...');
+            if (onProgress) onProgress(85, language === 'ar' ? 'نجح OCR! جاري إنشاء الملخص...' : 'OCR successful! Generating summary...');
           } else {
             throw new Error('OCR returned insufficient text');
           }
@@ -108,20 +113,21 @@ export var generateSummary = async function(
       
       // Summarize with page references
       const pdfImageUrls = doc.pages.filter((p: any) => p.imageUrl).map((p: any) => p.imageUrl);
-      var pdfSummary = await ApiService.summarize(pdfContentWithPages, { includePageRefs: true, includeImages: pdfImageUrls.length > 0, imageUrls: pdfImageUrls });
+      var pdfSummary = await ApiService.summarize(pdfContentWithPages, { includePageRefs: true, includeImages: pdfImageUrls.length > 0, imageUrls: pdfImageUrls, language: language || 'en' });
       
-      if (onProgress) onProgress(100, 'Done!');
+      if (onProgress) onProgress(100, language === 'ar' ? 'تم!' : 'Done!');
       
       // Add header with document info
-      return '# 📚 Document Summary\n' +
-        '*' + doc.pageCount + ' pages analyzed with page references*\n\n' +
-        '---\n\n' + pdfSummary;
+      var pdfHeader = language === 'ar'
+        ? '# 📚 ملخص المستند\n*تم تحليل ' + doc.pageCount + ' صفحة مع مراجع الصفحات*\n\n---\n\n'
+        : '# 📚 Document Summary\n*' + doc.pageCount + ' pages analyzed with page references*\n\n---\n\n';
+      return pdfHeader + pdfSummary;
     }
 
     // Non-PDF content
-    if (onProgress) onProgress(50, 'Analyzing with AI...');
-    var summary = await ApiService.summarize(textContent);
-    if (onProgress) onProgress(100, 'Done!');
+    if (onProgress) onProgress(50, language === 'ar' ? 'جاري التحليل بالذكاء الاصطناعي...' : 'Analyzing with AI...');
+    var summary = await ApiService.summarize(textContent, { language: language || 'en' });
+    if (onProgress) onProgress(100, language === 'ar' ? 'تم!' : 'Done!');
     return summary;
     
   } catch (error: any) {
@@ -178,8 +184,9 @@ export var generateStudyGuide = async function(
     var pageImages: { pageNum: number; imageUrl: string }[] = [];
     var imageUrls: string[] = [];
     
-    // Handle PDF files
-    if (fileUri && fileType && fileType.indexOf('pdf') >= 0) {
+    // Use existing content - DON'T reprocess PDF (it was already processed at upload)
+    // Only process PDF if we have NO content
+    if ((!textContent || textContent.length < 100) && fileUri && fileType && fileType.indexOf('pdf') >= 0) {
       if (onProgress) onProgress(20, 'Processing PDF...');
       var doc = await PdfService.processDocument(fileUri, onProgress);
       textContent = doc.pages.map(function(p) {
@@ -195,8 +202,8 @@ export var generateStudyGuide = async function(
       imageUrls = pageImages.map(function(p) { return p.imageUrl; });
       
       console.log('Text content length:', textContent.length, 'Image URLs:', imageUrls.length);
-    } else if (chunks && chunks.length > 0) {
-      textContent = chunks.slice(0, 5).join('\n\n');
+    } else if (chunks && chunks.length > 0 && !textContent) {
+      textContent = chunks.join('\n\n');
     }
 
     if (onProgress) onProgress(70, 'Creating study guide...');

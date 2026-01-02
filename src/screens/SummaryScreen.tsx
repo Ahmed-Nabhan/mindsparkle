@@ -1,18 +1,21 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, FlatList, Dimensions } from 'react-native';
 import { useRoute, useNavigation } from '@react-navigation/native';
 import { colors } from '../constants/colors';
 import { Header } from '../components/Header';
 import { Card } from '../components/Card';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { Button } from '../components/Button';
-import { useDocument } from '../hooks/useDocument';
+import { useDocument, isSummaryGenerating } from '../hooks/useDocument';
 import { generateSummary } from '../services/openai';
-import { updateDocumentSummary } from '../services/storage';
+import { updateDocumentSummary, getDocumentById } from '../services/storage';
 import type { MainDrawerScreenProps } from '../navigation/types';
 import type { Document } from '../types/document';
 
 type SummaryScreenProps = MainDrawerScreenProps<'Summary'>;
+type SummaryLanguage = 'en' | 'ar';
+
+const SCREEN_WIDTH = Dimensions.get('window').width;
 
 export const SummaryScreen: React.FC = () => {
   const route = useRoute<SummaryScreenProps['route']>();
@@ -21,14 +24,25 @@ export const SummaryScreen: React.FC = () => {
   const [document, setDocument] = useState<Document | null>(null);
   const [summary, setSummary] = useState<string>('');
   const [summaryImage, setSummaryImage] = useState<string | null>(null);
+  const [documentImages, setDocumentImages] = useState<{pageNum: number, url: string}[]>([]);
   const [displaySummary, setDisplaySummary] = useState<string>('');
   const [isLoading, setIsLoading] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isBackgroundGenerating, setIsBackgroundGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressMessage, setProgressMessage] = useState('');
+  const [summaryLanguage, setSummaryLanguage] = useState<SummaryLanguage>('en');
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     loadDocumentAndSummary();
+    
+    // Cleanup polling on unmount
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
+    };
   }, []);
 
   // Parse summary for images whenever it changes
@@ -50,13 +64,61 @@ export const SummaryScreen: React.FC = () => {
   }, [summary]);
 
   const loadDocumentAndSummary = async () => {
-    const doc = await getDocument(route.params.documentId);
+    const documentId = route.params.documentId;
+    const doc = await getDocument(documentId);
     setDocument(doc);
     
-    if (doc?. summary) {
+    if (doc?.summary) {
+      // Summary already exists - show it instantly
       setSummary(doc.summary);
+      setIsLoading(false);
+    } else if (isSummaryGenerating(documentId)) {
+      // Background generation in progress - poll for completion
+      setIsBackgroundGenerating(true);
+      setIsLoading(false);
+      startPollingForSummary(documentId);
+    } else {
+      setIsLoading(false);
     }
-    setIsLoading(false);
+    
+    // Extract images from document's extracted data
+    if (doc?.extractedData?.images && doc.extractedData.images.length > 0) {
+      const images = doc.extractedData.images.map((img: any) => ({
+        pageNum: img.pageNumber || 0,
+        url: img.url,
+      })).filter((img: any) => img.url);
+      setDocumentImages(images);
+    } else if (doc?.extractedData?.pages) {
+      // Try to get images from pages
+      const images = doc.extractedData.pages
+        .filter((p: any) => p.images && p.images.length > 0)
+        .flatMap((p: any) => p.images.map((img: any) => ({
+          pageNum: p.pageNumber || 0,
+          url: img.url,
+        })))
+        .filter((img: any) => img.url);
+      setDocumentImages(images);
+    }
+  };
+
+  // Poll for summary completion every 1 second
+  const startPollingForSummary = (documentId: string) => {
+    pollIntervalRef.current = setInterval(async () => {
+      // Check if still generating
+      if (!isSummaryGenerating(documentId)) {
+        // Generation complete - fetch updated document
+        const updatedDoc = await getDocumentById(documentId);
+        if (updatedDoc?.summary) {
+          setSummary(updatedDoc.summary);
+          setDocument(updatedDoc);
+        }
+        setIsBackgroundGenerating(false);
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current);
+          pollIntervalRef.current = null;
+        }
+      }
+    }, 1000);
   };
 
   const handleProgress = (prog: number, message:  string) => {
@@ -67,20 +129,41 @@ export const SummaryScreen: React.FC = () => {
   const handleGenerateSummary = async () => {
     if (!document) return;
     
+    // ENHANCED: Try multiple sources for content
+    let contentToUse = document.content || '';
+    
+    // Fallback 1: Try extracted data pages
+    if (!contentToUse && document.extractedData?.pages) {
+      contentToUse = document.extractedData.pages
+        .map(p => p.text || '')
+        .join('\n\n');
+    }
+    
+    // Fallback 2: Try extracted data text
+    if (!contentToUse && document.extractedData?.text) {
+      contentToUse = document.extractedData.text;
+    }
+    
+    // Fallback 3: Try chunks
+    if (!contentToUse && document.chunks && document.chunks.length > 0) {
+      contentToUse = document.chunks.join('\n\n');
+    }
+    
     setIsGenerating(true);
     setProgress(0);
-    setProgressMessage('Starting...');
+    setProgressMessage(summaryLanguage === 'ar' ? 'جاري البدء...' : 'Starting...');
 
     try {
       // Pass existing extracted data to avoid re-uploading to cloud
       const generatedSummary = await generateSummary(
-        document.content || '',
+        contentToUse,
         document.chunks,
         handleProgress,
         document.fileUri,
         document.fileType,
         document.pdfCloudUrl,  // Pass existing cloud URL
-        document.extractedData  // Pass existing extracted data
+        document.extractedData,  // Pass existing extracted data
+        summaryLanguage  // Pass selected language
       );
       setSummary(generatedSummary);
       
@@ -88,7 +171,9 @@ export const SummaryScreen: React.FC = () => {
       await updateDocumentSummary(document.id, generatedSummary);
     } catch (error:  any) {
       console.error('Error generating summary:', error);
-      setSummary('Failed to generate summary:  ' + (error.message || 'Unknown error'));
+      setSummary(summaryLanguage === 'ar' 
+        ? 'فشل في إنشاء الملخص: ' + (error.message || 'خطأ غير معروف')
+        : 'Failed to generate summary:  ' + (error.message || 'Unknown error'));
     } finally {
       setIsGenerating(false);
       setProgress(0);
@@ -133,16 +218,60 @@ export const SummaryScreen: React.FC = () => {
           </Card>
         )}
 
-        {! summary && ! isGenerating && (
+        {!summary && !isGenerating && !isBackgroundGenerating && (
           <Card>
             <Text style={styles.infoText}>
               No summary available yet. Generate one now! 
             </Text>
+            
+            {/* Language Selection */}
+            <View style={styles.languageSelector}>
+              <Text style={styles.languageLabel}>Summary Language:</Text>
+              <View style={styles.languageButtons}>
+                <TouchableOpacity
+                  style={[
+                    styles.languageButton,
+                    summaryLanguage === 'en' && styles.languageButtonActive
+                  ]}
+                  onPress={() => setSummaryLanguage('en')}
+                >
+                  <Text style={[
+                    styles.languageButtonText,
+                    summaryLanguage === 'en' && styles.languageButtonTextActive
+                  ]}>🇺🇸 English</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[
+                    styles.languageButton,
+                    summaryLanguage === 'ar' && styles.languageButtonActive
+                  ]}
+                  onPress={() => setSummaryLanguage('ar')}
+                >
+                  <Text style={[
+                    styles.languageButtonText,
+                    summaryLanguage === 'ar' && styles.languageButtonTextActive
+                  ]}>🇸🇦 العربية</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            
             <Button
-              title="Generate Summary"
+              title={summaryLanguage === 'ar' ? 'إنشاء ملخص' : 'Generate Summary'}
               onPress={handleGenerateSummary}
               style={styles.button}
             />
+          </Card>
+        )}
+
+        {isBackgroundGenerating && (
+          <Card>
+            <Text style={styles.progressTitle}>✨ Summary generating automatically...</Text>
+            <Text style={styles.infoText}>
+              Your summary is being prepared in the background. It will appear here shortly!
+            </Text>
+            <View style={styles.progressBarContainer}>
+              <View style={[styles.progressBar, styles.progressBarAnimated]} />
+            </View>
           </Card>
         )}
 
@@ -170,6 +299,32 @@ export const SummaryScreen: React.FC = () => {
             )}
             
             <Text style={styles.summaryText}>{displaySummary}</Text>
+            
+            {/* Show document images if available */}
+            {documentImages.length > 0 && (
+              <View style={styles.imagesSection}>
+                <Text style={styles.imagesSectionTitle}>📷 Document Images ({documentImages.length})</Text>
+                <ScrollView 
+                  horizontal 
+                  showsHorizontalScrollIndicator={false}
+                  style={styles.imagesScroll}
+                >
+                  {documentImages.map((img, index) => (
+                    <View key={index} style={styles.imageContainer}>
+                      <Image 
+                        source={{ uri: img.url }} 
+                        style={styles.documentImage} 
+                        resizeMode="contain"
+                      />
+                      {img.pageNum > 0 && (
+                        <Text style={styles.imageCaption}>Page {img.pageNum}</Text>
+                      )}
+                    </View>
+                  ))}
+                </ScrollView>
+              </View>
+            )}
+            
             <Button
               title="Regenerate"
               onPress={handleGenerateSummary}
@@ -211,6 +366,34 @@ const styles = StyleSheet.create({
     lineHeight: 24,
     marginBottom: 16,
   },
+  imagesSection: {
+    marginTop: 16,
+    marginBottom: 16,
+  },
+  imagesSectionTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    marginBottom: 8,
+  },
+  imagesScroll: {
+    flexDirection: 'row',
+  },
+  imageContainer: {
+    marginRight: 12,
+    alignItems: 'center',
+  },
+  documentImage: {
+    width: SCREEN_WIDTH * 0.6,
+    height: 200,
+    borderRadius: 8,
+    backgroundColor: colors.surface,
+  },
+  imageCaption: {
+    marginTop: 4,
+    fontSize: 12,
+    color: colors.textSecondary,
+  },
   infoLabel: {
     fontSize: 14,
     fontWeight: 'bold',
@@ -251,6 +434,10 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primary,
     borderRadius: 4,
   },
+  progressBarAnimated: {
+    width: '100%',
+    opacity: 0.7,
+  },
   progressText: {
     fontSize: 14,
     color:  colors.textSecondary,
@@ -273,5 +460,40 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: colors.primary,
     fontWeight: '600',
+  },
+  languageSelector: {
+    marginBottom: 16,
+  },
+  languageLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.text,
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  languageButtons: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  languageButton: {
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 20,
+    borderWidth: 2,
+    borderColor: colors.border,
+    backgroundColor: colors.surface,
+  },
+  languageButtonActive: {
+    borderColor: colors.primary,
+    backgroundColor: colors.primary + '15',
+  },
+  languageButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.textSecondary,
+  },
+  languageButtonTextActive: {
+    color: colors.primary,
   },
 });

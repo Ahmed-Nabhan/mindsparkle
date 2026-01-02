@@ -7,6 +7,7 @@ import revenueCatService, {
   ENTITLEMENT_ID 
 } from '../services/revenueCat';
 import { useAuth } from './AuthContext';
+import * as CloudStorage from '../services/cloudStorageService';
 
 // Feature limits for free tier
 export const FREE_TIER_LIMITS = {
@@ -14,7 +15,7 @@ export const FREE_TIER_LIMITS = {
   maxQuizzesPerDay: 3,
   maxFlashcardsPerDoc: 20,
   maxChatMessages: 10,
-  canUseVideoGen: false,
+  canUseVideoGen: true, // Video is FREE for everyone!
   canUseAdvancedAnalytics: false,
   canUseCloudSync: false,
   canExportPdf: false,
@@ -55,6 +56,7 @@ export interface PremiumFeatures {
 interface PremiumContextType {
   isPremium: boolean;
   isLoading: boolean;
+  purchasesAvailable: boolean;
   subscription: SubscriptionInfo | null;
   products: ProductInfo[];
   features: PremiumFeatures;
@@ -87,6 +89,7 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
   
   const [isPremium, setIsPremium] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [purchasesAvailable, setPurchasesAvailable] = useState(true);
   const [subscription, setSubscription] = useState<SubscriptionInfo | null>(null);
   const [products, setProducts] = useState<ProductInfo[]>([]);
   const [features, setFeatures] = useState<PremiumFeatures>(FREE_TIER_LIMITS);
@@ -125,6 +128,17 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
     try {
       setIsLoading(true);
       await revenueCatService.initialize();
+      const available = revenueCatService.getAvailable();
+      setPurchasesAvailable(available);
+      if (!available) {
+        // Don't show alert - just silently fail and use free tier
+        console.log('RevenueCat not available - using free tier');
+        setProducts([]);
+        setSubscription(null);
+        setIsPremium(false);
+        setFeatures(FREE_TIER_LIMITS);
+        return;
+      }
       await checkPremiumStatus();
       await loadProducts();
     } catch (error) {
@@ -135,6 +149,10 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
   };
 
   const loadProducts = async () => {
+    if (!purchasesAvailable) {
+      setProducts([]);
+      return;
+    }
     const availableProducts = await revenueCatService.getProducts();
     setProducts(availableProducts);
   };
@@ -145,16 +163,25 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
       setSubscription(status);
       setIsPremium(status.isActive);
       setFeatures(status.isActive ? PRO_TIER_LIMITS : FREE_TIER_LIMITS);
+      
+      // Update cloud storage limit based on premium status
+      if (user?.id) {
+        CloudStorage.updateStorageLimit(user.id, status.isActive).catch(console.error);
+      }
     } catch (error) {
       console.error('Error checking premium status:', error);
       setIsPremium(false);
       setFeatures(FREE_TIER_LIMITS);
     }
-  }, []);
+  }, [user?.id]);
 
   const purchaseProduct = async (productId: string): Promise<boolean> => {
     try {
       setIsLoading(true);
+      if (!purchasesAvailable) {
+        Alert.alert('Purchases unavailable', 'In-app purchases are not available on this device.');
+        return false;
+      }
       const result = await revenueCatService.purchaseProduct(productId);
       
       if (result.success) {
@@ -266,6 +293,7 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
       value={{
         isPremium: effectiveIsPremium,
         isLoading,
+        purchasesAvailable,
         subscription,
         products,
         features: effectiveFeatures,

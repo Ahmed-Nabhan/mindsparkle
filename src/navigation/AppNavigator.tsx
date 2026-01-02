@@ -39,15 +39,16 @@ const MainDrawer = () => {
     <Drawer.Navigator
       drawerContent={(props) => <Sidebar {...props} />}
       screenOptions={{
-        headerStyle: {
-          backgroundColor: colors.primary,
-        },
-        headerTintColor: '#FFFFFF',
-        headerTitleStyle: {
-          fontWeight:  'bold',
-        },
+        headerShown: false,
         drawerActiveTintColor: colors.primary,
         drawerInactiveTintColor:  colors.textSecondary,
+        drawerType: 'front',
+        overlayColor: 'rgba(0,0,0,0.5)',
+        swipeEnabled: true,
+        swipeEdgeWidth: 30,
+        drawerStyle: {
+          width: 280,
+        },
       }}
     >
       <Drawer.Screen 

@@ -54,8 +54,32 @@ export const InterviewScreen: React.FC = () => {
   };
 
   const generateInterviewQuestions = async () => {
-    if (!selectedDocument?.content) {
-      Alert.alert('Error', 'Document content not available');
+    // ENHANCED: Try multiple sources for content
+    let contentToUse = selectedDocument?.content || '';
+    
+    // Fallback 1: Try extracted data pages
+    if (!contentToUse && selectedDocument?.extractedData?.pages) {
+      contentToUse = selectedDocument.extractedData.pages
+        .map(p => p.text || '')
+        .join('\n\n');
+    }
+    
+    // Fallback 2: Try extracted data text
+    if (!contentToUse && selectedDocument?.extractedData?.text) {
+      contentToUse = selectedDocument.extractedData.text;
+    }
+    
+    // Fallback 3: Try chunks
+    if (!contentToUse && selectedDocument?.chunks && selectedDocument.chunks.length > 0) {
+      contentToUse = selectedDocument.chunks.join('\n\n');
+    }
+    
+    // Final check
+    if (!contentToUse || contentToUse.trim().length < 50) {
+      Alert.alert(
+        'Content Not Available', 
+        'Could not extract text from this document. It may be:\n\n• A scanned PDF (image-only)\n• Password protected\n• Corrupted\n\nTry uploading a text-based PDF or different document.'
+      );
       return;
     }
 
@@ -67,7 +91,7 @@ export const InterviewScreen: React.FC = () => {
       const prompt = `Based on this document content, generate ${questionCount} interview questions that would help someone prepare for a job interview related to this material. ${typeFilter}
 
 Document content:
-${selectedDocument.content.substring(0, 8000)}
+${contentToUse.substring(0, 8000)}
 
 Return a JSON array with this format:
 [

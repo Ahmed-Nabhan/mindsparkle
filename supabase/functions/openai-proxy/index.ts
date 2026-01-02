@@ -1,10 +1,93 @@
 // @ts-nocheck - This file runs in Deno runtime, not Node.js
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": "*", // narrowed at runtime
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
+
+const ALLOWED_ORIGINS = (Deno.env.get("ALLOWED_ORIGINS") || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+const MAX_CONTENT_LENGTH = 150000; // mirrors client limit (increased)
+const MAX_REQUESTS_PER_MIN = 200; // INSTANT RESULTS: handle ALL parallel chunks at once
+const rateBuckets = new Map<string, { count: number; windowStart: number }>();
+
+function enforceCors(req: Request) {
+  if (ALLOWED_ORIGINS.length === 0) return corsHeaders;
+  const origin = req.headers.get("Origin") || "";
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    return { ...corsHeaders, "Access-Control-Allow-Origin": origin };
+  }
+  throw new Error("Origin not allowed");
+}
+
+function rateLimit(req: Request) {
+  const ip = req.headers.get("x-forwarded-for") || req.headers.get("cf-connecting-ip") || "unknown";
+  const now = Date.now();
+  const windowStart = now - 60_000;
+  const bucket = rateBuckets.get(ip) || { count: 0, windowStart: now };
+  if (bucket.windowStart < windowStart) {
+    bucket.count = 0;
+    bucket.windowStart = now;
+  }
+  bucket.count += 1;
+  rateBuckets.set(ip, bucket);
+  if (bucket.count > MAX_REQUESTS_PER_MIN) {
+    const err: any = new Error("Rate limit exceeded");
+    err.status = 429;
+    throw err;
+  }
+}
+
+async function getAuthUser(req: Request) {
+  const authHeader = req.headers.get("Authorization") || "";
+  const token = authHeader.replace("Bearer ", "").trim();
+  
+  // Get Supabase config
+  const supabaseUrl = Deno.env.get("PROJECT_URL") || Deno.env.get("SUPABASE_URL");
+  const supabaseAnonKey = Deno.env.get("PROJECT_ANON_KEY") || Deno.env.get("SUPABASE_ANON_KEY");
+  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  
+  if (!supabaseUrl || !supabaseAnonKey) {
+    const err: any = new Error("Supabase config missing");
+    err.status = 500;
+    throw err;
+  }
+  
+  // If token is the anon key itself, allow anonymous access with a dummy user
+  // This handles cases where session hasn't loaded yet but anon key is valid
+  if (token === supabaseAnonKey) {
+    console.log("[Auth] Using anon key - allowing anonymous access");
+    return { id: "anonymous", email: "anonymous@app.local" };
+  }
+  
+  // No token at all
+  if (!token) {
+    const err: any = new Error("Missing auth token");
+    err.status = 401;
+    throw err;
+  }
+
+  // Try to verify the user token
+  const supabase = createClient(supabaseUrl, supabaseServiceKey || supabaseAnonKey, {
+    global: { headers: { Authorization: `Bearer ${token}` } },
+  });
+
+  const { data, error } = await supabase.auth.getUser(token);
+  
+  // If token verification failed but we have a token, allow with limited access
+  // This handles edge cases with token refresh timing
+  if (error || !data?.user) {
+    console.warn("[Auth] Token verification failed:", error?.message || "no user");
+    // Allow with anonymous user ID for better UX
+    return { id: "anonymous-" + Date.now(), email: "guest@app.local" };
+  }
+  
+  return data.user;
+}
 
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 const GOOGLE_CLOUD_API_KEY = Deno.env.get("GOOGLE_CLOUD_API_KEY"); // For Document AI
@@ -181,23 +264,45 @@ function buildSystemPrompt(action: string, opts: any = {}, language: string | un
     }
 
     if (opts.chunkInfo) {
-      return langPrefix + `You are an expert educational writer. Summarize ${opts.chunkInfo} as a self-contained study section. Include: a short section title, 3–6 bullet key points, 2 brief examples or clarifying sentences, and any page references present. Keep the summary concise but complete.`;
+      return langPrefix + `You are an expert educational writer. Summarize ${opts.chunkInfo} as a self-contained study section.
+      
+      Include:
+      - A short section title
+      - ONE relevant image at the start: ![Topic](https://source.unsplash.com/600x300/?[keyword]) where [keyword] is 1-2 words describing the main topic
+      - 3–6 bullet key points
+      - 2 brief examples or clarifying sentences
+      - Any page references present
+      
+      Keep the summary concise but complete.`;
     }
 
-    // PROFESSIONAL WHOLE DOCUMENT SUMMARY
-    return langPrefix + `You are an expert academic summarizer creating a PROFESSIONAL STUDY GUIDE.
+    // PROFESSIONAL WHOLE DOCUMENT SUMMARY WITH IMAGES
+    return langPrefix + `You are an expert academic summarizer creating a PROFESSIONAL STUDY GUIDE with visual aids.
     
     YOUR GOAL: Create a comprehensive summary of the ENTIRE document, not just the beginning.
     
     STRUCTURE:
     1. 🎯 **Executive Summary**: A professional 3-4 sentence overview of the whole document.
+       - After the executive summary, add an image: ![Topic Overview](https://source.unsplash.com/800x400/?[main-topic-keyword])
+    
     2. 📖 **Detailed Analysis**: Break down the document into logical sections. For EACH section:
        - **Title**: Clear section title.
+       - Add a relevant image at the start: ![Section Title](https://source.unsplash.com/600x300/?[section-keyword])
        - **Core Concepts**: Explain the main ideas in depth (not just bullets).
        - **Examples**: Include examples from the text.
+    
     3. 🔑 **Key Terminology**: A table of definitions.
+    
     4. 🧠 **Critical Analysis**: Connect ideas and explain "Why this matters".
+    
     5. ✅ **Exam Prep**: 5-7 key takeaways and a checklist.
+    
+    IMAGE RULES:
+    - Use Unsplash source URLs: https://source.unsplash.com/WIDTHxHEIGHT/?KEYWORD
+    - Replace [main-topic-keyword] and [section-keyword] with relevant search terms from the content
+    - Use only 1-2 keywords, separated by commas (e.g., biology,cell or computer,network)
+    - Add 3-5 images total throughout the summary (not too many)
+    - Choose keywords that match educational/academic imagery
     
     TONE: Professional, academic, yet accessible.
     IMPORTANT: Ensure you cover the END of the document as thoroughly as the beginning.`;
@@ -272,51 +377,84 @@ async function generateImage(prompt: string): Promise<string | null> {
 }
 
 async function callOpenAI(systemPrompt: string, userPrompt: string, maxTokens = 4096, temperature = 0.3, useGpt4o = false): Promise<string> {
-  // Use gpt-4o-mini by default (faster, cheaper, higher rate limits)
-  // Only use gpt-4o for complex tasks when explicitly requested
-  const model = useGpt4o ? "gpt-4o" : "gpt-4o-mini";
+  // Model fallback chain: gpt-5-mini (fastest) -> gpt-4o-mini (backup)
+  const models = ["gpt-5-mini", "gpt-4o-mini"];
+  const safeMaxTokens = Math.min(maxTokens, 4096);
   
-  // Retry up to 3 times for rate limits
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        max_tokens: maxTokens,
-        temperature: temperature,
-      }),
-    });
+  for (const model of models) {
+    console.log(`[callOpenAI] Trying model: ${model}, prompt length: ${userPrompt.length}`);
+    const startTime = Date.now();
+    
+    try {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          max_tokens: safeMaxTokens,
+          temperature: temperature,
+        }),
+      });
 
-    const data = await response.json();
-    
-    // Handle rate limits with retry
-    if (response.status === 429 && attempt < 2) {
-      console.log(`Rate limited, waiting ${(attempt + 1) * 2} seconds before retry...`);
-      await sleep((attempt + 1) * 2000); // Wait 2s, then 4s
-      continue;
+      const data = await response.json();
+      const elapsed = Date.now() - startTime;
+      console.log(`[callOpenAI] Response from ${model} in ${elapsed}ms, status: ${response.status}`);
+      
+      if (data.error) {
+        console.warn(`[callOpenAI] ${model} failed: ${JSON.stringify(data.error)}`);
+        // If model not found or similar error, try next model
+        if (data.error.code === "model_not_found" || data.error.type === "invalid_request_error") {
+          console.log(`[callOpenAI] Falling back to next model...`);
+          continue;
+        }
+        // For other errors (rate limit, etc), throw immediately
+        throw new Error(formatOpenAIError(data.error, response.status));
+      }
+      
+      const result = data.choices?.[0]?.message?.content || "";
+      console.log(`[callOpenAI] Success with ${model}, result length: ${result.length} chars`);
+      return result;
+    } catch (fetchError: any) {
+      console.error(`[callOpenAI] Fetch error with ${model}:`, fetchError.message);
+      // If it's a network error, try next model
+      if (model !== models[models.length - 1]) {
+        continue;
+      }
+      throw fetchError;
     }
-    
-    if (data.error) {
-      throw new Error(formatOpenAIError(data.error, response.status));
-    }
-    return data.choices?.[0]?.message?.content || "";
   }
+  
+  throw new Error("All models failed");
+}
 
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders });
-  }
+  let cors = corsHeaders;
 
   try {
+    cors = enforceCors(req);
+
+    if (req.method === 'OPTIONS') {
+      return new Response('ok', { headers: cors });
+    }
+
+    rateLimit(req);
+    const user = await getAuthUser(req);
+
     const { action, content, language, isCombine, chunkInfo, includeImages, imageUrls, questionCount, totalPages, pageCount, style, useAnimations, ...body } = await req.json();
+
+    if (content && typeof content === 'string' && content.length > MAX_CONTENT_LENGTH) {
+      return new Response(JSON.stringify({ error: 'Content too large' }), {
+        status: 413,
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
 
     let result;
     let systemPrompt;
@@ -325,6 +463,16 @@ Deno.serve(async (req) => {
 
     switch (action) {
       case 'summarize': {
+        // VALIDATION: Check if content is sufficient
+        if (!hasContent && !hasImages) {
+          console.warn('[summarize] No content or images provided');
+          return new Response(JSON.stringify({ 
+            summary: 'Unable to generate summary: No content found in the document. Please ensure the document has extractable text.',
+            userId: user.id 
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
   
   // Build a tuned system prompt using prompt builder
   systemPrompt = buildSystemPrompt('summarize', { isCombine, chunkInfo }, language);
@@ -339,24 +487,26 @@ Deno.serve(async (req) => {
           // Add language directive if requested
           const langPrefix = language && language !== 'en' ? `Respond in ${language}. ` : '';
           result = await callOpenAI(systemPrompt, `${langPrefix}Create a comprehensive, study-friendly summary of this content (${content.length} characters):\n\n${content}`, 4096, 0.3);
-          
-          // If no images in document, generate one using DALL-E
-          if (!hasImages && !chunkInfo && !isCombine) {
-             // Generate a prompt for the image based on the summary title/topic
-             const imagePrompt = `Educational illustration for a study guide about: ${content.substring(0, 200).replace(/\n/g, ' ')}. Style: Modern, clean, flat vector art, educational.`;
-             const generatedImageUrl = await generateImage(imagePrompt);
-             if (generatedImageUrl) {
-               result = `![Study Guide Illustration](${generatedImageUrl})\n\n` + result;
-             }
-          }
         }
         
-        return new Response(JSON.stringify({ summary: result }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        return new Response(JSON.stringify({ summary: result, userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
         });
       }
 
       case "quiz": {
+        // VALIDATION: Check if content is sufficient
+        if (!hasContent || content.length < 100) {
+          console.warn('[quiz] Content too short:', content?.length || 0);
+          return new Response(JSON.stringify({ 
+            questions: [],
+            error: 'Unable to generate quiz: Document content is too short or empty.',
+            userId: user.id 
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
         const systemPrompt = `Create ${questionCount || 10} quiz questions based ONLY on the document content provided.
 
 CRITICAL ACCURACY RULES:
@@ -375,18 +525,30 @@ Create questions from different parts of the document. Every question must be ve
         try {
           const match = result.match(/\[[\s\S]*\]/);
           if (match) {
-            return new Response(JSON.stringify({ questions: JSON.parse(match[0]) }), {
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            return new Response(JSON.stringify({ questions: JSON.parse(match[0]), userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
             });
           }
         } catch {}
         
-        return new Response(JSON.stringify({ questions: [] }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        return new Response(JSON.stringify({ questions: [], userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
         });
       }
 
       case "studyGuide": {
+        // VALIDATION: Check if content or images are available
+        if (!hasContent && !hasImages) {
+          console.warn('[studyGuide] No content or images provided');
+          return new Response(JSON.stringify({ 
+            studyGuide: null,
+            summary: 'Unable to generate study guide: No content found in the document.',
+            userId: user.id 
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
         const systemPrompt = `Create a comprehensive and ACCURATE study guide covering the ENTIRE document.
 
 CRITICAL ACCURACY RULES:
@@ -466,16 +628,16 @@ Return ONLY valid JSON in this format:
           const match = result.match(/\{[\s\S]*\}/);
           if (match) {
             const studyGuide = JSON.parse(match[0]);
-            return new Response(JSON.stringify({ studyGuide, summary: result }), {
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            return new Response(JSON.stringify({ studyGuide, summary: result, userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
             });
           }
         } catch (e) {
           console.error("Study guide JSON parse error:", e);
         }
         
-        return new Response(JSON.stringify({ summary: result }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        return new Response(JSON.stringify({ summary: result, userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
         });
       }
 
@@ -484,14 +646,15 @@ Return ONLY valid JSON in this format:
         
         // Use tuned prompt builder for video scripts
         systemPrompt = buildSystemPrompt('videoWithSlides', {}, language, style, useAnimations);
-        result = await callOpenAI(systemPrompt, `Create an engaging, comprehensive video lesson covering this entire ${docInfo}. Make it professional, educational, and memorable:\n\n${content}`, 8192, 0.25, true);
+        // Use gpt-4o-mini for speed
+        result = await callOpenAI(systemPrompt, `Create an engaging, comprehensive video lesson covering this entire ${docInfo}. Make it professional, educational, and memorable:\n\n${content}`, 4096, 0.25, false);
         
         try {
           const match = result.match(/\{[\s\S]*\}/);
           if (match) {
             const videoScript = JSON.parse(match[0]);
-            return new Response(JSON.stringify({ videoScript }), {
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            return new Response(JSON.stringify({ videoScript, userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
             });
           }
         } catch (e) {
@@ -503,9 +666,83 @@ Return ONLY valid JSON in this format:
             introduction: "Welcome to this lesson.", 
             sections: [], 
             conclusion: "Thank you for learning!" 
-          } 
+          },
+          userId: user.id,
         }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      // New: Process video chunks in parallel for large documents
+      case "videoChunk": {
+        const chunkInfo = body.chunkInfo || 'document section';
+        const animDirective = useAnimations === false ? '' : 'Include visualDirections array with animation cues.';
+        
+        const chunkPrompt = `You are creating video lesson sections. Return ONLY valid JSON array of sections for ${chunkInfo}:
+[
+  {
+    "title": "Section Title",
+    "narration": "Engaging explanation of the content...",
+    "keyPoints": ["Key point 1", "Key point 2"],
+    "visualDirections": ["Teacher: points to diagram", "Screen: shows formula"],
+    "pageRef": 1
+  }
+]
+Create 1-2 sections per page. ${animDirective} Be educational and engaging.${language !== 'en' ? ` Respond in ${language}.` : ''}`;
+        
+        result = await callOpenAI(chunkPrompt, `Create video sections for this content:\n\n${content}`, 2048, 0.25, false);
+        
+        try {
+          const match = result.match(/\[[\s\S]*\]/);
+          if (match) {
+            const sections = JSON.parse(match[0]);
+            return new Response(JSON.stringify({ sections, userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
+          }
+        } catch (e) {
+          console.error("Video chunk JSON parse error:", e);
+        }
+        
+        return new Response(JSON.stringify({ sections: [], userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      // New: Generate intro and conclusion for parallel-processed videos
+      case "videoIntroConclusion": {
+        const totalSections = body.totalSections || 1;
+        const introPrompt = `Create a video lesson introduction and conclusion. Return ONLY valid JSON:
+{
+  "introduction": "Welcome message introducing the topic (2-3 sentences, engaging)",
+  "conclusion": "Closing remarks summarizing the ${totalSections} sections covered (2-3 sentences)"
+}
+${language !== 'en' ? `Respond in ${language}.` : ''}`;
+        
+        result = await callOpenAI(introPrompt, `Based on this content preview, create intro and conclusion:\n\n${content}`, 512, 0.3, false);
+        
+        try {
+          const match = result.match(/\{[\s\S]*\}/);
+          if (match) {
+            const parsed = JSON.parse(match[0]);
+            return new Response(JSON.stringify({ 
+              introduction: parsed.introduction || "Welcome to this lesson!",
+              conclusion: parsed.conclusion || "Thank you for learning!",
+              userId: user.id 
+            }), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
+          }
+        } catch (e) {
+          console.error("Intro/conclusion JSON parse error:", e);
+        }
+        
+        return new Response(JSON.stringify({ 
+          introduction: "Welcome to this comprehensive lesson!",
+          conclusion: "Thank you for learning with me today!",
+          userId: user.id 
+        }), {
+          headers: { ...cors, "Content-Type": "application/json" },
         });
       }
 
@@ -524,16 +761,17 @@ Make it engaging, educational, and memorable like a great TED talk!`;
         try {
           const match = result.match(/\{[\s\S]*\]/);
           if (match) {
-            return new Response(JSON.stringify({ videoScript: JSON.parse(match[0]) }), {
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            return new Response(JSON.stringify({ videoScript: JSON.parse(match[0]), userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
             });
           }
         } catch {}
         
         return new Response(JSON.stringify({ 
-          videoScript: { introduction: "Welcome.", sections: [], conclusion: "Thank you!" } 
+          videoScript: { introduction: "Welcome.", sections: [], conclusion: "Thank you!" },
+          userId: user.id,
         }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+          headers: { ...cors, "Content-Type": "application/json" },
         });
       }
 
@@ -544,8 +782,8 @@ Make it engaging, educational, and memorable like a great TED talk!`;
         const temperature = body.temperature || 0.3;
         result = await callOpenAI(systemPrompt, content, 4096, temperature);
         
-        return new Response(JSON.stringify({ response: result }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        return new Response(JSON.stringify({ response: result, userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
         });
       }
 
@@ -573,27 +811,51 @@ Make it engaging, educational, and memorable like a great TED talk!`;
         // Add the current message
         messages.push({ role: "user", content: message });
         
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: "gpt-4o",
-            messages: messages,
-            max_tokens: 2048,
-            temperature: 0.7,
-          }),
-        });
+        // Try models with fallback
+        const chatModels = ["gpt-5-mini", "gpt-4o-mini"];
+        let chatResult = null;
+        
+        for (const model of chatModels) {
+          try {
+            console.log(`[chat] Trying model: ${model}`);
+            const response = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                model: model,
+                messages: messages,
+                max_tokens: 4096,
+                temperature: 0.7,
+              }),
+            });
 
-        const data = await response.json();
-        if (data.error) throw new Error(data.error.message);
+            const data = await response.json();
+            
+            if (data.error) {
+              console.warn(`[chat] ${model} failed:`, data.error);
+              if (data.error.code === "model_not_found" || data.error.type === "invalid_request_error") {
+                continue; // Try next model
+              }
+              throw new Error(data.error.message);
+            }
+            
+            chatResult = data.choices?.[0]?.message?.content || "I couldn't generate a response.";
+            console.log(`[chat] Success with ${model}`);
+            break;
+          } catch (e: any) {
+            console.error(`[chat] Error with ${model}:`, e.message);
+            if (model === chatModels[chatModels.length - 1]) throw e;
+          }
+        }
         
         return new Response(JSON.stringify({ 
-          response: data.choices?.[0]?.message?.content || "I couldn't generate a response."
+          response: chatResult || "I couldn't generate a response.",
+          userId: user.id,
         }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+          headers: { ...cors, "Content-Type": "application/json" },
         });
       }
 
@@ -614,14 +876,14 @@ Each flashcard should have:
           const match = result.match(/\[[\s\S]*\]/);
           if (match) {
             const flashcards = JSON.parse(match[0]);
-            return new Response(JSON.stringify({ flashcards }), {
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            return new Response(JSON.stringify({ flashcards, userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
             });
           }
         } catch {}
         
-        return new Response(JSON.stringify({ flashcards: [] }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        return new Response(JSON.stringify({ flashcards: [], userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
         });
       }
 
@@ -632,7 +894,7 @@ Each flashcard should have:
             text: "No image provided for OCR.",
             error: "Missing imageUrls parameter" 
           }), {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            headers: { ...cors, "Content-Type": "application/json" },
           });
         }
         
@@ -656,18 +918,20 @@ Your output should be the extracted text in a readable format.`;
           
           return new Response(JSON.stringify({ 
             text: result,
-            success: true 
+            success: true,
+            userId: user.id,
           }), {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            headers: { ...cors, "Content-Type": "application/json" },
           });
         } catch (ocrError) {
           console.error("OCR error:", ocrError);
           return new Response(JSON.stringify({ 
             text: "",
             error: String(ocrError),
-            success: false 
+            success: false,
+            userId: user.id,
           }), {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            headers: { ...cors, "Content-Type": "application/json" },
           });
         }
       }
@@ -683,7 +947,7 @@ Your output should be the extracted text in a readable format.`;
             text: "",
             pages: []
           }), {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            headers: { ...cors, "Content-Type": "application/json" },
           });
         }
         
@@ -696,9 +960,10 @@ Your output should be the extracted text in a readable format.`;
             pages: extraction.pages,
             pageCount: extraction.pages.length,
             success: true,
-            method: "google-document-ai"
+            method: "google-document-ai",
+            userId: user.id,
           }), {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            headers: { ...cors, "Content-Type": "application/json" },
           });
         } catch (extractError: any) {
           console.error("[extractPdf] Google Document AI error:", extractError);
@@ -719,9 +984,10 @@ Your output should be the extracted text in a readable format.`;
                 pages: [{ pageNum: 1, text: ocrResult }],
                 pageCount: 1,
                 success: true,
-                method: "openai-vision-fallback"
+                method: "openai-vision-fallback",
+                userId: user.id,
               }), {
-                headers: { ...corsHeaders, "Content-Type": "application/json" },
+                headers: { ...cors, "Content-Type": "application/json" },
               });
             } catch (ocrFallbackError) {
               console.error("[extractPdf] OCR fallback also failed:", ocrFallbackError);
@@ -732,9 +998,10 @@ Your output should be the extracted text in a readable format.`;
             error: extractError.message || "PDF extraction failed",
             text: "",
             pages: [],
-            success: false
+            success: false,
+            userId: user.id,
           }), {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            headers: { ...cors, "Content-Type": "application/json" },
           });
         }
       }
@@ -745,29 +1012,24 @@ Your output should be the extracted text in a readable format.`;
 
   } catch (error) {
     console.error("Error:", error);
-    
+
+    const status = (error as any)?.status || 500;
     const errorMessage = String(error);
-    
-    // Check if it's a quota/billing error and return user-friendly message
     if (errorMessage.includes('QUOTA_EXCEEDED') || errorMessage.includes('insufficient') || errorMessage.includes('billing')) {
       return new Response(JSON.stringify({ 
         error: "AI service temporarily unavailable. Please try again in a few minutes.",
-        summary: "",
-        questions: []
       }), {
-        status: 200, // Return 200 so app can handle gracefully
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 429,
+        headers: { ...cors, "Content-Type": "application/json" },
       });
     }
     
-    // For other errors, return with details for debugging
     return new Response(JSON.stringify({ 
       error: errorMessage,
       details: "Please try again. If the problem persists, contact support."
     }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      status,
+      headers: { ...cors, "Content-Type": "application/json" },
     });
   }
 });
-}

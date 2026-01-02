@@ -65,10 +65,39 @@ export const StudyScreen: React.FC = () => {
   const handleGenerateStudyGuide = async () => {
     if (!document) return;
     
+    // ENHANCED: Try multiple sources for content
+    let contentToUse = document.content || '';
+    
+    // Fallback 1: Try extracted data pages
+    if (!contentToUse && document.extractedData?.pages) {
+      contentToUse = document.extractedData.pages
+        .map(p => p.text || '')
+        .join('\n\n');
+    }
+    
+    // Fallback 2: Try extracted data text
+    if (!contentToUse && document.extractedData?.text) {
+      contentToUse = document.extractedData.text;
+    }
+    
+    // Fallback 3: Try chunks
+    if (!contentToUse && document.chunks && document.chunks.length > 0) {
+      contentToUse = document.chunks.join('\n\n');
+    }
+    
+    // Check if we have enough content
+    if (!contentToUse || contentToUse.trim().length < 50) {
+      Alert.alert(
+        'Content Not Available', 
+        'Could not extract text from this document. It may be:\n\n• A scanned PDF (image-only)\n• Password protected\n• Corrupted\n\nTry uploading a text-based PDF or different document.'
+      );
+      return;
+    }
+    
     setIsGenerating(true);
     try {
       const result = await generateStudyGuide(
-        document.content || '',
+        contentToUse,
         document.chunks,
         undefined,
         document.fileUri,

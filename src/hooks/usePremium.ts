@@ -7,7 +7,7 @@ export const usePremium = () => {
   const [features, setFeatures] = useState({
     unlimitedDocuments: false,
     unlimitedQuizzes: false,
-    videoGeneration: false,
+    videoGeneration: true, // Video is FREE for everyone!
     advancedAnalytics: false,
     prioritySupport: false,
   });
@@ -18,7 +18,7 @@ export const usePremium = () => {
       setFeatures({
         unlimitedDocuments: user.isPremium,
         unlimitedQuizzes: user.isPremium,
-        videoGeneration: user.isPremium,
+        videoGeneration: true, // Video is FREE for everyone!
         advancedAnalytics: user.isPremium,
         prioritySupport: user.isPremium,
       });
@@ -27,7 +27,7 @@ export const usePremium = () => {
       setFeatures({
         unlimitedDocuments: false,
         unlimitedQuizzes: false,
-        videoGeneration: false,
+        videoGeneration: true, // Video is FREE for everyone!
         advancedAnalytics: false,
         prioritySupport: false,
       });

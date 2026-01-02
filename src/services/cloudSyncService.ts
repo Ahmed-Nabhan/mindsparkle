@@ -6,6 +6,22 @@ import { Document } from '../types/document';
 import { Folder } from '../types/folder';
 import { TestResult } from '../types/performance';
 
+// Simple event emitter for sync events
+type SyncListener = () => void;
+const syncListeners: SyncListener[] = [];
+
+export const onDocumentsSync = (listener: SyncListener): (() => void) => {
+  syncListeners.push(listener);
+  return () => {
+    const index = syncListeners.indexOf(listener);
+    if (index > -1) syncListeners.splice(index, 1);
+  };
+};
+
+const notifyDocumentsSync = () => {
+  syncListeners.forEach(listener => listener());
+};
+
 export interface SyncableData {
   documents: any[];
   folders: any[];
@@ -53,13 +69,13 @@ class CloudSyncService {
 
     try {
       const { data, error } = await supabase
-        .from('user_sync')
-        .select('last_sync_time')
+        .from('sync_metadata')
+        .select('last_sync_at')
         .eq('user_id', this.userId)
         .single();
 
-      if (data && !error) {
-        this.syncStatus.lastSyncTime = new Date(data.last_sync_time);
+      if (data && !error && data.last_sync_at) {
+        this.syncStatus.lastSyncTime = new Date(data.last_sync_at);
         return this.syncStatus.lastSyncTime;
       }
       return null;
@@ -80,7 +96,7 @@ class CloudSyncService {
 
       for (const doc of documents) {
         const { error } = await supabase
-          .from('user_documents')
+          .from('documents')
           .upsert({
             id: doc.id,
             user_id: this.userId,
@@ -88,7 +104,11 @@ class CloudSyncService {
             content: doc.content,
             file_type: doc.fileType,
             file_size: doc.fileSize,
-            created_at: doc.createdAt,
+            file_uri: doc.fileUri || '',
+            summary: doc.summary || null,
+            folder_id: doc.folderId || null,
+            tags: doc.tags || [],
+            created_at: doc.createdAt || new Date().toISOString(),
             updated_at: new Date().toISOString(),
           });
 
@@ -116,7 +136,7 @@ class CloudSyncService {
       this.syncStatus.isSyncing = true;
 
       const { data, error } = await supabase
-        .from('user_documents')
+        .from('documents')
         .select('*')
         .eq('user_id', this.userId)
         .order('created_at', { ascending: false });
@@ -138,12 +158,19 @@ class CloudSyncService {
             fileUri: '', // Cannot restore local URI
             uploadedAt: new Date(doc.created_at),
             userId: doc.user_id,
+            summary: doc.summary,
             // Add other fields if available in Supabase schema
           };
           await saveDocument(document);
         } catch (e) {
           console.error(`Failed to save synced document ${doc.id}:`, e);
         }
+      }
+
+      // Notify listeners that documents were synced
+      if (documents.length > 0) {
+        console.log('[CloudSync] Notifying UI of', documents.length, 'synced documents');
+        notifyDocumentsSync();
       }
 
       return documents;
@@ -166,7 +193,7 @@ class CloudSyncService {
       this.syncStatus.isSyncing = true;
 
       const { error } = await supabase
-        .from('user_folders')
+        .from('folders')
         .upsert(
           folders.map(folder => ({
             id: folder.id,
@@ -174,8 +201,9 @@ class CloudSyncService {
             name: folder.name,
             emoji: folder.emoji,
             color: folder.color,
-            document_ids: folder.documentIds,
-            created_at: folder.createdAt,
+            parent_folder_id: folder.parentFolderId || null,
+            document_count: Array.isArray(folder.documentIds) ? folder.documentIds.length : 0,
+            created_at: folder.createdAt || new Date().toISOString(),
             updated_at: new Date().toISOString(),
           }))
         );
@@ -201,7 +229,7 @@ class CloudSyncService {
 
     try {
       const { data, error } = await supabase
-        .from('user_folders')
+        .from('folders')
         .select('*')
         .eq('user_id', this.userId);
 
@@ -217,7 +245,7 @@ class CloudSyncService {
             name: f.name,
             emoji: f.emoji,
             color: f.color,
-            documentIds: f.document_ids || [], // Assuming array in DB
+            documentIds: [], // not stored server-side
             createdAt: new Date(f.created_at),
           };
           await saveFolder(folder);
@@ -244,17 +272,19 @@ class CloudSyncService {
       this.syncStatus.isSyncing = true;
 
       const { error } = await supabase
-        .from('user_test_results')
+        .from('quiz_results')
         .upsert(
           results.map(result => ({
             id: result.id,
             user_id: this.userId,
             document_id: result.documentId,
-            test_type: result.testType,
+            quiz_type: result.testType,
             score: result.score,
             total_questions: result.totalQuestions,
-            time_spent: result.timeSpent,
+            correct_answers: result.correctAnswers,
+            time_spent_seconds: result.timeSpent,
             completed_at: result.completedAt,
+            updated_at: new Date().toISOString(),
           }))
         );
 
@@ -279,7 +309,7 @@ class CloudSyncService {
 
     try {
       const { data, error } = await supabase
-        .from('user_test_results')
+        .from('quiz_results')
         .select('*')
         .eq('user_id', this.userId)
         .order('completed_at', { ascending: false });
@@ -297,10 +327,10 @@ class CloudSyncService {
             userId: r.user_id,
             score: r.score,
             totalQuestions: r.total_questions,
-            correctAnswers: Math.round((r.score / 100) * r.total_questions), // Approximate if not stored
+            correctAnswers: r.correct_answers ?? Math.round((r.score / 100) * r.total_questions),
             completedAt: new Date(r.completed_at),
-            timeSpent: r.time_spent,
-            testType: r.test_type,
+            timeSpent: r.time_spent_seconds,
+            testType: r.quiz_type,
           };
           await saveTestResult(result);
         } catch (e) {
@@ -328,7 +358,7 @@ class CloudSyncService {
         .upsert({
           user_id: this.userId,
           total_xp: stats.totalXP,
-          level: stats.level,
+          current_level: stats.level,
           current_streak: stats.currentStreak,
           longest_streak: stats.longestStreak,
           achievements: stats.achievements,
@@ -424,10 +454,10 @@ class CloudSyncService {
     
     try {
       await supabase
-        .from('user_sync')
+        .from('sync_metadata')
         .upsert({
           user_id: this.userId,
-          last_sync_time: now.toISOString(),
+          last_sync_at: now.toISOString(),
         });
 
       this.syncStatus.lastSyncTime = now;
@@ -444,11 +474,11 @@ class CloudSyncService {
 
     try {
       await Promise.all([
-        supabase.from('user_documents').delete().eq('user_id', this.userId),
-        supabase.from('user_folders').delete().eq('user_id', this.userId),
-        supabase.from('user_test_results').delete().eq('user_id', this.userId),
+        supabase.from('documents').delete().eq('user_id', this.userId),
+        supabase.from('folders').delete().eq('user_id', this.userId),
+        supabase.from('quiz_results').delete().eq('user_id', this.userId),
         supabase.from('user_stats').delete().eq('user_id', this.userId),
-        supabase.from('user_sync').delete().eq('user_id', this.userId),
+        supabase.from('sync_metadata').delete().eq('user_id', this.userId),
       ]);
 
       return true;

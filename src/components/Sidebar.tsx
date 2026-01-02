@@ -1,6 +1,7 @@
 import React from 'react';
 import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { DrawerContentScrollView, DrawerItemList, DrawerContentComponentProps } from '@react-navigation/drawer';
+import { Ionicons } from '@expo/vector-icons';
 import { colors } from '../constants/colors';
 import { strings } from '../constants/strings';
 import { useAuth } from '../context/AuthContext';
@@ -27,7 +28,16 @@ export const Sidebar: React.FC<DrawerContentComponentProps> = (props) => {
   return (
     <DrawerContentScrollView {...props} style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.appName}>MindSparkle</Text>
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+          <Text style={[styles.appName, { marginBottom: 0 }]}>MindSparkle</Text>
+          <TouchableOpacity 
+            onPress={() => props.navigation.closeDrawer()}
+            hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }}
+            style={{ padding: 5 }}
+          >
+            <Ionicons name="close" size={28} color="#FFFFFF" />
+          </TouchableOpacity>
+        </View>
         {user && (
           <View style={styles.userInfo}>
             <Text style={styles.userEmail}>{user.email}</Text>

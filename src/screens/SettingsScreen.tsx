@@ -18,6 +18,7 @@ import { usePremiumContext } from '../context/PremiumContext';
 import { useAuth } from '../context/AuthContext';
 import { restorePurchases } from '../services/revenueCat';
 import { notificationService } from '../services/notificationService';
+import * as CloudStorage from '../services/cloudStorageService';
 import type { MainDrawerScreenProps } from '../navigation/types';
 
 type SettingsScreenProps = MainDrawerScreenProps<'Settings'>;
@@ -30,10 +31,23 @@ export const SettingsScreen: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [studyReminders, setStudyReminders] = useState(true);
   const [streakReminders, setStreakReminders] = useState(true);
+  const [storageUsage, setStorageUsage] = useState<CloudStorage.StorageUsage | null>(null);
 
   useEffect(() => {
     loadSettings();
-  }, []);
+    loadStorageUsage();
+  }, [user]);
+
+  const loadStorageUsage = async () => {
+    if (user) {
+      try {
+        const usage = await CloudStorage.getStorageUsage(user.id);
+        setStorageUsage(usage);
+      } catch (error) {
+        console.error('Error loading storage usage:', error);
+      }
+    }
+  };
 
   const loadSettings = async () => {
     try {
@@ -199,6 +213,69 @@ export const SettingsScreen: React.FC = () => {
                 Cloud sync is a Pro feature
               </Text>
               <Button title="Upgrade to Unlock" onPress={handleUpgrade} />
+            </>
+          )}
+        </Card>
+
+        {/* Cloud Storage Section */}
+        <Text style={styles.sectionTitle}>Cloud Storage</Text>
+        <Card style={styles.card}>
+          {user ? (
+            <>
+              <View style={styles.row}>
+                <Text style={styles.label}>Plan</Text>
+                <Text style={styles.value}>{isPremium ? 'Pro (200 GB)' : 'Free (5 GB)'}</Text>
+              </View>
+              
+              {storageUsage && (
+                <>
+                  <View style={styles.row}>
+                    <Text style={styles.label}>Used</Text>
+                    <Text style={styles.value}>
+                      {CloudStorage.formatBytes(storageUsage.usedBytes)} / {CloudStorage.formatBytes(storageUsage.limitBytes)}
+                    </Text>
+                  </View>
+                  
+                  <View style={styles.storageBarContainer}>
+                    <View 
+                      style={[
+                        styles.storageBar, 
+                        { 
+                          width: `${Math.min(storageUsage.usedPercentage, 100)}%`,
+                          backgroundColor: storageUsage.usedPercentage > 90 ? colors.error : colors.primary,
+                        }
+                      ]} 
+                    />
+                  </View>
+                  
+                  <Text style={styles.storageNote}>
+                    {storageUsage.fileCount} cloud document{storageUsage.fileCount !== 1 ? 's' : ''} • 
+                    {CloudStorage.formatBytes(storageUsage.remainingBytes)} remaining
+                  </Text>
+                </>
+              )}
+              
+              {!isPremium && (
+                <>
+                  <Text style={styles.upgradeNote}>
+                    Need more space? Upgrade to Pro for 200 GB storage.
+                  </Text>
+                  <Button title="Upgrade to Pro" onPress={handleUpgrade} />
+                </>
+              )}
+            </>
+          ) : (
+            <>
+              <Text style={styles.lockIcon}>☁️</Text>
+              <Text style={styles.lockedText}>
+                Sign in to use cloud storage for large files (50MB+)
+              </Text>
+              <TouchableOpacity 
+                style={styles.signInButton}
+                onPress={() => navigation.navigate('Auth', { mode: 'signin' })}
+              >
+                <Text style={styles.signInText}>Sign In</Text>
+              </TouchableOpacity>
             </>
           )}
         </Card>
@@ -434,5 +511,28 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 12,
     fontWeight: '600',
+  },
+  storageBarContainer: {
+    height: 8,
+    backgroundColor: colors.border,
+    borderRadius: 4,
+    marginVertical: 12,
+    overflow: 'hidden',
+  },
+  storageBar: {
+    height: '100%',
+    borderRadius: 4,
+  },
+  storageNote: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    textAlign: 'center',
+  },
+  upgradeNote: {
+    fontSize: 13,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    marginTop: 12,
+    marginBottom: 12,
   },
 });

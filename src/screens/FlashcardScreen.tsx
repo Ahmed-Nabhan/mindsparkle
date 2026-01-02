@@ -64,7 +64,27 @@ export const FlashcardScreen: React.FC = () => {
     try {
       const doc = await getDocument(documentId);
       if (doc) {
-        setContent(doc.content || '');
+        // ENHANCED: Try multiple sources for content
+        let contentToUse = doc.content || '';
+        
+        // Fallback 1: Try extracted data pages
+        if (!contentToUse && doc.extractedData?.pages) {
+          contentToUse = doc.extractedData.pages
+            .map(p => p.text || '')
+            .join('\n\n');
+        }
+        
+        // Fallback 2: Try extracted data text
+        if (!contentToUse && doc.extractedData?.text) {
+          contentToUse = doc.extractedData.text;
+        }
+        
+        // Fallback 3: Try chunks
+        if (!contentToUse && doc.chunks && doc.chunks.length > 0) {
+          contentToUse = doc.chunks.join('\n\n');
+        }
+        
+        setContent(contentToUse);
         setChunks(doc.chunks || []);
       }
     } catch (error) {

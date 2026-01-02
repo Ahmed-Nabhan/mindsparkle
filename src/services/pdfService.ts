@@ -1,7 +1,7 @@
 // PDF Processing Service - 100% FREE local extraction
 // Falls back to OpenAI Vision OCR for scanned PDFs (uses your existing OpenAI credits)
 
-import * as FileSystem from 'expo-file-system/legacy';
+import * as FileSystem from 'expo-file-system';
 import { extractPdfText, extractTextFromChunk } from './pdfExtractor';
 import { callApi } from './apiService';
 
@@ -30,45 +30,57 @@ export const basicBinaryExtraction = async (fileUri: string): Promise<ProcessedD
     encoding: FileSystem.EncodingType.Base64,
   });
   const binaryString = atob(base64);
-  const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
-  const OVERLAP = 10000; // 10KB
+  const CHUNK_SIZE = 1024 * 1024; // 1MB chunks to be safe
+  const OVERLAP = 1024; 
   const totalSize = binaryString.length;
   let position = 0;
-  let chunkNum = 0;
+  
   const allTexts: string[] = [];
+  
   while (position < totalSize) {
     const chunkEnd = Math.min(position + CHUNK_SIZE + OVERLAP, totalSize);
     const chunk = binaryString.substring(position, chunkEnd);
+    
     // Use the same iterative extraction as in pdfExtractor
     const texts = extractTextFromChunk(chunk);
-    allTexts.push(...texts);
-    chunkNum++;
+    
+    // Clean each text fragment individually to avoid massive regex later
+    const cleanedTexts = texts.map(t => t.replace(/\s+/g, ' ').trim()).filter(t => t.length > 0);
+    allTexts.push(...cleanedTexts);
+    
     position += CHUNK_SIZE;
   }
-  // Remove duplicates
+  
+  // Remove duplicates using Set (efficient for strings)
   const uniqueTexts = [...new Set(allTexts)];
-  let extractedText = uniqueTexts
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .replace(/([.!?])\s*/g, '$1\n')
-    .trim();
-  // Remove duplicate sentences
-  const sentences = extractedText.split('\n').filter(s => s.trim().length > 5);
-  const uniqueSentences = [...new Set(sentences)];
-  extractedText = uniqueSentences.join('\n');
+  
+  // Join with spaces - no global regex on the full string needed anymore
+  let extractedText = uniqueTexts.join(' ');
+  
+  // Simple punctuation formatting without global regex if possible, 
+  // or split-process-join if needed. 
+  // For now, just basic joining is much safer than the previous global replace.
+  // We can do a simple split by period to format paragraphs.
+  const sentences = extractedText.split('. ');
+  extractedText = sentences.join('.\n');
+  
   // Estimate pages
   const estimatedPages = Math.max(Math.ceil(extractedText.length / 3000), 1);
+  
   // Create pages
   const pages: PDFPage[] = [];
   const avgPageLength = Math.max(Math.ceil(extractedText.length / estimatedPages), 1500);
   let pos = 0;
   let pageNum = 1;
+  
   while (pos < extractedText.length && pageNum <= estimatedPages + 10) {
     let endPos = Math.min(pos + avgPageLength, extractedText.length);
     const breakPos = extractedText.lastIndexOf('.', endPos);
+    
     if (breakPos > pos + avgPageLength / 2) {
       endPos = breakPos + 1;
     }
+    
     const pageText = extractedText.slice(pos, endPos).trim();
     if (pageText.length > 20) {
       pages.push({ pageNum, text: pageText, imageUrl: undefined });
@@ -76,6 +88,7 @@ export const basicBinaryExtraction = async (fileUri: string): Promise<ProcessedD
     }
     pos = endPos;
   }
+  
   return {
     pdfUrl: fileUri,
     pageCount: pages.length || 1,

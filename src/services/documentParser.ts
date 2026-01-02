@@ -1,4 +1,4 @@
-import * as FileSystem from 'expo-file-system/legacy';
+import * as FileSystem from 'expo-file-system';
 
 const MAX_CHUNK_SIZE = 12000;
 const MAX_FILE_SIZE_MB = 10240;
@@ -156,10 +156,16 @@ const cleanText = function(text: string): string {
     }
   }
   
-  // Collapse multiple spaces
-  cleaned = cleaned.replace(/  +/g, ' ').trim();
+  // Collapse multiple spaces iteratively to avoid OOM on large strings
+  // Instead of global regex, we'll split and join which is safer for massive strings
+  // or just leave it if it's too big.
+  if (cleaned.length > 1000000) {
+     // For huge strings, just return as is to be safe, or do a very simple pass
+     return cleaned;
+  }
   
-  return cleaned;
+  // Safe for reasonable sizes
+  return cleaned.replace(/  +/g, ' ').trim();
 };
 
 const extractDocText = async (fileUri: string): Promise<string> => {
@@ -170,12 +176,24 @@ const extractDocText = async (fileUri: string): Promise<string> => {
 
     const binaryString = atob(base64);
     
-    var textContent = binaryString
-      .replace(/<w:t[^>]*>([^<]+)<\/w:t>/g, '$1 ')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/[^\x20-\x7E\n]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
+    // Avoid chaining multiple global regexes on the full string
+    // Process in a more memory-efficient way if possible
+    // For now, we'll just simplify the regexes to be less aggressive
+    
+    let textContent = binaryString;
+    
+    // 1. Remove XML tags (iterative or simplified)
+    textContent = textContent.replace(/<[^>]+>/g, ' ');
+    
+    // 2. Keep only printable
+    textContent = textContent.replace(/[^\x20-\x7E\n]/g, ' ');
+    
+    // 3. Collapse spaces (only if size permits)
+    if (textContent.length < 1000000) {
+        textContent = textContent.replace(/\s+/g, ' ');
+    }
+    
+    textContent = textContent.trim();
 
     if (textContent.length < 30) {
       throw new Error('Could not extract text from Word document.');
@@ -187,93 +205,134 @@ const extractDocText = async (fileUri: string): Promise<string> => {
   }
 };
 
-// Extract text from PowerPoint (PPTX) files
+// Extract text from PowerPoint (PPTX) files - handles large files with true streaming
 const extractPptxText = async (fileUri: string): Promise<string> => {
   try {
-    const base64 = await FileSystem.readAsStringAsync(fileUri, {
-      encoding: FileSystem.EncodingType.Base64,
-    });
-
-    const binaryString = atob(base64);
+    // Get file info first
+    const fileInfo = await FileSystem.getInfoAsync(fileUri);
+    const fileSize = (fileInfo as any).size || 0;
+    const fileSizeMB = Math.round(fileSize / (1024 * 1024));
     
-    // PPTX files are ZIP archives containing XML
-    // Extract text from slide content using XML patterns
-    var textContent = '';
+    console.log('[PPTX] Processing file, size:', fileSizeMB, 'MB');
     
-    // Match text content in PowerPoint XML format
-    // <a:t> tags contain text in PPTX files
-      // Avoid running global regex on the entire binary string for large files.
-      // Instead scan iteratively and collect a bounded number of matches.
-      const MAX_PPTX_MATCHES = 5000;
-      let pptxMatches = 0;
-      for (let i = 0; i < binaryString.length; i++) {
-        if (binaryString[i] === '<' && binaryString.substring(i, i + 4) === '<a:t') {
-          // find '>'
-          const startTagEnd = binaryString.indexOf('>', i);
-          if (startTagEnd === -1) continue;
-          const closeTag = '</a:t>';
-          const endIdx = binaryString.indexOf(closeTag, startTagEnd + 1);
-          if (endIdx === -1) continue;
-          const text = binaryString.substring(startTagEnd + 1, endIdx);
-          if (text && text.length > 0) {
-            textContent += text + ' ';
-            pptxMatches++;
-            if (pptxMatches >= MAX_PPTX_MATCHES) break;
-          }
-          i = endIdx + closeTag.length - 1;
+    // True streaming: read file in small chunks, never load entire file
+    const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB raw chunks
+    const MAX_TOTAL_TEXT = 500000; // Max chars to extract
+    const MAX_PPTX_MATCHES = 3000;
+    const MAX_BYTES_TO_READ = 100 * 1024 * 1024; // Only read first 100MB max
+    
+    let textContent = '';
+    let pptxMatches = 0;
+    let bytesRead = 0;
+    let chunkIdx = 0;
+    let carryOver = ''; // Text that spans chunk boundaries
+    
+    console.log('[PPTX] Using streaming mode for', fileSizeMB, 'MB file');
+    
+    while (bytesRead < fileSize && bytesRead < MAX_BYTES_TO_READ && pptxMatches < MAX_PPTX_MATCHES) {
+      try {
+        // Read chunk directly from file (this is the key - read only what we need)
+        const base64Chunk = await FileSystem.readAsStringAsync(fileUri, {
+          encoding: FileSystem.EncodingType.Base64,
+          position: bytesRead,
+          length: CHUNK_SIZE,
+        });
+        
+        if (!base64Chunk || base64Chunk.length === 0) break;
+        
+        // Decode this chunk only
+        let binaryChunk: string;
+        try {
+          binaryChunk = atob(base64Chunk);
+        } catch (e) {
+          console.log('[PPTX] Chunk', chunkIdx, 'decode failed, skipping');
+          bytesRead += CHUNK_SIZE;
+          chunkIdx++;
+          continue;
         }
-      }
-    
-    // Also try to match <p:txBody> content
-      // Additional safe scan for <p:txBody> inner text (if any)
-      // (This is a lighter pass and will stop early if too many matches.)
-      let bodyMatchesCount = 0;
-      const MAX_BODY_MATCHES = 2000;
-      for (let i = 0; i < binaryString.length; i++) {
-        if (binaryString.substring(i, i + 8) === '<p:txBody') {
-          // find the nearest closing </p:txBody> and scan contained <a:t> tags
-          const blockEnd = binaryString.indexOf('</p:txBody>', i);
-          const block = blockEnd === -1 ? binaryString.substring(i, Math.min(i + 10000, binaryString.length)) : binaryString.substring(i, blockEnd);
-          // scan block for <a:t> occurrences
-          for (let j = 0; j < block.length; j++) {
-            if (block[j] === '<' && block.substring(j, j + 3) === '<a:') {
-              const startTagEnd = block.indexOf('>', j);
-              if (startTagEnd === -1) continue;
-              const closeTag = '</a:t>';
-              const endIdx = block.indexOf(closeTag, startTagEnd + 1);
-              if (endIdx === -1) continue;
-              const text = block.substring(startTagEnd + 1, endIdx);
-              if (text && text.length > 0 && !textContent.includes(text)) {
-                textContent += text + ' ';
-                bodyMatchesCount++;
-                if (bodyMatchesCount >= MAX_BODY_MATCHES) break;
-              }
-              j = endIdx + closeTag.length - 1;
+        
+        // Prepend any carry-over from previous chunk
+        const fullChunk = carryOver + binaryChunk;
+        carryOver = '';
+        
+        // Extract <a:t> tags from this chunk
+        let lastProcessedIdx = 0;
+        for (let i = 0; i < fullChunk.length && pptxMatches < MAX_PPTX_MATCHES; i++) {
+          if (fullChunk[i] === '<' && i + 4 < fullChunk.length && fullChunk.substring(i, i + 4) === '<a:t') {
+            const startTagEnd = fullChunk.indexOf('>', i);
+            if (startTagEnd === -1 || startTagEnd > i + 50) continue;
+            
+            const closeTag = '</a:t>';
+            const endIdx = fullChunk.indexOf(closeTag, startTagEnd + 1);
+            
+            // If we can't find close tag, might span chunks
+            if (endIdx === -1) {
+              // Save the rest for next chunk
+              carryOver = fullChunk.substring(i);
+              break;
             }
+            
+            if (endIdx > startTagEnd + 500) continue;
+            
+            const text = fullChunk.substring(startTagEnd + 1, endIdx);
+            if (text && text.length > 0 && text.length < 200) {
+              // Clean text char by char (no regex)
+              let cleanText = '';
+              for (let c = 0; c < text.length; c++) {
+                const code = text.charCodeAt(c);
+                if (code >= 32 && code <= 126) cleanText += text[c];
+              }
+              if (cleanText.length > 0) {
+                textContent += cleanText + ' ';
+                pptxMatches++;
+              }
+            }
+            lastProcessedIdx = endIdx + closeTag.length;
+            i = lastProcessedIdx - 1;
           }
-          if (bodyMatchesCount >= MAX_BODY_MATCHES) break;
-          i = blockEnd === -1 ? i + 10000 : blockEnd + 10;
         }
+        
+        // Check if we have enough text
+        if (textContent.length > MAX_TOTAL_TEXT) {
+          textContent = textContent.substring(0, MAX_TOTAL_TEXT);
+          break;
+        }
+        
+        bytesRead += CHUNK_SIZE;
+        chunkIdx++;
+        
+        // Log progress every 10 chunks
+        if (chunkIdx % 10 === 0) {
+          console.log('[PPTX] Processed', Math.round(bytesRead / (1024 * 1024)), 'MB, found', pptxMatches, 'text blocks');
+        }
+        
+      } catch (chunkError: any) {
+        console.log('[PPTX] Chunk', chunkIdx, 'error:', chunkError.message);
+        bytesRead += CHUNK_SIZE;
+        chunkIdx++;
+        continue;
       }
-    
-    // Clean up extracted text
-    textContent = textContent
-      .replace(/[^\x20-\x7E\n]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    if (textContent.length < 30) {
-      // Fallback: try to extract any readable ASCII text
-      textContent = extractReadableText(binaryString);
     }
     
+    // Simple cleanup
+    textContent = textContent.trim();
+    
+    // Add note if file was truncated
+    if (bytesRead < fileSize) {
+      const percentRead = Math.round((bytesRead / fileSize) * 100);
+      textContent = '[Note: Large presentation (' + fileSizeMB + 'MB). Processed ' + percentRead + '% of content.]\n\n' + textContent;
+    }
+
+    console.log('[PPTX] Extracted', textContent.length, 'chars,', pptxMatches, 'text blocks from', Math.round(bytesRead / (1024 * 1024)), 'MB');
+
     if (textContent.length < 30) {
       throw new Error('Could not extract text from PowerPoint. The file may contain only images.');
     }
 
-    console.log('Extracted ' + textContent.length + ' characters from PPTX');
+    console.log('[PPTX] Extracted ' + textContent.length + ' characters, ' + pptxMatches + ' text blocks');
     return textContent;
   } catch (error: any) {
+    console.error('[PPTX] Extraction error:', error.message);
     throw new Error(error.message || 'Could not extract text from PowerPoint document.');
   }
 };

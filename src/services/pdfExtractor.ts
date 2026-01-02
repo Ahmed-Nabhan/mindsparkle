@@ -1,7 +1,7 @@
 // PDF Extractor Service - Handles documents of ANY size (up to 1GB+)
 // Uses chunked processing for large files + server-side fallback
 
-import * as FileSystem from 'expo-file-system/legacy';
+import * as FileSystem from 'expo-file-system';
 
 // Types
 interface PDFPage {
@@ -228,12 +228,19 @@ const processSmallFile = async (
   // Remove duplicates
   const uniqueTexts = [...new Set(texts)];
   
-  // Build full text
-  let fullText = uniqueTexts
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .replace(/([.!?])\s*/g, '$1\n')
-    .trim();
+  // Build full text - clean each chunk individually to avoid OOM
+  const cleanedChunks = uniqueTexts.map(t => t.replace(/\s+/g, ' ').trim()).filter(t => t.length > 0);
+  let fullText = cleanedChunks.join(' ');
+  
+  // Add line breaks after sentences using iteration instead of regex
+  let formatted = '';
+  for (let i = 0; i < fullText.length; i++) {
+    formatted += fullText[i];
+    if ('.!?'.includes(fullText[i]) && i + 1 < fullText.length && fullText[i + 1] === ' ') {
+      formatted += '\n';
+    }
+  }
+  fullText = formatted;
   
   // Remove duplicate sentences
   const sentences = fullText.split('\n').filter(s => s.trim().length > 5);
@@ -333,12 +340,19 @@ const processMediumFile = async (
   // Remove duplicates
   const uniqueTexts = [...new Set(allTexts)];
   
-  // Build full text
-  let fullText = uniqueTexts
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .replace(/([.!?])\s*/g, '$1\n')
-    .trim();
+  // Build full text - clean each chunk individually to avoid OOM
+  const cleanedChunks = uniqueTexts.map(t => t.replace(/\s+/g, ' ').trim()).filter(t => t.length > 0);
+  let fullText = cleanedChunks.join(' ');
+  
+  // Add line breaks after sentences using iteration instead of regex
+  let formatted = '';
+  for (let i = 0; i < fullText.length; i++) {
+    formatted += fullText[i];
+    if ('.!?'.includes(fullText[i]) && i + 1 < fullText.length && fullText[i + 1] === ' ') {
+      formatted += '\n';
+    }
+  }
+  fullText = formatted;
   
   // Remove duplicate sentences
   const sentences = fullText.split('\n').filter(s => s.trim().length > 5);

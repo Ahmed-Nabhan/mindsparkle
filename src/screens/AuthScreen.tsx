@@ -17,6 +17,7 @@ import * as Crypto from 'expo-crypto';
 import { colors } from '../constants/colors';
 import { useAuth } from '../context/AuthContext';
 import { supabase } from '../services/supabase';
+import { CommonActions } from '@react-navigation/native';
 
 interface AuthScreenProps {
   navigation: any;
@@ -79,15 +80,55 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
           nonce: rawNonce,
         });
 
+        // Check if we got a session regardless of database errors
+        const session = data?.session;
+        const authUser = data?.user;
+        
         if (error) {
           console.error('Supabase auth error:', JSON.stringify(error));
-          // Throw with the specific message from Supabase
-          throw new Error(error.message || 'Supabase authentication failed');
+          
+          // Handle database trigger errors gracefully
+          // Auth may have succeeded even if profile creation failed
+          if (error.message?.includes('Database error') || 
+              error.message?.includes('saving new user') ||
+              error.message?.includes('duplicate key') ||
+              error.message?.includes('violates') ||
+              error.message?.includes('trigger')) {
+            console.log('Profile creation issue, checking if auth succeeded...');
+            
+            // Check if we actually have a valid session despite the error
+            const { data: sessionData } = await supabase.auth.getSession();
+            if (sessionData?.session) {
+              console.log('Auth succeeded despite database error, proceeding...');
+              // Continue with navigation
+            } else if (!session) {
+              throw new Error('Authentication failed. Please try again.');
+            }
+          } else {
+            throw new Error(error.message || 'Supabase authentication failed');
+          }
         }
         
-        console.log('Apple Sign In successful!');
-        // Success! User is now signed in
-        // Navigation will happen automatically through auth state change
+        console.log('Apple Sign In successful, user:', authUser?.id || 'checking session...');
+        
+        // Verify we have a valid session
+        const { data: finalSession } = await supabase.auth.getSession();
+        if (!finalSession?.session) {
+          throw new Error('Failed to establish session. Please try again.');
+        }
+        
+        console.log('Session verified, navigating to Main...');
+        
+        // Wait a moment for auth state to propagate
+        await new Promise(resolve => setTimeout(resolve, 300));
+        
+        // Use reset to clear the navigation stack and go to Main
+        navigation.dispatch(
+          CommonActions.reset({
+            index: 0,
+            routes: [{ name: 'Main' }],
+          })
+        );
       } else {
         throw new Error('No identity token received from Apple');
       }
@@ -113,6 +154,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
           errorMessage = 'Apple Sign In session expired. Please try again.';
         } else if (errorMessage.includes('client_id')) {
           errorMessage = 'App configuration error (Bundle ID mismatch). Please contact support.';
+        } else if (errorMessage.includes('Unacceptable audience')) {
+          errorMessage = 'Configuration Error: Your Bundle ID (com.ahmednabhan.mindsparkle) is not registered in Supabase. Please go to Supabase Dashboard > Authentication > Providers > Apple and add "com.ahmednabhan.mindsparkle" to the "Bundle ID" field.';
         }
       }
       

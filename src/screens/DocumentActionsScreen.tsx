@@ -44,11 +44,7 @@ export const DocumentActionsScreen:  React.FC = () => {
 
   const handleGenerateVideo = () => {
     if (!document) return;
-    // Check if user can access video generation
-    if (!features.canUseVideoGen) {
-      navigation.navigate('Paywall', { source: 'video' });
-      return;
-    }
+    // Video generation is FREE for everyone!
     navigation.navigate('Video', { 
       documentId: document.id,
       content: document.content || '',
