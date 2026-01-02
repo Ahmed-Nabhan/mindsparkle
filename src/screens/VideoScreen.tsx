@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator, Alert, Animated, Image, Dimensions } from "react-native";
+import { View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator, Alert, Animated, Image, Dimensions, Modal, FlatList } from "react-native";
 import * as Speech from "expo-speech";
 import { useRoute, useNavigation } from "@react-navigation/native";
+import YoutubePlayer from "react-native-youtube-iframe";
 import Config from "../services/config";
 import PdfService from "../services/pdfService";
 import ApiService from "../services/apiService";
@@ -55,6 +56,39 @@ interface ExtractedData {
   pages: ExtractedPage[];
   pageCount: number;
 }
+
+// YouTube Video Interface
+interface YouTubeVideo {
+  id: string;
+  title: string;
+  channelTitle: string;
+  thumbnail: string;
+  duration?: string;
+  viewCount?: string;
+}
+
+// Subtitle/Caption Interface
+interface SubtitleTrack {
+  code: string;
+  name: string;
+  flag: string;
+}
+
+// Available subtitle languages
+var SUBTITLE_LANGUAGES: SubtitleTrack[] = [
+  { code: 'en', name: 'English', flag: '🇺🇸' },
+  { code: 'ar', name: 'العربية', flag: '🇸🇦' },
+  { code: 'es', name: 'Español', flag: '🇪🇸' },
+  { code: 'fr', name: 'Français', flag: '🇫🇷' },
+  { code: 'de', name: 'Deutsch', flag: '🇩🇪' },
+  { code: 'hi', name: 'हिन्दी', flag: '🇮🇳' },
+  { code: 'zh', name: '中文', flag: '🇨🇳' },
+  { code: 'ja', name: '日本語', flag: '🇯🇵' },
+  { code: 'ko', name: '한국어', flag: '🇰🇷' },
+  { code: 'pt', name: 'Português', flag: '🇧🇷' },
+  { code: 'ru', name: 'Русский', flag: '🇷🇺' },
+  { code: 'tr', name: 'Türkçe', flag: '🇹🇷' },
+];
 
 interface Teacher {
   id: string;
@@ -119,14 +153,31 @@ export var VideoScreen: React.FC = function() {
   var [videoLanguage, setVideoLanguage] = useState<'en' | 'ar' | string>('en');
   var [useAnimationsOption, setUseAnimationsOption] = useState(true);
 
+  // YouTube Integration States
+  var [youtubeVideos, setYoutubeVideos] = useState<YouTubeVideo[]>([]);
+  var [selectedYoutubeVideo, setSelectedYoutubeVideo] = useState<YouTubeVideo | null>(null);
+  var [isYoutubeLoading, setIsYoutubeLoading] = useState(false);
+  var [youtubeError, setYoutubeError] = useState<string | null>(null);
+  var [isYoutubePlaying, setIsYoutubePlaying] = useState(false);
+  var [showSubtitleMenu, setShowSubtitleMenu] = useState(false);
+  var [selectedSubtitle, setSelectedSubtitle] = useState<SubtitleTrack>(SUBTITLE_LANGUAGES[0]);
+  var [showCaptions, setShowCaptions] = useState(true);
+  var [youtubeSearchQuery, setYoutubeSearchQuery] = useState('');
+  var youtubePlayerRef = useRef<any>(null);
+
   // Load saved user preferences (video language and animations)
   useEffect(() => {
     (async () => {
       try {
         const lang = await AsyncStorage.getItem('videoLanguage');
         const anim = await AsyncStorage.getItem('videoUseAnimations');
+        const subtitleLang = await AsyncStorage.getItem('subtitleLanguage');
         if (lang) setVideoLanguage(lang);
         if (anim !== null) setUseAnimationsOption(anim === 'true');
+        if (subtitleLang) {
+          const found = SUBTITLE_LANGUAGES.find(s => s.code === subtitleLang);
+          if (found) setSelectedSubtitle(found);
+        }
       } catch (e) {
         console.warn('Failed to load video settings', e);
       }
@@ -144,6 +195,135 @@ export var VideoScreen: React.FC = function() {
   var progressAnim = useRef(new Animated.Value(0)).current;
   var pulseAnim = useRef(new Animated.Value(1)).current;
   var isPausedRef = useRef(false);
+
+  // YouTube Search Function - searches for educational videos based on document content
+  var searchYoutubeVideos = async function(query: string) {
+    setIsYoutubeLoading(true);
+    setYoutubeError(null);
+    setYoutubeSearchQuery(query);
+    
+    try {
+      // Use OpenAI proxy to search YouTube
+      const videos = await ApiService.searchYoutubeVideos(query, { 
+        language: selectedSubtitle.code,
+        maxResults: 10
+      });
+      
+      if (videos && videos.length > 0) {
+        setYoutubeVideos(videos);
+        setSelectedYoutubeVideo(videos[0]);
+      } else {
+        // Fallback: Use hardcoded popular educational channels
+        console.log('[YouTube] No API results, using fallback videos');
+        setYoutubeError('YouTube search is not available. Please enable YouTube Data API v3 in Google Cloud Console.');
+      }
+    } catch (error: any) {
+      console.error('YouTube search error:', error);
+      // Show specific error message
+      if (error.message?.includes('not configured')) {
+        setYoutubeError('YouTube API not configured. Enable YouTube Data API v3 in Google Cloud Console.');
+      } else {
+        setYoutubeError('Failed to search YouTube. Please try again later.');
+      }
+    } finally {
+      setIsYoutubeLoading(false);
+    }
+  };
+
+  // Smart topic extraction from document content for better YouTube search
+  var extractSmartSearchQuery = function(content: string, title: string): string {
+    // Clean the title first - remove special chars and newlines
+    var cleanTitle = (title || '')
+      .replace(/[\n\r\t]+/g, ' ')
+      .replace(/[^\w\s-]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .substring(0, 50);
+    
+    // Priority 1: Use section titles/key concepts from video script
+    if (videoScript && videoScript.sections && videoScript.sections.length > 0) {
+      // Get first 3 section titles and combine them
+      var sectionTitles = videoScript.sections
+        .slice(0, 3)
+        .map(function(s) { return (s.title || '').replace(/[\n\r]+/g, ' ').trim(); })
+        .filter(function(t) { return t && t.length > 3 && t.length < 50; })
+        .join(' ');
+      if (sectionTitles.length > 10 && sectionTitles.length < 100) {
+        return sectionTitles + ' tutorial';
+      }
+    }
+    
+    // Priority 2: Look for known acronyms/keywords in content
+    var cleanContent = (content || '').substring(0, 3000).replace(/[\n\r]+/g, ' ');
+    
+    // Common educational keywords
+    var knownTerms = ['CCNA', 'CCNP', 'Python', 'JavaScript', 'React', 'AWS', 'Azure', 
+      'Machine Learning', 'Data Science', 'Network', 'Security', 'Database', 'SQL',
+      'Java', 'C++', 'Linux', 'Docker', 'Kubernetes', 'API', 'Web Development'];
+    
+    var foundTerms: string[] = [];
+    knownTerms.forEach(function(term) {
+      if (cleanContent.toLowerCase().includes(term.toLowerCase())) {
+        foundTerms.push(term);
+      }
+    });
+    
+    if (foundTerms.length > 0) {
+      return foundTerms.slice(0, 3).join(' ') + ' tutorial';
+    }
+    
+    // Priority 3: Extract acronyms from content
+    var acronymMatches = cleanContent.match(/\b[A-Z]{2,6}\b/g);
+    if (acronymMatches && acronymMatches.length > 0) {
+      // Filter common non-educational acronyms
+      var filtered = acronymMatches.filter(function(a) {
+        return !['THE', 'AND', 'FOR', 'PDF', 'DOC', 'PAGE', 'WWW', 'HTTP'].includes(a);
+      });
+      if (filtered.length > 0) {
+        return filtered.slice(0, 2).join(' ') + ' ' + cleanTitle + ' tutorial';
+      }
+    }
+    
+    // Fallback to cleaned title
+    if (cleanTitle.length > 3) {
+      return cleanTitle + ' tutorial course';
+    }
+    
+    return 'educational tutorial';
+  };
+
+  // Auto-search YouTube when video script is ready
+  useEffect(function() {
+    if (videoScript && videoScript.title && youtubeVideos.length === 0) {
+      // Smart extract topic from document content
+      var documentContent = route.params?.content || route.params?.documentContent || '';
+      var searchQuery = extractSmartSearchQuery(documentContent, videoScript.title);
+      console.log('[YouTube] Smart search query:', searchQuery);
+      searchYoutubeVideos(searchQuery);
+    }
+  }, [videoScript]);
+
+  // YouTube player state change handler
+  var onYoutubeStateChange = useCallback(function(state: string) {
+    if (state === "ended") {
+      setIsYoutubePlaying(false);
+    } else if (state === "playing") {
+      setIsYoutubePlaying(true);
+    } else if (state === "paused") {
+      setIsYoutubePlaying(false);
+    }
+  }, []);
+
+  // Change subtitle language
+  var changeSubtitleLanguage = async function(track: SubtitleTrack) {
+    setSelectedSubtitle(track);
+    setShowSubtitleMenu(false);
+    try {
+      await AsyncStorage.setItem('subtitleLanguage', track.code);
+    } catch (e) {
+      console.warn('Failed to save subtitle preference', e);
+    }
+  };
 
   useEffect(function() {
     if (! showTeacherSelect) {
@@ -635,6 +815,28 @@ export var VideoScreen: React.FC = function() {
         </View>
         <Text style={styles.loadingMessage}>{loadingMessage}</Text>
         <ActivityIndicator size="large" color={selectedTeacher.color} style={{ marginTop: 20 }} />
+        
+        {/* Skip Generation Button */}
+        <TouchableOpacity 
+          style={[styles.skipButton, { borderColor: selectedTeacher.color }]} 
+          onPress={function() {
+            // Skip generation and go directly to YouTube tab
+            setIsLoading(false);
+            setActiveTab('youtube');
+            // Create a minimal video script so the screen doesn't error
+            setVideoScript({
+              title: route.params?.documentName || 'Document',
+              introduction: '',
+              conclusion: '',
+              sections: []
+            });
+            // Trigger YouTube search with document name
+            var searchQuery = route.params?.documentName || route.params?.content?.substring(0, 100) || 'tutorial';
+            searchYoutubeVideos(searchQuery + ' tutorial');
+          }}
+        >
+          <Text style={[styles.skipButtonText, { color: selectedTeacher.color }]}>Skip → Watch YouTube Instead</Text>
+        </TouchableOpacity>
       </View>
     );
   }
@@ -755,7 +957,10 @@ export var VideoScreen: React.FC = function() {
 
       <View style={styles.tabsRow}>
         <TouchableOpacity style={[styles.tabBtn, activeTab === "video" && { borderBottomColor: sectionColor }]} onPress={function() { setActiveTab("video"); }}>
-          <Text style={[styles.tabLabel, activeTab === "video" && { color: sectionColor }]}>📺 Current</Text>
+          <Text style={[styles.tabLabel, activeTab === "video" && { color: sectionColor }]}>📺 AI Lesson</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.tabBtn, activeTab === "youtube" && { borderBottomColor: sectionColor }]} onPress={function() { setActiveTab("youtube"); Speech.stop(); setIsPlaying(false); }}>
+          <Text style={[styles.tabLabel, activeTab === "youtube" && { color: sectionColor }]}>▶️ YouTube</Text>
         </TouchableOpacity>
         <TouchableOpacity style={[styles.tabBtn, activeTab === "sections" && { borderBottomColor:  sectionColor }]} onPress={function() { setActiveTab("sections"); }}>
           <Text style={[styles.tabLabel, activeTab === "sections" && { color: sectionColor }]}>📑 Sections</Text>
@@ -766,10 +971,123 @@ export var VideoScreen: React.FC = function() {
       </View>
 
       <ScrollView style={styles.bottomContent}>
+        {/* YouTube Tab Content */}
+        {activeTab === "youtube" && (
+          <View style={styles.youtubeContainer}>
+            {/* Subtitle/Language Controls */}
+            <View style={styles.youtubeControls}>
+              <TouchableOpacity 
+                style={[styles.subtitleBtn, { borderColor: sectionColor }]} 
+                onPress={function() { setShowSubtitleMenu(true); }}
+              >
+                <Text style={styles.subtitleBtnText}>{selectedSubtitle.flag} {selectedSubtitle.name}</Text>
+                <Text style={styles.subtitleArrow}>▼</Text>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                style={[styles.captionToggle, showCaptions && { backgroundColor: sectionColor }]}
+                onPress={function() { setShowCaptions(!showCaptions); }}
+              >
+                <Text style={[styles.captionToggleText, showCaptions && { color: '#fff' }]}>
+                  {showCaptions ? '🔤 CC ON' : '🔤 CC OFF'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* YouTube Player */}
+            {selectedYoutubeVideo ? (
+              <View style={styles.youtubePlayerWrapper}>
+                <YoutubePlayer
+                  ref={youtubePlayerRef}
+                  height={220}
+                  width={SCREEN_WIDTH - 32}
+                  play={isYoutubePlaying}
+                  videoId={selectedYoutubeVideo.id}
+                  onChangeState={onYoutubeStateChange}
+                  initialPlayerParams={{
+                    cc_lang_pref: selectedSubtitle.code,
+                    cc_load_policy: showCaptions ? 1 : 0,
+                    modestbranding: true,
+                    rel: false,
+                  }}
+                />
+                <View style={styles.youtubeVideoInfo}>
+                  <Text style={styles.youtubeVideoTitle} numberOfLines={2}>{selectedYoutubeVideo.title}</Text>
+                  <Text style={styles.youtubeChannelName}>{selectedYoutubeVideo.channelTitle}</Text>
+                </View>
+              </View>
+            ) : isYoutubeLoading ? (
+              <View style={styles.youtubeLoading}>
+                <ActivityIndicator size="large" color={sectionColor} />
+                <Text style={styles.youtubeLoadingText}>Finding related videos...</Text>
+              </View>
+            ) : youtubeError ? (
+              <View style={styles.youtubeError}>
+                <Text style={styles.youtubeErrorEmoji}>📺</Text>
+                <Text style={styles.youtubeErrorText}>{youtubeError}</Text>
+                <TouchableOpacity 
+                  style={[styles.youtubeRetryBtn, { backgroundColor: sectionColor }]}
+                  onPress={function() { searchYoutubeVideos(youtubeSearchQuery || videoScript?.title || 'tutorial'); }}
+                >
+                  <Text style={styles.youtubeRetryText}>Try Again</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <View style={styles.youtubeEmpty}>
+                <Text style={styles.youtubeEmptyEmoji}>🔍</Text>
+                <Text style={styles.youtubeEmptyText}>Search for related videos</Text>
+              </View>
+            )}
+
+            {/* Video List */}
+            {youtubeVideos.length > 0 && (
+              <View style={styles.youtubeVideoList}>
+                <Text style={styles.youtubeListTitle}>📹 Related Videos</Text>
+                {youtubeVideos.map(function(video, index) {
+                  var isSelected = selectedYoutubeVideo?.id === video.id;
+                  return (
+                    <TouchableOpacity 
+                      key={video.id}
+                      style={[styles.youtubeVideoItem, isSelected && { borderLeftColor: sectionColor, backgroundColor: sectionColor + '15' }]}
+                      onPress={function() { 
+                        setSelectedYoutubeVideo(video); 
+                        setIsYoutubePlaying(true);
+                      }}
+                    >
+                      <Image source={{ uri: video.thumbnail }} style={styles.youtubeThumbnail} />
+                      <View style={styles.youtubeVideoItemInfo}>
+                        <Text style={styles.youtubeVideoItemTitle} numberOfLines={2}>{video.title}</Text>
+                        <Text style={styles.youtubeVideoItemChannel}>{video.channelTitle}</Text>
+                      </View>
+                      {isSelected && <Text style={styles.youtubeNowPlaying}>▶️</Text>}
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            )}
+          </View>
+        )}
+
         {activeTab === "video" && currentSection && (
           <View style={[styles.contentCard, { borderLeftColor: sectionColor }]}>
             <Text style={[styles.cardHeading, { color: sectionColor }]}>{currentSection.title}</Text>
             <Text style={styles.cardNarration}>{currentSection.narration}</Text>
+            
+            {/* Teaching Tip - YouTube-style explanation */}
+            {(currentSection as any).teachingTip && (
+              <View style={[styles.teachingTipBox, { borderColor: sectionColor }]}>
+                <Text style={styles.teachingTipHeading}>💡 Pro Tip</Text>
+                <Text style={styles.teachingTipText}>{(currentSection as any).teachingTip}</Text>
+              </View>
+            )}
+            
+            {/* Interactive Element - Engage the viewer */}
+            {(currentSection as any).interactiveElement && (
+              <View style={[styles.interactiveBox, { backgroundColor: sectionColor + '15' }]}>
+                <Text style={styles.interactiveHeading}>🤔 Think About It</Text>
+                <Text style={styles.interactiveText}>{(currentSection as any).interactiveElement}</Text>
+              </View>
+            )}
+            
             {currentSection.keyPoints && currentSection.keyPoints.length > 0 && (
               <View style={styles.keyPointsBox}>
                 <Text style={styles.keyPointsHeading}>📌 Key Points</Text>
@@ -832,6 +1150,46 @@ export var VideoScreen: React.FC = function() {
           </View>
         )}
       </ScrollView>
+
+      {/* Subtitle Language Selection Modal */}
+      <Modal
+        visible={showSubtitleMenu}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={function() { setShowSubtitleMenu(false); }}
+      >
+        <TouchableOpacity 
+          style={styles.modalOverlay} 
+          activeOpacity={1} 
+          onPress={function() { setShowSubtitleMenu(false); }}
+        >
+          <View style={styles.subtitleModal}>
+            <View style={styles.subtitleModalHeader}>
+              <Text style={styles.subtitleModalTitle}>🌐 Select Subtitle Language</Text>
+              <TouchableOpacity onPress={function() { setShowSubtitleMenu(false); }}>
+                <Text style={styles.subtitleModalClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.subtitleList}>
+              {SUBTITLE_LANGUAGES.map(function(lang) {
+                var isSelected = selectedSubtitle.code === lang.code;
+                return (
+                  <TouchableOpacity
+                    key={lang.code}
+                    style={[styles.subtitleOption, isSelected && { backgroundColor: sectionColor + '20', borderColor: sectionColor }]}
+                    onPress={function() { changeSubtitleLanguage(lang); }}
+                  >
+                    <Text style={styles.subtitleFlag}>{lang.flag}</Text>
+                    <Text style={[styles.subtitleLangName, isSelected && { color: sectionColor, fontWeight: 'bold' }]}>{lang.name}</Text>
+                    {isSelected && <Text style={[styles.subtitleCheck, { color: sectionColor }]}>✓</Text>}
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+            <Text style={styles.subtitleNote}>💡 Subtitles will be shown in your selected language when available on YouTube</Text>
+          </View>
+        </TouchableOpacity>
+      </Modal>
     </View>
   );
 };
@@ -864,6 +1222,8 @@ var styles = StyleSheet.create({
   progressBarBg: { width: "80%", height: 8, backgroundColor: "#30363d", borderRadius: 4, marginBottom: 16 },
   progressBarFill: { height: "100%", borderRadius: 4 },
   loadingMessage: { fontSize: 16, color: "#8b949e", textAlign: "center" },
+  skipButton: { marginTop: 30, paddingVertical: 14, paddingHorizontal: 24, borderRadius: 10, borderWidth: 2, backgroundColor: "transparent" },
+  skipButtonText: { fontSize: 15, fontWeight: "600" },
   errorText: { fontSize: 18, color: "#f85149", marginBottom: 20 },
   retryButton:  { backgroundColor: colors.primary, paddingHorizontal: 30, paddingVertical: 12, borderRadius: 8 },
   retryButtonText:  { color: "#fff", fontSize:  16, fontWeight: "600" },
@@ -920,12 +1280,18 @@ var styles = StyleSheet.create({
   optionBtn: { paddingVertical: 10, paddingHorizontal: 14, borderRadius: 10, borderWidth: 2, borderColor: '#30363d', backgroundColor: '#0d1117' },
   optionText: { color: '#c9d1d9', fontSize: 14, fontWeight: '600' },
   tabsRow:  { flexDirection: "row", borderBottomWidth: 1, borderBottomColor: "#30363d" },
-  tabBtn: { flex: 1, padding: 14, alignItems: "center", borderBottomWidth: 2, borderBottomColor: "transparent" },
-  tabLabel:  { fontSize: 13, color: "#8b949e" },
+  tabBtn: { flex: 1, padding: 12, alignItems: "center", borderBottomWidth: 2, borderBottomColor: "transparent" },
+  tabLabel:  { fontSize: 11, color: "#8b949e" },
   bottomContent: { flex: 1 },
   contentCard: { margin: 16, backgroundColor: "#161b22", borderRadius: 12, padding: 16, borderLeftWidth: 4 },
   cardHeading: { fontSize: 18, fontWeight:  "bold", marginBottom: 12 },
   cardNarration: { fontSize: 15, color: "#c9d1d9", lineHeight: 24 },
+  teachingTipBox: { marginTop: 16, padding: 14, backgroundColor: "#1a2332", borderRadius: 10, borderWidth: 1, borderLeftWidth: 4 },
+  teachingTipHeading: { fontSize: 14, fontWeight: "bold", color: "#ffa657", marginBottom: 8 },
+  teachingTipText: { fontSize: 14, color: "#c9d1d9", lineHeight: 22, fontStyle: "italic" },
+  interactiveBox: { marginTop: 12, padding: 14, borderRadius: 10 },
+  interactiveHeading: { fontSize: 14, fontWeight: "bold", color: "#58a6ff", marginBottom: 8 },
+  interactiveText: { fontSize: 14, color: "#c9d1d9", lineHeight: 22 },
   keyPointsBox: { marginTop: 16, paddingTop: 16, borderTopWidth: 1, borderTopColor: "#30363d" },
   keyPointsHeading:  { fontSize: 14, fontWeight: "bold", color: "#fff", marginBottom: 10 },
   keyPointLine:  { fontSize: 14, color: "#8b949e", marginBottom: 6, paddingLeft: 8 },
@@ -942,6 +1308,50 @@ var styles = StyleSheet.create({
   noteBoxTitle: { fontSize: 16, fontWeight: "bold", color: "#fff", marginBottom: 10 },
   noteBoxText:  { fontSize: 14, color: "#c9d1d9", lineHeight: 22 },
   noteListItem: { fontSize: 14, color: "#8b949e", marginBottom: 6 },
+  
+  // YouTube Integration Styles
+  youtubeContainer: { padding: 16 },
+  youtubeControls: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 16 },
+  subtitleBtn: { flexDirection: "row", alignItems: "center", paddingVertical: 10, paddingHorizontal: 14, borderRadius: 10, borderWidth: 2, backgroundColor: "#161b22" },
+  subtitleBtnText: { color: "#c9d1d9", fontSize: 14, fontWeight: "600" },
+  subtitleArrow: { color: "#8b949e", fontSize: 10, marginLeft: 8 },
+  captionToggle: { paddingVertical: 10, paddingHorizontal: 14, borderRadius: 10, backgroundColor: "#30363d" },
+  captionToggleText: { color: "#c9d1d9", fontSize: 12, fontWeight: "600" },
+  youtubePlayerWrapper: { backgroundColor: "#000", borderRadius: 12, overflow: "hidden", marginBottom: 16 },
+  youtubeVideoInfo: { padding: 12, backgroundColor: "#161b22" },
+  youtubeVideoTitle: { fontSize: 16, fontWeight: "bold", color: "#fff", marginBottom: 4 },
+  youtubeChannelName: { fontSize: 13, color: "#8b949e" },
+  youtubeLoading: { alignItems: "center", justifyContent: "center", padding: 40, backgroundColor: "#161b22", borderRadius: 12 },
+  youtubeLoadingText: { color: "#8b949e", fontSize: 14, marginTop: 12 },
+  youtubeError: { alignItems: "center", justifyContent: "center", padding: 40, backgroundColor: "#161b22", borderRadius: 12 },
+  youtubeErrorEmoji: { fontSize: 48, marginBottom: 12 },
+  youtubeErrorText: { color: "#f85149", fontSize: 14, textAlign: "center", marginBottom: 16 },
+  youtubeRetryBtn: { paddingVertical: 10, paddingHorizontal: 20, borderRadius: 8 },
+  youtubeRetryText: { color: "#fff", fontSize: 14, fontWeight: "600" },
+  youtubeEmpty: { alignItems: "center", justifyContent: "center", padding: 40, backgroundColor: "#161b22", borderRadius: 12 },
+  youtubeEmptyEmoji: { fontSize: 48, marginBottom: 12 },
+  youtubeEmptyText: { color: "#8b949e", fontSize: 14 },
+  youtubeVideoList: { marginTop: 8 },
+  youtubeListTitle: { fontSize: 16, fontWeight: "bold", color: "#fff", marginBottom: 12 },
+  youtubeVideoItem: { flexDirection: "row", alignItems: "center", backgroundColor: "#161b22", borderRadius: 10, padding: 10, marginBottom: 10, borderLeftWidth: 4, borderLeftColor: "transparent" },
+  youtubeThumbnail: { width: 100, height: 56, borderRadius: 6, backgroundColor: "#30363d" },
+  youtubeVideoItemInfo: { flex: 1, marginLeft: 12 },
+  youtubeVideoItemTitle: { fontSize: 13, fontWeight: "600", color: "#c9d1d9", marginBottom: 4 },
+  youtubeVideoItemChannel: { fontSize: 11, color: "#8b949e" },
+  youtubeNowPlaying: { fontSize: 16 },
+  
+  // Subtitle Modal Styles
+  modalOverlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.7)", justifyContent: "flex-end" },
+  subtitleModal: { backgroundColor: "#161b22", borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, maxHeight: "70%" },
+  subtitleModalHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 16, paddingBottom: 16, borderBottomWidth: 1, borderBottomColor: "#30363d" },
+  subtitleModalTitle: { fontSize: 18, fontWeight: "bold", color: "#fff" },
+  subtitleModalClose: { fontSize: 20, color: "#8b949e", padding: 4 },
+  subtitleList: { maxHeight: 300 },
+  subtitleOption: { flexDirection: "row", alignItems: "center", padding: 14, borderRadius: 10, borderWidth: 2, borderColor: "transparent", marginBottom: 8, backgroundColor: "#21262d" },
+  subtitleFlag: { fontSize: 24, marginRight: 12 },
+  subtitleLangName: { flex: 1, fontSize: 16, color: "#c9d1d9" },
+  subtitleCheck: { fontSize: 18, fontWeight: "bold" },
+  subtitleNote: { fontSize: 12, color: "#8b949e", textAlign: "center", marginTop: 16, fontStyle: "italic" },
 });
 
 export default VideoScreen;

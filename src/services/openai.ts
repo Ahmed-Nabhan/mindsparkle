@@ -23,15 +23,59 @@ export var generateSummary = async function(
       textContent = chunks.join('\n\n');
     }
 
+    // Helper: Check if text is garbage (custom font encoding)
+    const isGarbageText = (text: string): boolean => {
+      if (!text || text.length < 100) return true;
+      const sample = text.slice(0, 2000);
+      let letters = 0, symbols = 0;
+      for (let i = 0; i < sample.length; i++) {
+        const code = sample.charCodeAt(i);
+        if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) letters++;
+        else if (code >= 33 && code <= 126 && !'.,;:\'"!?()-[]/<> '.includes(sample[i])) symbols++;
+      }
+      const letterRatio = letters / sample.length;
+      const symbolRatio = symbols / sample.length;
+      // If less than 30% letters or more than 30% symbols, it's garbage
+      return letterRatio < 0.3 || symbolRatio > 0.3;
+    };
+
+    // Check if content is a help message (not actual document content)
+    const isHelpMessage = (text: string): boolean => {
+      const lower = text.toLowerCase();
+      return lower.includes('custom font encoding') || 
+             lower.includes('google drive') || 
+             lower.includes('google docs') ||
+             lower.includes('__needs_ocr__') ||
+             lower.includes('dev build') ||
+             lower.includes('quick fix') ||
+             lower.includes('requires ocr') ||
+             lower.includes('npx expo run') ||
+             lower.includes('standard text extraction');
+    };
+
+    // Return the actual help message directly
+    const returnHelpMessage = (lang: 'en' | 'ar' = 'en') => {
+      return lang === 'ar'
+        ? '# ⚠️ تعذر إنشاء الملخص\n\nهذا المستند يستخدم ترميز خطوط مخصص يتطلب OCR للقراءة.\n\n**الحل:**\n1. ارفع الملف إلى Google Drive\n2. انقر بزر الماوس الأيمن → فتح باستخدام → Google Docs\n3. انسخ النص والصقه في ملف .txt\n4. ارفع ملف .txt بدلاً من ذلك'
+        : '# ⚠️ Unable to Generate Summary\n\nThis PDF uses custom font encoding that requires OCR to read properly.\n\n**Quick Fix:**\n1. Upload the PDF to Google Drive\n2. Right-click → Open with → Google Docs\n3. Copy the text and paste into a .txt file\n4. Upload the .txt file instead\n\n*Google Docs will automatically OCR the document for free.*';
+    };
+
     // PRIORITY 1: Use existing extracted data if available (no API calls needed!)
     if (existingExtractedData && existingExtractedData.pages && existingExtractedData.pages.length > 0) {
-      console.log('Using cached extracted data for summary, language:', language);
-      if (onProgress) onProgress(50, language === 'ar' ? 'جاري إنشاء الملخص...' : 'Generating summary...');
-      
       var contentWithPages = existingExtractedData.pages.map(function(p: any) {
         var pageNum = p.pageNumber || p.pageNum;
         return '=== PAGE ' + pageNum + ' ===\n' + (p.text || '');
       }).join('\n\n');
+      
+      // Check if the cached data is garbage or help message
+      if (isGarbageText(contentWithPages) || isHelpMessage(contentWithPages)) {
+        console.log('[Summary] Cached data is garbage/help message, cannot generate summary');
+        if (onProgress) onProgress(100, language === 'ar' ? 'غير قادر على إنشاء ملخص' : 'Unable to generate summary');
+        return returnHelpMessage(language);
+      }
+      
+      console.log('Using cached extracted data for summary, language:', language);
+      if (onProgress) onProgress(50, language === 'ar' ? 'جاري إنشاء الملخص...' : 'Generating summary...');
       
       if (contentWithPages.length < 50) {
         contentWithPages = existingExtractedData.text || content || '';
@@ -50,20 +94,27 @@ export var generateSummary = async function(
       return header + summary;
     }
     
-    // PRIORITY 2: Use document content directly if sufficient
-    if (textContent && textContent.length > 200) {
+    // PRIORITY 2: Use document content directly if sufficient AND not garbage
+    if (textContent && textContent.length > 200 && !isGarbageText(textContent) && !isHelpMessage(textContent)) {
       console.log('Using document content directly');
       if (onProgress) onProgress(50, language === 'ar' ? 'جاري تحليل المحتوى...' : 'Analyzing content...');
       var summary = await ApiService.summarize(textContent, { language: language || 'en' });
       if (onProgress) onProgress(100, language === 'ar' ? 'تم!' : 'Done!');
       return summary;
     }
+    
+    // Check if textContent is garbage - return help message
+    if (textContent && (isGarbageText(textContent) || isHelpMessage(textContent))) {
+      console.log('[Summary] Document content is garbage/help message');
+      if (onProgress) onProgress(100, language === 'ar' ? 'غير قادر على إنشاء ملخص' : 'Unable to generate summary');
+      return returnHelpMessage(language);
+    }
 
     // PRIORITY 3: Handle PDF files - extract with page references (API may fail)
     if (fileUri && fileType && (fileType.indexOf('pdf') >= 0 || fileUri.toLowerCase().endsWith('.pdf'))) {
       
-      // Process document with page numbers - pass existing data to skip re-upload
-      var doc = await PdfService.processDocument(fileUri, onProgress, existingPdfUrl, existingExtractedData);
+      // Process document with page numbers - use OCR fallback for problematic PDFs
+      var doc = await PdfService.processDocumentWithOcrFallback(fileUri, onProgress);
       
       if (onProgress) onProgress(85, language === 'ar' ? 'جاري إنشاء الملخص مع مراجع الصفحات...' : 'Generating summary with page references...');
       
@@ -84,6 +135,8 @@ export var generateSummary = async function(
       var needsOcr = (doc as any).needsOcr || 
                      pdfContentWithPages === '__NEEDS_OCR__' || 
                      pdfContentWithPages.includes('__NEEDS_OCR__') ||
+                     isGarbageText(pdfContentWithPages) ||
+                     isHelpMessage(pdfContentWithPages) ||
                      !pdfContentWithPages || 
                      pdfContentWithPages.length < 50;
       

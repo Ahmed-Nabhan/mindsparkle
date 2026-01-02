@@ -1,3 +1,25 @@
+/**
+ * AuthScreen - User authentication interface
+ * 
+ * SUPPORTED AUTH METHODS:
+ * 1. Email/Password - Traditional sign in/up
+ * 2. Apple Sign In - Native iOS authentication with Face ID/Touch ID
+ * 3. Magic Link - Passwordless email authentication
+ * 4. Password Reset - Email-based password recovery
+ * 
+ * DATA FLOW:
+ * 1. User enters credentials or taps OAuth button
+ * 2. Validation occurs client-side
+ * 3. Auth request sent to Supabase
+ * 4. On success: JWT stored securely → AuthContext updated → Navigate to Main
+ * 5. On error: Display error message to user
+ * 
+ * UI STATES:
+ * - Loading: Shows spinner, disables inputs
+ * - Error: Shows alert with error message
+ * - Success: Navigates to main app
+ */
+
 import React, { useState, useEffect } from 'react';
 import {
   View,
@@ -19,24 +41,65 @@ import { useAuth } from '../context/AuthContext';
 import { supabase } from '../services/supabase';
 import { CommonActions } from '@react-navigation/native';
 
+// ============================================
+// TYPE DEFINITIONS
+// ============================================
+
 interface AuthScreenProps {
   navigation: any;
 }
 
-type AuthMode = 'signin' | 'signup' | 'forgot';
+/**
+ * Authentication modes:
+ * - signin: Email/password login
+ * - signup: Create new account
+ * - forgot: Password reset
+ * - magiclink: Passwordless login via email link
+ */
+type AuthMode = 'signin' | 'signup' | 'forgot' | 'magiclink';
+
+// ============================================
+// COMPONENT
+// ============================================
 
 export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
-  const { signIn, signUp } = useAuth();
+  // Get auth methods from context
+  const { 
+    signIn, 
+    signUp, 
+    signInWithApple, 
+    signInWithMagicLink,
+    resetPassword,
+    authError,
+    clearError,
+  } = useAuth();
   
+  // ============================================
+  // STATE
+  // ============================================
+  
+  // Form state
   const [mode, setMode] = useState<AuthMode>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  
+  // UI state
   const [isLoading, setIsLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [appleAuthAvailable, setAppleAuthAvailable] = useState(false);
+  
+  // Success message for magic link/reset
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
-  // Check if Apple Authentication is available
+  // ============================================
+  // EFFECTS
+  // ============================================
+
+  /**
+   * Check if Apple Authentication is available on this device
+   * Only available on iOS 13+ with Apple ID configured
+   */
   useEffect(() => {
     const checkAppleAuth = async () => {
       const isAvailable = await AppleAuthentication.isAvailableAsync();
@@ -45,21 +108,73 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
     checkAppleAuth();
   }, []);
 
-  // Native Apple Sign In with Face ID/Touch ID
+  /**
+   * Clear errors when switching auth modes
+   */
+  useEffect(() => {
+    clearError();
+    setSuccessMessage(null);
+  }, [mode, clearError]);
+
+  // ============================================
+  // VALIDATION
+  // ============================================
+
+  /**
+   * Validate email format using regex
+   */
+  const validateEmail = (email: string): boolean => {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email);
+  };
+
+  /**
+   * Validate password strength
+   * Requirements: min 8 characters
+   */
+  const validatePassword = (password: string): { valid: boolean; message?: string } => {
+    if (password.length < 8) {
+      return { valid: false, message: 'Password must be at least 8 characters' };
+    }
+    return { valid: true };
+  };
+
+  // ============================================
+  // AUTH HANDLERS
+  // ============================================
+
+  /**
+   * Handle Apple Sign In
+   * 
+   * FLOW:
+   * 1. Generate secure nonce for CSRF protection
+   * 2. Show native Apple Sign In sheet (Face ID/Touch ID)
+   * 3. Get identity token from Apple
+   * 4. Send token to Supabase for verification
+   * 5. Navigate to main app on success
+   * 
+   * SECURITY:
+   * - Nonce prevents replay attacks
+   * - Token is short-lived
+   * - Verified server-side by Supabase
+   */
   const handleAppleSignIn = async () => {
     try {
       setIsLoading(true);
+      clearError();
       
-      // Generate a secure nonce for security
+      // Generate a secure nonce for CSRF protection
+      // Raw nonce sent to Supabase, hashed nonce sent to Apple
       const rawNonce = Crypto.randomUUID();
       const hashedNonce = await Crypto.digestStringAsync(
         Crypto.CryptoDigestAlgorithm.SHA256,
         rawNonce
       );
 
-      console.log('Starting Apple Sign In with nonce...');
+      console.log('[Auth] Starting Apple Sign In with nonce...');
 
-      // This shows the native Apple Sign In sheet with Face ID/Touch ID
+      // Show native Apple Sign In sheet
+      // This triggers Face ID/Touch ID automatically
       const credential = await AppleAuthentication.signInAsync({
         requestedScopes: [
           AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
@@ -68,61 +183,21 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
         nonce: hashedNonce,
       });
 
-      console.log('Apple credential received, identity token present:', !!credential.identityToken);
+      console.log('[Auth] Apple credential received, identity token present:', !!credential.identityToken);
 
-      // Sign in with Supabase using the Apple ID token
+      // Verify token with Supabase
       if (credential.identityToken) {
-        console.log('Sending token to Supabase...');
+        console.log('[Auth] Sending token to Supabase...');
         
-        const { data, error } = await supabase.auth.signInWithIdToken({
-          provider: 'apple',
-          token: credential.identityToken,
-          nonce: rawNonce,
-        });
-
-        // Check if we got a session regardless of database errors
-        const session = data?.session;
-        const authUser = data?.user;
+        // Use context method which handles all the logic
+        await signInWithApple(credential.identityToken, rawNonce);
         
-        if (error) {
-          console.error('Supabase auth error:', JSON.stringify(error));
-          
-          // Handle database trigger errors gracefully
-          // Auth may have succeeded even if profile creation failed
-          if (error.message?.includes('Database error') || 
-              error.message?.includes('saving new user') ||
-              error.message?.includes('duplicate key') ||
-              error.message?.includes('violates') ||
-              error.message?.includes('trigger')) {
-            console.log('Profile creation issue, checking if auth succeeded...');
-            
-            // Check if we actually have a valid session despite the error
-            const { data: sessionData } = await supabase.auth.getSession();
-            if (sessionData?.session) {
-              console.log('Auth succeeded despite database error, proceeding...');
-              // Continue with navigation
-            } else if (!session) {
-              throw new Error('Authentication failed. Please try again.');
-            }
-          } else {
-            throw new Error(error.message || 'Supabase authentication failed');
-          }
-        }
+        console.log('[Auth] Apple Sign In successful, navigating to Main...');
         
-        console.log('Apple Sign In successful, user:', authUser?.id || 'checking session...');
-        
-        // Verify we have a valid session
-        const { data: finalSession } = await supabase.auth.getSession();
-        if (!finalSession?.session) {
-          throw new Error('Failed to establish session. Please try again.');
-        }
-        
-        console.log('Session verified, navigating to Main...');
-        
-        // Wait a moment for auth state to propagate
+        // Wait for auth state to propagate
         await new Promise(resolve => setTimeout(resolve, 300));
         
-        // Use reset to clear the navigation stack and go to Main
+        // Reset navigation stack and go to Main
         navigation.dispatch(
           CommonActions.reset({
             index: 0,
@@ -133,29 +208,26 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
         throw new Error('No identity token received from Apple');
       }
     } catch (error: any) {
+      // User cancelled - don't show error
       if (error.code === 'ERR_REQUEST_CANCELED') {
-        // User cancelled - do nothing
-        console.log('Apple Sign In cancelled by user');
+        console.log('[Auth] Apple Sign In cancelled by user');
         return;
       }
       
-      console.error('Apple Sign In error:', error);
+      console.error('[Auth] Apple Sign In error:', error);
       
-      // Provide more helpful error messages
+      // Map error to user-friendly message
       let errorMessage = 'Could not sign in with Apple. Please try again.';
       
       if (error.message) {
-        // Show the actual error message for debugging
-        errorMessage = error.message;
-        
-        if (errorMessage.includes('Network')) {
-          errorMessage = 'Network connection error. Please check your internet and try again.';
-        } else if (errorMessage.includes('invalid_grant')) {
+        if (error.message.includes('Network')) {
+          errorMessage = 'Network connection error. Please check your internet.';
+        } else if (error.message.includes('invalid_grant')) {
           errorMessage = 'Apple Sign In session expired. Please try again.';
-        } else if (errorMessage.includes('client_id')) {
-          errorMessage = 'App configuration error (Bundle ID mismatch). Please contact support.';
-        } else if (errorMessage.includes('Unacceptable audience')) {
-          errorMessage = 'Configuration Error: Your Bundle ID (com.ahmednabhan.mindsparkle) is not registered in Supabase. Please go to Supabase Dashboard > Authentication > Providers > Apple and add "com.ahmednabhan.mindsparkle" to the "Bundle ID" field.';
+        } else if (error.message.includes('Unacceptable audience')) {
+          errorMessage = 'Configuration Error: Bundle ID not registered in Supabase.';
+        } else {
+          errorMessage = error.message;
         }
       }
       
@@ -165,12 +237,15 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
     }
   };
 
-  const validateEmail = (email: string): boolean => {
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    return emailRegex.test(email);
-  };
-
+  /**
+   * Handle email/password sign in
+   * 
+   * VALIDATION:
+   * - Email format check
+   * - Non-empty password
+   */
   const handleSignIn = async () => {
+    // Validate inputs
     if (!email.trim() || !password) {
       Alert.alert('Error', 'Please fill in all fields');
       return;
@@ -183,8 +258,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
 
     try {
       setIsLoading(true);
+      clearError();
+      
+      // Sign in via context (handles JWT storage automatically)
       await signIn(email.trim().toLowerCase(), password);
-      // Navigation will happen automatically through auth state change
+      
+      // Navigation happens automatically via auth state change
+      console.log('[Auth] Sign in successful');
     } catch (error: any) {
       Alert.alert('Sign In Failed', error.message || 'Invalid email or password');
     } finally {
@@ -192,7 +272,16 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
     }
   };
 
+  /**
+   * Handle new account creation
+   * 
+   * VALIDATION:
+   * - Email format check
+   * - Password strength (min 8 chars)
+   * - Password confirmation match
+   */
   const handleSignUp = async () => {
+    // Validate inputs
     if (!email.trim() || !password || !confirmPassword) {
       Alert.alert('Error', 'Please fill in all fields');
       return;
@@ -203,8 +292,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
       return;
     }
 
-    if (password.length < 8) {
-      Alert.alert('Error', 'Password must be at least 8 characters');
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      Alert.alert('Error', passwordValidation.message);
       return;
     }
 
@@ -215,7 +305,12 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
 
     try {
       setIsLoading(true);
+      clearError();
+      
+      // Create account via context
       await signUp(email.trim().toLowerCase(), password);
+      
+      // Show verification email notice
       Alert.alert(
         'Check Your Email',
         'We sent you a verification link. Please check your email to complete registration.',
@@ -228,6 +323,10 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
     }
   };
 
+  /**
+   * Handle password reset request
+   * Sends email with reset link
+   */
   const handleForgotPassword = async () => {
     if (!email.trim()) {
       Alert.alert('Error', 'Please enter your email address');
@@ -241,12 +340,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
 
     try {
       setIsLoading(true);
-      // Import the resetPassword function from supabase service
-      const { supabase } = require('../services/supabase');
-      const { error } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase());
+      clearError();
       
-      if (error) throw error;
+      // Use context method
+      await resetPassword(email.trim().toLowerCase());
       
+      // Show success message
+      setSuccessMessage('Password reset email sent! Check your inbox.');
       Alert.alert(
         'Password Reset Email Sent',
         'Check your email for a link to reset your password.',
@@ -259,6 +359,45 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
     }
   };
 
+  /**
+   * Handle Magic Link (passwordless) sign in
+   * Sends email with login link
+   */
+  const handleMagicLink = async () => {
+    if (!email.trim()) {
+      Alert.alert('Error', 'Please enter your email address');
+      return;
+    }
+
+    if (!validateEmail(email)) {
+      Alert.alert('Error', 'Please enter a valid email address');
+      return;
+    }
+
+    try {
+      setIsLoading(true);
+      clearError();
+      
+      // Send magic link via context
+      await signInWithMagicLink(email.trim().toLowerCase());
+      
+      // Show success message
+      setSuccessMessage('Magic link sent! Check your email to sign in.');
+      Alert.alert(
+        'Magic Link Sent',
+        'Check your email for a link to sign in. No password needed!',
+        [{ text: 'OK' }]
+      );
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Could not send magic link');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  /**
+   * Route to appropriate handler based on auth mode
+   */
   const handleSubmit = () => {
     switch (mode) {
       case 'signin':
@@ -270,12 +409,23 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
       case 'forgot':
         handleForgotPassword();
         break;
+      case 'magiclink':
+        handleMagicLink();
+        break;
     }
   };
 
+  /**
+   * Skip authentication and continue as guest
+   * Limited functionality without account
+   */
   const handleContinueAsGuest = () => {
     navigation.replace('Main');
   };
+
+  // ============================================
+  // RENDER
+  // ============================================
 
   return (
     <KeyboardAvoidingView
@@ -299,13 +449,22 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
             {mode === 'signin' && 'Welcome Back'}
             {mode === 'signup' && 'Create Account'}
             {mode === 'forgot' && 'Reset Password'}
+            {mode === 'magiclink' && 'Magic Link Sign In'}
           </Text>
 
           <Text style={styles.subtitle}>
             {mode === 'signin' && 'Sign in to continue learning'}
             {mode === 'signup' && 'Join MindSparkle today'}
             {mode === 'forgot' && 'Enter your email to reset password'}
+            {mode === 'magiclink' && 'No password needed - we\'ll email you a link'}
           </Text>
+
+          {/* Success Message */}
+          {successMessage && (
+            <View style={styles.successBanner}>
+              <Text style={styles.successText}>✅ {successMessage}</Text>
+            </View>
+          )}
 
           {/* Email Input */}
           <View style={styles.inputContainer}>
@@ -326,8 +485,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
             </View>
           </View>
 
-          {/* Password Input - Hide for forgot mode */}
-          {mode !== 'forgot' && (
+          {/* Password Input - Hide for forgot and magiclink modes */}
+          {(mode === 'signin' || mode === 'signup') && (
             <View style={styles.inputContainer}>
               <Text style={styles.inputLabel}>Password</Text>
               <View style={styles.inputWrapper}>
@@ -373,12 +532,20 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
 
           {/* Forgot Password Link */}
           {mode === 'signin' && (
-            <TouchableOpacity
-              style={styles.forgotButton}
-              onPress={() => setMode('forgot')}
-            >
-              <Text style={styles.forgotText}>Forgot Password?</Text>
-            </TouchableOpacity>
+            <View style={styles.forgotContainer}>
+              <TouchableOpacity
+                style={styles.forgotButton}
+                onPress={() => setMode('forgot')}
+              >
+                <Text style={styles.forgotText}>Forgot Password?</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.forgotButton}
+                onPress={() => setMode('magiclink')}
+              >
+                <Text style={styles.magicLinkText}>🔗 Magic Link</Text>
+              </TouchableOpacity>
+            </View>
           )}
 
           {/* Submit Button */}
@@ -394,12 +561,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
                 {mode === 'signin' && 'Sign In'}
                 {mode === 'signup' && 'Create Account'}
                 {mode === 'forgot' && 'Send Reset Link'}
+                {mode === 'magiclink' && 'Send Magic Link'}
               </Text>
             )}
           </TouchableOpacity>
 
           {/* Social Login Divider */}
-          {mode !== 'forgot' && (
+          {(mode === 'signin' || mode === 'signup') && (
             <>
               <View style={styles.divider}>
                 <View style={styles.dividerLine} />
@@ -450,7 +618,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
                 </TouchableOpacity>
               </>
             )}
-            {mode === 'forgot' && (
+            {(mode === 'forgot' || mode === 'magiclink') && (
               <TouchableOpacity onPress={() => setMode('signin')}>
                 <Text style={styles.switchLink}>← Back to Sign In</Text>
               </TouchableOpacity>
@@ -560,13 +728,35 @@ const styles = StyleSheet.create({
   eyeButton: {
     padding: 8,
   },
-  forgotButton: {
-    alignSelf: 'flex-end',
+  forgotContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     marginBottom: 20,
+  },
+  forgotButton: {
+    padding: 4,
   },
   forgotText: {
     color: colors.primary,
     fontSize: 14,
+  },
+  magicLinkText: {
+    color: colors.secondary || colors.primary,
+    fontSize: 14,
+  },
+  successBanner: {
+    backgroundColor: '#d4edda',
+    borderColor: '#c3e6cb',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 16,
+  },
+  successText: {
+    color: '#155724',
+    fontSize: 14,
+    textAlign: 'center',
   },
   submitButton: {
     backgroundColor: colors.primary,

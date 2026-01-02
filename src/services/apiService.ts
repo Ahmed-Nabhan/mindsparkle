@@ -452,7 +452,7 @@ export var generateStudyGuide = async function(
   return { structured: null, text: allGuides.join('\n\n---\n\n') };
 };
 
-// Generate video script with slides - covers ENTIRE document using parallel processing
+// Generate video script with slides - uses smart sampling for large documents
 export var generateVideoScript = async function(
   pages: { pageNum: number; text: string; imageUrl?: string }[],
   options?: { language?: 'en' | 'ar' | string; style?: string; useAnimations?: boolean }
@@ -468,17 +468,50 @@ export var generateVideoScript = async function(
   }[];
   conclusion: string;
 }> {
-  console.log('Generating video script for', pages.length, 'pages using parallel processing');
+  console.log('Generating video script for', pages.length, 'pages');
+  
+  // OPTIMIZATION: For large documents, sample key pages instead of processing all
+  // This reduces a 350-page doc from 44 API calls to just 3-4 calls
+  var MAX_VIDEO_PAGES = 24; // Max pages for video (creates ~8-12 sections)
+  var sampled = pages;
+  
+  if (pages.length > MAX_VIDEO_PAGES) {
+    console.log('Large document detected, sampling', MAX_VIDEO_PAGES, 'key pages from', pages.length);
+    sampled = [];
+    var step = Math.floor(pages.length / MAX_VIDEO_PAGES);
+    
+    // Always include first 3 pages (intro/TOC)
+    sampled.push(...pages.slice(0, 3));
+    
+    // Sample evenly from the rest
+    for (var i = 3; i < pages.length && sampled.length < MAX_VIDEO_PAGES - 2; i += step) {
+      if (!sampled.find(function(p) { return p.pageNum === pages[i].pageNum; })) {
+        sampled.push(pages[i]);
+      }
+    }
+    
+    // Always include last 2 pages (conclusion/summary)
+    var lastPages = pages.slice(-2);
+    lastPages.forEach(function(p) {
+      if (!sampled.find(function(s) { return s.pageNum === p.pageNum; })) {
+        sampled.push(p);
+      }
+    });
+    
+    // Sort by page number
+    sampled.sort(function(a, b) { return a.pageNum - b.pageNum; });
+    console.log('Sampled pages:', sampled.map(function(p) { return p.pageNum; }).join(', '));
+  }
   
   // For small documents (<=8 pages), process in single request
-  if (pages.length <= 8) {
-    var content = pages.map(function(p) {
+  if (sampled.length <= 8) {
+    var content = sampled.map(function(p) {
       return '=== PAGE ' + p.pageNum + ' ===\n' + (p.text || '');
     }).join('\n\n');
     
     var payload: any = {
       content: (content || '').substring(0, Config.MAX_CONTENT_LENGTH),
-      pageCount: pages.length,
+      pageCount: sampled.length,
       totalPages: pages[pages.length - 1]?.pageNum || pages.length,
       language: options?.language || 'en',
       style: options?.style || 'educational',
@@ -503,17 +536,17 @@ export var generateVideoScript = async function(
     return script;
   }
   
-  // For large documents, split into chunks and process in parallel (50 concurrent)
-  var PAGES_PER_CHUNK = 8; // More pages per chunk = fewer API calls
+  // For medium documents (9-24 pages), split into chunks and process in parallel
+  var PAGES_PER_CHUNK = 8;
   var chunks: { pageNum: number; text: string; imageUrl?: string }[][] = [];
   
-  for (var i = 0; i < pages.length; i += PAGES_PER_CHUNK) {
-    chunks.push(pages.slice(i, i + PAGES_PER_CHUNK));
+  for (var i = 0; i < sampled.length; i += PAGES_PER_CHUNK) {
+    chunks.push(sampled.slice(i, i + PAGES_PER_CHUNK));
   }
   
-  console.log('INSTANT VIDEO: Processing', chunks.length, 'chunks (50 concurrent max)');
+  console.log('VIDEO: Processing', chunks.length, 'chunks (max 3-4 API calls)');
   
-  // Process chunks in batches of 50 for controlled parallelism
+  // Process chunks in parallel
   var allSections = await processBatched(chunks, function(chunk, chunkIndex) {
     var chunkContent = chunk.map(function(p) {
       return '=== PAGE ' + p.pageNum + ' ===\n' + (p.text || '');
@@ -581,6 +614,64 @@ export var chat = async function(
   return response.response || response.message || '';
 };
 
+// YouTube video search - finds educational videos based on document topic
+export var searchYoutubeVideos = async function(
+  query: string,
+  options?: { language?: string; maxResults?: number }
+): Promise<{
+  id: string;
+  title: string;
+  description: string;
+  thumbnail: string;
+  channelTitle: string;
+  publishedAt: string;
+  duration?: string;
+}[]> {
+  try {
+    console.log(`Searching YouTube for: "${query}" in language: ${options?.language || 'en'}`);
+    
+    var response = await callApi('youtube_search', {
+      query: query,
+      language: options?.language || 'en',
+      maxResults: options?.maxResults || 10,
+    });
+    
+    if (response.videos && Array.isArray(response.videos)) {
+      console.log(`Found ${response.videos.length} YouTube videos`);
+      return response.videos;
+    }
+    
+    return [];
+  } catch (error: any) {
+    console.error('YouTube search failed:', error?.message || error);
+    throw new Error('Could not search YouTube videos. Please try again.');
+  }
+};
+
+// Get YouTube video captions/subtitles
+export var getYoutubeSubtitles = async function(
+  videoId: string,
+  language?: string
+): Promise<{
+  available: { code: string; name: string }[];
+  captions?: { start: number; duration: number; text: string }[];
+}> {
+  try {
+    var response = await callApi('youtube_captions', {
+      videoId: videoId,
+      language: language || 'en',
+    });
+    
+    return {
+      available: response.available || [],
+      captions: response.captions || [],
+    };
+  } catch (error: any) {
+    console.error('Could not get YouTube captions:', error?.message || error);
+    return { available: [], captions: [] };
+  }
+};
+
 export default {
   callApi,
   summarize,
@@ -588,4 +679,6 @@ export default {
   generateStudyGuide,
   generateVideoScript,
   chat,
+  searchYoutubeVideos,
+  getYoutubeSubtitles,
 };

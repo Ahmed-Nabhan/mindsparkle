@@ -21,6 +21,21 @@ interface ProcessedDocument {
 }
 
 /**
+ * Get file size in MB
+ */
+const getFileSizeMB = async (fileUri: string): Promise<number> => {
+  try {
+    const info = await FileSystem.getInfoAsync(fileUri);
+    if (info.exists && !info.isDirectory) {
+      return ((info as any).size || 0) / (1024 * 1024);
+    }
+  } catch (e) {
+    console.log('[PDFService] Could not get file size');
+  }
+  return 0;
+};
+
+/**
  * Read file as base64
  */
 
@@ -136,13 +151,16 @@ export const processDocument = async (
   if (onProgress) onProgress(5, 'Starting extraction...');
 
   // PRIORITY 2: Try native PdfExtractor (best local extraction)
+  let localExtractionQuality: string = 'unknown';
   try {
     if (onProgress) onProgress(10, 'Extracting text...');
     
     const extractorResult = await extractPdfText(fileUri, onProgress);
+    localExtractionQuality = (extractorResult as any).extractionQuality || 'unknown';
     
-    if (extractorResult.fullText && extractorResult.fullText.length > 100) {
-      console.log('[PDFService] Native extraction successful:', extractorResult.pageCount, 'pages,', extractorResult.fullText.length, 'chars');
+    // Only use local extraction if quality is good (not garbage)
+    if (extractorResult.fullText && extractorResult.fullText.length > 100 && localExtractionQuality !== 'garbage') {
+      console.log('[PDFService] Native extraction successful:', extractorResult.pageCount, 'pages,', extractorResult.fullText.length, 'chars, quality:', localExtractionQuality);
       
       if (onProgress) onProgress(100, 'Extraction complete!');
       
@@ -158,56 +176,132 @@ export const processDocument = async (
       };
     }
     
-    console.log('[PDFService] Native extraction got limited text');
+    console.log('[PDFService] Native extraction got limited/poor quality text:', localExtractionQuality);
   } catch (error: any) {
     console.log('[PDFService] Native extraction failed:', error.message);
   }
 
-  // PRIORITY 3: Basic binary extraction (fallback)
-  try {
-    if (onProgress) onProgress(50, 'Extracting text (method 2)...');
-    
-    const result = await basicBinaryExtraction(fileUri);
-    
-    if (result.fullText && result.fullText.length > 50) {
-      console.log('[PDFService] Basic extraction got:', result.fullText.length, 'chars');
+  // PRIORITY 3: Basic binary extraction (fallback) - skip if we already know quality is garbage
+  if (localExtractionQuality !== 'garbage') {
+    try {
+      if (onProgress) onProgress(50, 'Extracting text (method 2)...');
       
-      if (onProgress) onProgress(100, 'Extraction complete!');
-      return result;
+      const result = await basicBinaryExtraction(fileUri);
+      
+      if (result.fullText && result.fullText.length > 50) {
+        console.log('[PDFService] Basic extraction got:', result.fullText.length, 'chars');
+        
+        if (onProgress) onProgress(100, 'Extraction complete!');
+        return result;
+      }
+    } catch (error: any) {
+      console.log('[PDFService] Basic extraction failed:', error.message);
     }
-  } catch (error: any) {
-    console.log('[PDFService] Basic extraction failed:', error.message);
   }
 
-  // PRIORITY 4: Google Document AI (1000 pages FREE/month, then $0.001/page)
-  try {
-    if (onProgress) onProgress(60, 'Using Google Document AI...');
-    console.log('[PDFService] Trying Google Document AI...');
-    
-    const base64 = await FileSystem.readAsStringAsync(fileUri, {
-      encoding: FileSystem.EncodingType.Base64,
-    });
-    
-    const result = await callApi('extractPdf', { pdfBase64: base64 });
-    
-    if (result.success && result.text && result.text.length > 50) {
-      console.log('[PDFService] Google Document AI successful:', result.pageCount, 'pages,', result.text.length, 'chars');
+  // PRIORITY 4: Cloud extraction with pdf-parse - works better for custom fonts
+  // Try cloud for files up to 15MB (after base64 encoding ~20MB)
+  const fileSizeMB = await getFileSizeMB(fileUri);
+  
+  if (fileSizeMB < 15) {
+    try {
+      if (onProgress) onProgress(55, 'Using cloud extraction...');
+      console.log('[PDFService] Trying cloud pdf-parse extraction (local quality was:', localExtractionQuality, ', size:', fileSizeMB.toFixed(1), 'MB)');
       
-      if (onProgress) onProgress(100, 'Extraction complete!');
+      if (onProgress) onProgress(60, 'Uploading to cloud...');
       
+      const base64 = await FileSystem.readAsStringAsync(fileUri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      
+      if (onProgress) onProgress(75, 'Extracting text...');
+      
+      const result = await callApi('extractPdf', { 
+        pdfBase64: base64,
+      });
+      
+      if (result.success && result.text && result.text.length > 100) {
+        console.log('[PDFService] Cloud extraction successful:', result.pageCount, 'pages,', result.text.length, 'chars, method:', result.method);
+        
+        if (onProgress) onProgress(100, 'Extraction complete!');
+        
+        return {
+          pdfUrl: fileUri,
+          pageCount: result.pageCount || result.pages?.length || 1,
+          pages: (result.pages || []).map((p: any) => ({
+            pageNum: p.pageNum,
+            text: p.text,
+            imageUrl: undefined,
+          })),
+          fullText: result.text,
+        };
+      }
+      
+      // If we got here, extraction returned but with no/little text
+      if (result.error || result.needsImages) {
+        console.log('[PDFService] Cloud extraction needs images:', result.message || result.error);
+      }
+    } catch (error: any) {
+      console.log('[PDFService] Cloud extraction failed:', error.message);
+    }
+  } else {
+    console.log('[PDFService] Large file (' + fileSizeMB.toFixed(1) + 'MB) - will use cloud chunked processing.');
+  }
+
+  // If all methods fail, return the garbage text with a note
+  // This is better than showing nothing
+  if (localExtractionQuality === 'garbage') {
+    console.log('[PDFService] All methods failed. PDF has custom font encoding.');
+    if (onProgress) onProgress(100, 'Complex PDF - processing in cloud...');
+    
+    // For large files, let cloud handle it with chunked processing
+    const isLargeFile = fileSizeMB > 15;
+    
+    if (isLargeFile) {
+      // Large files will be processed server-side with chunked extraction
       return {
         pdfUrl: fileUri,
-        pageCount: result.pageCount || result.pages?.length || 1,
-        pages: (result.pages || []).map((p: any) => ({
-          pageNum: p.pageNum,
-          text: `=== PAGE ${p.pageNum} ===\n${p.text}`,
-          imageUrl: undefined,
-        })),
-        fullText: result.text,
+        pageCount: 1,
+        pages: [{ pageNum: 1, text: '__CLOUD_PROCESSING__', imageUrl: undefined }],
+        fullText: '__CLOUD_PROCESSING__',
+        needsOcr: false, // Server will handle OCR if needed
       };
     }
-  } catch (error: any) {
-    console.log('[PDFService] Google Document AI failed:', error.message);
+    
+    // For smaller files with custom fonts, provide guidance
+    const helpfulText = `**📄 PDF Processing Notice**
+
+This PDF (${fileSizeMB.toFixed(1)}MB) uses embedded custom fonts that standard text extraction cannot read.
+
+**🔧 How to Fix:**
+
+**Option 1 - Google Drive (Recommended):**
+1. Upload the PDF to Google Drive
+2. Right-click → "Open with" → "Google Docs"
+3. Google will convert and OCR the text
+4. Copy all text and save as a .txt file
+5. Upload the .txt file to MindSparkle
+
+**Option 2 - Adobe Reader:**
+1. Open in Adobe Acrobat Reader (free)
+2. File → "Export PDF" → "Text" or copy text
+3. Save as .txt and upload
+
+**Option 3 - Online Converters:**
+• ilovepdf.com/pdf_to_txt
+• smallpdf.com/pdf-to-text
+• pdftotext.com
+
+**💡 Why This Happens:**
+Cisco training materials, textbooks, and some enterprise PDFs use proprietary font encoding for security. The text appears normal when viewing but is encoded differently in the file structure.`;
+    
+    return {
+      pdfUrl: fileUri,
+      pageCount: 1,
+      pages: [{ pageNum: 1, text: helpfulText, imageUrl: undefined }],
+      fullText: helpfulText,
+      needsOcr: true,
+    };
   }
 
   // If all methods fail, return with flag for manual intervention
@@ -242,46 +336,85 @@ export const extractPageImages = async (pdfUrl: string, pages: number[], onProgr
 };
 
 /**
- * OCR for scanned PDFs using OpenAI Vision
- * This uses your existing OpenAI credits (~$0.001-0.003 per page)
- * Much cheaper than PDF.co!
+ * OCR for scanned PDFs
+ * 
+ * NOTE: OpenAI Vision API does NOT support PDF files directly.
+ * It only accepts images (JPEG, PNG, GIF, WEBP).
+ * 
+ * For PDF OCR, use one of these methods:
+ * 1. Server-side: Edge Function extract-text handles OCR via signed URL
+ * 2. Native build: Use react-native-vision-camera for on-device OCR
+ * 3. Manual: User converts PDF via Google Drive or online tools
+ * 
+ * This function now returns a helpful message instead of failing.
  */
 export const performOcrWithOpenAI = async (
   fileUri: string,
   onProgress?: (progress: number, message: string) => void
 ): Promise<string> => {
-  try {
-    if (onProgress) onProgress(10, 'Preparing for OCR...');
+  console.log('[PDFService] OCR requested - OpenAI Vision does not support PDF files directly');
+  
+  // Check file extension
+  const isPdf = fileUri.toLowerCase().includes('.pdf');
+  
+  if (isPdf) {
+    console.log('[PDFService] PDF files cannot be sent to Vision API (only images supported)');
     
-    // Read PDF as base64
+    // Return a helpful message instead of crashing
+    if (onProgress) onProgress(100, 'PDF requires cloud processing');
+    
+    // This error will be caught and a helpful message shown to the user
+    throw new Error(
+      'PDF OCR is handled by cloud processing. ' +
+      'If cloud extraction failed, please try:\n\n' +
+      '1. Google Drive: Upload PDF → Open with Google Docs → Copy text\n' +
+      '2. Adobe Reader: Export PDF to Text\n' +
+      '3. Online: ilovepdf.com/pdf_to_txt'
+    );
+  }
+  
+  // For images (not PDFs), we can try Vision API
+  try {
+    if (onProgress) onProgress(10, 'Preparing image for OCR...');
+    
     const base64 = await FileSystem.readAsStringAsync(fileUri, {
       encoding: FileSystem.EncodingType.Base64,
     });
     
+    // Detect image type
+    let mimeType = 'image/png';
+    const lowerUri = fileUri.toLowerCase();
+    if (lowerUri.includes('.jpg') || lowerUri.includes('.jpeg')) {
+      mimeType = 'image/jpeg';
+    } else if (lowerUri.includes('.gif')) {
+      mimeType = 'image/gif';
+    } else if (lowerUri.includes('.webp')) {
+      mimeType = 'image/webp';
+    }
+    
     if (onProgress) onProgress(30, 'Sending to AI for text recognition...');
     
-    // Create data URL for the image/PDF
-    const dataUrl = `data:application/pdf;base64,${base64}`;
+    const dataUrl = `data:${mimeType};base64,${base64}`;
     
-    // Call OpenAI Vision OCR through your Supabase function
-    const response = await callApi('ocr', {
-      imageUrls: [dataUrl],
+    const response = await callApi('callOpenAIVision', {
+      imageUrl: dataUrl,
+      prompt: 'Extract ALL text from this image. Preserve structure and formatting. Output only the extracted text.',
     });
     
     if (onProgress) onProgress(90, 'Processing OCR results...');
     
-    const text = response?.text || '';
+    const text = response?.text || response?.content || '';
     
     if (text && text.length > 50) {
-      console.log('[PDFService] OCR successful:', text.length, 'chars');
+      console.log('[PDFService] Image OCR successful:', text.length, 'chars');
       if (onProgress) onProgress(100, 'OCR complete!');
       return text;
     }
     
     throw new Error('OCR returned insufficient text');
   } catch (error: any) {
-    console.error('[PDFService] OCR failed:', error.message);
-    throw new Error('Could not read scanned PDF. Please try a text-based PDF.');
+    console.error('[PDFService] Image OCR failed:', error.message);
+    throw error;
   }
 };
 

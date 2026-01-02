@@ -6,6 +6,7 @@ export interface Document {
   fileType: string;
   fileSize: number;
   uploadedAt: Date;
+  updatedAt?: Date;
   content?:  string;
   chunks?: string[];
   totalChunks?: number;

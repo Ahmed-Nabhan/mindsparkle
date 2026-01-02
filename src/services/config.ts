@@ -23,10 +23,10 @@ export var Config = {
   // No paid API keys needed!
   
   // Processing Limits - MAXIMUM SPEED (aggressive parallelism)
-  MAX_CONTENT_LENGTH: 200000, // ~50k tokens - larger single request = instant for most docs
-  MAX_CHUNK_SIZE: 120000, // Larger chunks = fewer API calls = FASTER for huge docs
-  PAGES_PER_CHUNK: 50,
-  MAX_IMAGES_PER_PAGE: 3,
+  MAX_CONTENT_LENGTH: 400000, // ~100k tokens - handles documents up to 200+ pages in one request
+  MAX_CHUNK_SIZE: 200000, // Larger chunks = fewer API calls = FASTER for huge docs
+  PAGES_PER_CHUNK: 100, // Process 100 pages per chunk for faster summaries
+  MAX_IMAGES_PER_PAGE: 5, // More images per page for visual documents
   
   // Timeouts (ms)
   API_TIMEOUT: 300000, // 5 minutes for AI processing

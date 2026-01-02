@@ -114,7 +114,25 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
     }
   }, [user?.id]);
 
-  // Reset daily counters at midnight
+  // 👑 Check premium status when user email changes
+  // This ensures owner gets Pro access immediately after sign in
+  useEffect(() => {
+    const OWNER_EMAIL = 'ahmedadel737374@icloud.com';
+    if (user?.email?.toLowerCase() === OWNER_EMAIL.toLowerCase()) {
+      console.log('[Premium] 👑 Owner email detected - auto-granting Pro!');
+      setIsPremium(true);
+      setFeatures(PRO_TIER_LIMITS);
+      setSubscription({
+        isActive: true,
+        willRenew: true,
+        periodType: 'normal',
+        expirationDate: null,
+        productIdentifier: 'owner_free_pro',
+      });
+    }
+  }, [user?.email]);
+
+  // Reset daily counters at midnight - only runs once on mount
   useEffect(() => {
     const today = new Date().toDateString();
     if (lastResetDate !== today) {
@@ -122,7 +140,8 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
       setDailyChatCount(0);
       setLastResetDate(today);
     }
-  }, [lastResetDate]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only run on mount, not when lastResetDate changes
 
   const initializeRevenueCat = async () => {
     try {
@@ -159,6 +178,31 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
 
   const checkPremiumStatus = useCallback(async () => {
     try {
+      // 👑 OWNER GETS FREE PRO ACCESS!
+      // Only the app owner (ahmedadel737374@icloud.com) gets automatic Pro
+      const OWNER_EMAIL = 'ahmedadel737374@icloud.com';
+      const isOwner = user?.email?.toLowerCase() === OWNER_EMAIL.toLowerCase();
+      
+      if (isOwner) {
+        console.log('[Premium] 👑 Owner account detected - granting Pro access automatically!');
+        setSubscription({
+          isActive: true,
+          willRenew: true,
+          periodType: 'normal',
+          expirationDate: null, // Never expires for owner
+          productIdentifier: 'owner_free_pro',
+        });
+        setIsPremium(true);
+        setFeatures(PRO_TIER_LIMITS);
+        
+        // Update cloud storage limit
+        if (user?.id) {
+          CloudStorage.updateStorageLimit(user.id, true).catch(console.error);
+        }
+        return;
+      }
+      
+      // Regular RevenueCat check for other users
       const status = await revenueCatService.checkSubscriptionStatus();
       setSubscription(status);
       setIsPremium(status.isActive);
@@ -170,10 +214,20 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
       }
     } catch (error) {
       console.error('Error checking premium status:', error);
+      
+      // Even on error, owner still gets Pro
+      const OWNER_EMAIL = 'ahmedadel737374@icloud.com';
+      if (user?.email?.toLowerCase() === OWNER_EMAIL.toLowerCase()) {
+        console.log('[Premium] 👑 Owner account (fallback) - granting Pro access!');
+        setIsPremium(true);
+        setFeatures(PRO_TIER_LIMITS);
+        return;
+      }
+      
       setIsPremium(false);
       setFeatures(FREE_TIER_LIMITS);
     }
-  }, [user?.id]);
+  }, [user?.id, user?.email]);
 
   const purchaseProduct = async (productId: string): Promise<boolean> => {
     try {

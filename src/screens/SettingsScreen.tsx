@@ -129,6 +129,33 @@ export const SettingsScreen: React.FC = () => {
                   <Text style={styles.statusText}>{isPremium ? 'PRO' : 'FREE'}</Text>
                 </View>
               </View>
+              
+              {/* Sign Out Button */}
+              <TouchableOpacity 
+                style={styles.signOutButton}
+                onPress={() => {
+                  Alert.alert(
+                    'Sign Out',
+                    'Are you sure you want to sign out? You will need to sign in again to access your documents.',
+                    [
+                      { text: 'Cancel', style: 'cancel' },
+                      {
+                        text: 'Sign Out',
+                        style: 'destructive',
+                        onPress: async () => {
+                          try {
+                            await signOut();
+                          } catch (error: any) {
+                            Alert.alert('Error', error.message || 'Failed to sign out');
+                          }
+                        },
+                      },
+                    ]
+                  );
+                }}
+              >
+                <Text style={styles.signOutText}>Sign Out</Text>
+              </TouchableOpacity>
             </>
           ) : (
             <TouchableOpacity 
@@ -485,6 +512,24 @@ const styles = StyleSheet.create({
   deleteText: {
     color: colors.error,
     fontSize: 14,
+    fontWeight: '600',
+  },
+  signOutButton: {
+    marginTop: 16,
+    paddingTop: 12,
+    paddingBottom: 12,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    alignItems: 'center',
+    backgroundColor: colors.error + '10',
+    marginHorizontal: -16,
+    marginBottom: -16,
+    borderBottomLeftRadius: 12,
+    borderBottomRightRadius: 12,
+  },
+  signOutText: {
+    color: colors.error,
+    fontSize: 16,
     fontWeight: '600',
   },
   footer: {

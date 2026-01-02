@@ -1,22 +1,10 @@
-import { useState, useEffect } from 'react';
-import { Document, DocumentUploadResult, ExtractedData } from '../types/document';
-import { saveDocument, getAllDocuments, getDocumentById, updateDocumentExtractedData, updateDocumentSummary } from '../services/storage';
-import { parseDocument } from '../services/documentParser';
-import * as PdfService from '../services/pdfService';
-import * as PdfImageService from '../services/pdfImageService';
-import * as CloudStorage from '../services/cloudStorageService';
-import { generateId } from '../utils/helpers';
+import { useState, useEffect, useCallback } from 'react';
+import { Document, DocumentUploadResult } from '../types/document';
+import { saveDocument, getAllDocuments, getDocumentById, deleteDocument, deleteAllDocuments } from '../services/storage';
 import { supabase } from '../services/supabase';
-import { summarize } from '../services/apiService';
-
-// Helper to split text into chunks
-const splitTextIntoChunks = (text: string, chunkSize: number): string[] => {
-  const chunks: string[] = [];
-  for (let i = 0; i < text.length; i += chunkSize) {
-    chunks.push(text.slice(i, i + chunkSize));
-  }
-  return chunks.length > 0 ? chunks : [''];
-};
+import { canAccessDocument, verifyIsAdmin } from '../services/rbacService';
+import { uploadDocument as uploadDocumentService } from '../services/documentIntelligenceService';
+import { UserRole } from '../types/user';
 
 // Track documents with summary generation in progress (global state)
 const summaryGenerationInProgress = new Set<string>();
@@ -26,55 +14,69 @@ export const isSummaryGenerating = (documentId: string): boolean => {
   return summaryGenerationInProgress.has(documentId);
 };
 
-// Background summary generation - runs after upload without blocking
-const generateBackgroundSummary = async (documentId: string, content: string): Promise<void> => {
-  // Mark as in-progress
-  summaryGenerationInProgress.add(documentId);
-  
-  try {
-    console.log('[Background] Generating summary for document:', documentId);
-    const startTime = Date.now();
-    
-    // Generate summary using parallel processing
-    const summaryText = await summarize(content, { language: 'en' });
-    
-    if (summaryText && summaryText.length > 50) {
-      // Save to local storage
-      await updateDocumentSummary(documentId, summaryText);
-      console.log('[Background] Summary saved in', Date.now() - startTime, 'ms');
-    }
-  } catch (error: any) {
-    console.error('[Background] Summary generation failed:', error.message);
-    // Don't throw - this is fire-and-forget
-  } finally {
-    // Mark as complete
-    summaryGenerationInProgress.delete(documentId);
-  }
-};
-
+/**
+ * useDocument Hook - Document management with RBAC support
+ * 
+ * RBAC INTEGRATION:
+ * - loadDocuments(): Fetches documents based on user's role
+ *   - 'user': Only own documents (via RLS)
+ *   - 'admin': All documents (is_admin() check in RLS)
+ *   - 'vendor': Own docs + shared via vendor_permissions
+ * 
+ * - getDocument(): Validates access before returning
+ * - deleteDocument(): Validates delete permission
+ * 
+ * SECURITY NOTE:
+ * - Supabase RLS policies enforce server-side access control
+ * - Client-side checks are for UX (error messages, UI state)
+ * - RLS cannot be bypassed from client
+ */
 export const useDocument = () => {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadMessage, setUploadMessage] = useState('');
+  
+  // Track user's role for RBAC decisions
+  const [userRole, setUserRole] = useState<UserRole>('user');
 
-  useEffect(() => {
-    loadDocuments();
-  }, []);
-
-  const loadDocuments = async () => {
+  /**
+   * Load documents based on user's role
+   * 
+   * RBAC BEHAVIOR:
+   * - Supabase RLS automatically filters documents based on role
+   * - Admin sees all documents (via is_admin() RLS function)
+   * - User sees only own documents (auth.uid() = user_id)
+   * - Vendor sees own + shared documents
+   */
+  const loadDocuments = useCallback(async () => {
     try {
       setIsLoading(true);
+      
+      // Fetch documents - RLS handles role-based filtering
+      // The database will return only documents the user can access
       const docs = await getAllDocuments();
       setDocuments(docs);
+      
+      // Log for debugging RBAC
+      console.log(`[useDocument] Loaded ${docs.length} documents (RBAC filtered by server)`);
     } catch (err) {
       setError('Failed to load documents');
       console.error(err);
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    loadDocuments();
+    
+    // Check if user is admin for role-based UI decisions
+    verifyIsAdmin().then(isAdmin => {
+      setUserRole(isAdmin ? 'admin' : 'user');
+    });
+  }, [loadDocuments]);
 
   const uploadDocument = async (
     fileName: string,
@@ -95,293 +97,69 @@ export const useDocument = () => {
         if (onProgress) onProgress(progress, message);
       };
 
-      updateProgress(5, 'Processing document...');
-
-      const documentId = generateId();
-      let pdfCloudUrl: string | undefined;
-      let extractedData: ExtractedData | undefined;
-      let parsed = { content: '', chunks: [] as string[], totalChunks: 0, isLargeFile: false };
-
-      // Check BOTH mimeType AND fileName extension (mimeType may be 'application/octet-stream' on iOS)
-      const fileNameLower = fileName.toLowerCase();
-      const fileTypeLower = (fileType || '').toLowerCase();
-      const isPdf = fileTypeLower === 'application/pdf' || 
-                    fileTypeLower.includes('pdf') || 
-                    fileNameLower.endsWith('.pdf');
-      const isPptx = fileTypeLower.includes('powerpoint') || 
-                     fileTypeLower.includes('presentation') ||
-                     fileNameLower.endsWith('.pptx') || 
-                     fileNameLower.endsWith('.ppt');
-      const isDocx = fileTypeLower.includes('word') || 
-                     fileTypeLower.includes('document') ||
-                     fileNameLower.endsWith('.docx') || 
-                     fileNameLower.endsWith('.doc');
-      
-      // File size check for cloud vs local processing
-      const fileSizeMB = fileSize / (1024 * 1024);
-      const useCloudProcessing = CloudStorage.shouldUseCloudProcessing(fileSize);
-      
-      console.log('[useDocument] File check:', { 
-        fileName, 
-        fileType, 
-        fileSize: fileSizeMB.toFixed(1) + 'MB', 
-        isPdf, 
-        isPptx, 
-        isDocx,
-        useCloudProcessing 
-      });
-      
-      // For large files (>=50MB), use cloud processing
-      if (useCloudProcessing) {
-        updateProgress(10, 'Large file detected - uploading to cloud...');
-        
-        // Get current user - first try getSession which is more reliable
-        let userId: string | null = null;
-        
-        const { data: sessionData } = await supabase.auth.getSession();
-        if (sessionData?.session?.user) {
-          userId = sessionData.session.user.id;
-        } else {
-          // Fallback to getUser
-          const { data: userData } = await supabase.auth.getUser();
-          userId = userData?.user?.id || null;
-        }
-        
-        if (!userId) {
-          throw new Error('Please sign in to upload large files (50MB+). Large files require cloud storage.');
-        }
-        
-        console.log('[useDocument] Cloud upload for user:', userId);
-        
-        // Upload to cloud
-        const cloudResult = await CloudStorage.uploadLargeFile(
-          userId,
-          documentId,
-          fileUri,
-          fileName,
-          fileType,
-          fileSize,
-          (progress, message) => {
-            // Scale progress from 10-70%
-            const scaledProgress = 10 + (progress * 0.6);
-            updateProgress(scaledProgress, message);
-          }
-        );
-        
-        if (!cloudResult.success) {
-          throw new Error(cloudResult.error || 'Failed to upload to cloud');
-        }
-        
-        updateProgress(75, 'Waiting for text extraction...');
-        
-        // Wait for server-side text extraction - FASTER polling
-        const cloudDoc = await CloudStorage.waitForProcessing(
-          cloudResult.cloudDocumentId!,
-          90000, // Wait up to 90 seconds (reduced from 2 minutes)
-          1500   // Poll every 1.5 seconds (faster than 3 seconds)
-        );
-        
-        if (!cloudDoc) {
-          throw new Error('Cloud processing timed out. The document will be processed in the background.');
-        }
-        
-        if (cloudDoc.status === 'error') {
-          throw new Error(cloudDoc.processingError || 'Cloud text extraction failed');
-        }
-        
-        updateProgress(85, 'Saving document...');
-        
-        // Use extracted text from cloud
-        const extractedText = cloudDoc.extractedText || '';
-        parsed = {
-          content: extractedText,
-          chunks: splitTextIntoChunks(extractedText, 12000),
-          totalChunks: 1,
-          isLargeFile: true,
-        };
-        
-        // Create minimal extracted data
-        extractedData = {
-          text: extractedText,
-          pages: [{
-            pageNumber: 1,
-            text: extractedText,
-            images: [],
-            tables: [],
-          }],
-          images: [],
-          tables: [],
-          equations: [],
-          totalPages: 1,
-        };
-        
-        // Store cloud document reference
-        pdfCloudUrl = cloudResult.storagePath;
-        
-      } else if (isPdf) {
-        try {
-          updateProgress(15, 'Processing PDF...');
-          console.log('[useDocument] Using PdfService for PDF file');
-          
-          const processedDoc = await PdfService.processDocument(fileUri, (progress, message) => {
-            // Scale progress from 15-80%
-            const scaledProgress = 15 + (progress * 0.65);
-            updateProgress(scaledProgress, message);
-          });
-
-          pdfCloudUrl = processedDoc.pdfUrl;
-          
-          // Store extracted data for later use
-          extractedData = {
-            text: processedDoc.fullText,
-            pages: processedDoc.pages.map((p, idx) => ({
-              pageNumber: p.pageNum,
-              text: p.text,
-              images: p.imageUrl ? [{
-                id: `img-${idx}`,
-                url: p.imageUrl,
-                caption: '',
-                pageNumber: p.pageNum,
-                type: 'figure' as const,
-              }] : [],
-              tables: [],
-            })),
-            images: processedDoc.pages
-              .filter(p => p.imageUrl)
-              .map((p, idx) => ({
-                id: `img-${idx}`,
-                url: p.imageUrl!,
-                caption: '',
-                pageNumber: p.pageNum,
-                type: 'figure' as const,
-              })),
-            tables: [],
-            equations: [],
-            totalPages: processedDoc.pageCount,
-          };
-
-          // Also set parsed content for document storage
-          parsed = {
-            content: processedDoc.fullText,
-            chunks: processedDoc.pages.map(p => p.text),
-            totalChunks: processedDoc.pageCount,
-            isLargeFile: processedDoc.pageCount > 10,
-          };
-
-          // SKIP image extraction during upload for FASTER uploads
-          // Images will be extracted on-demand when needed (e.g., for video generation)
-          updateProgress(85, 'Finalizing...');
-          
-          // Only extract images for SMALL documents (< 5 pages) during upload
-          if (processedDoc.pageCount <= 5) {
-            try {
-              if (PdfImageService.isPdfImageExtractionAvailable()) {
-                const imageResult = await PdfImageService.extractPdfPageImages(
-                  fileUri, 
-                  'all', 
-                  50,  // Lower quality for faster extraction
-                  400  // Smaller size for faster extraction
-                );
-                
-                if (imageResult.success && imageResult.images.length > 0) {
-                  console.log('[useDocument] Extracted', imageResult.images.length, 'page images');
-                  
-                  // Add images to extracted data
-                  const pageImages = imageResult.images.map((img, idx) => ({
-                    id: `page-img-${idx}`,
-                    url: img.uri,
-                    caption: `Page ${img.pageNum}`,
-                    pageNumber: img.pageNum,
-                    type: 'figure' as const,
-                  }));
-                  
-                  // Merge with existing images
-                  if (extractedData) {
-                    extractedData.images = [...(extractedData.images || []), ...pageImages];
-                    
-                    // Also add to pages
-                    for (const img of imageResult.images) {
-                      const pageIdx = extractedData.pages.findIndex(p => p.pageNumber === img.pageNum);
-                      if (pageIdx >= 0) {
-                        extractedData.pages[pageIdx].images = [
-                          ...(extractedData.pages[pageIdx].images || []),
-                          {
-                            id: `page-img-${img.pageNum}`,
-                            url: img.uri,
-                            caption: `Page ${img.pageNum}`,
-                            pageNumber: img.pageNum,
-                            type: 'figure' as const,
-                          }
-                        ];
-                      }
-                    }
-                  }
-                }
-              }
-            } catch (imgError) {
-              console.log('[useDocument] Image extraction skipped:', imgError);
-            }
-          } else {
-            console.log('[useDocument] Skipping image extraction for large document (', processedDoc.pageCount, 'pages) - will extract on demand');
-          }
-
-          updateProgress(90, 'Saving document...');
-        } catch (pdfError: any) {
-          console.error('[useDocument] PDF processing failed:', pdfError.message);
-          // If the error is OOM, rethrow with clear message
-          if (pdfError.message?.includes('memory') || pdfError.message?.includes('regexp')) {
-            throw new Error('This PDF is too large to process. Please try a smaller file (under 50MB) or split the document.');
-          }
-          throw new Error('Could not process PDF: ' + pdfError.message);
-        }
-      } else {
-        console.log('[useDocument] Using parseDocument for non-PDF file');
-        // For non-PDF files, use parseDocument
-        try {
-          parsed = await parseDocument(fileUri, fileType);
-        } catch (parseError: any) {
-          console.log('Parse error:', parseError.message);
-          throw new Error('Could not read document: ' + parseError.message);
-        }
+      // Get current user
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        throw new Error('Please sign in to upload documents');
       }
 
-      updateProgress(90, 'Finalizing...');
-
-      const newDocument:  Document = {
-        id: documentId,
-        title: fileName.replace(/\.[^/.]+$/, ''),
+      // Call the unified upload service
+      // This handles: upload → extract → analyze → store → trigger AI
+      const result = await uploadDocumentService(
         fileName,
         fileUri,
         fileType,
         fileSize,
-        uploadedAt:  new Date(),
-        content: parsed.content,
-        chunks: parsed.chunks,
-        totalChunks: parsed.totalChunks,
-        isLargeFile: parsed.isLargeFile,
-        pdfCloudUrl,
-        extractedData,
-      };
+        user.id,
+        updateProgress
+      );
 
-      await saveDocument(newDocument);
-      
+      if (!result.success) {
+        throw new Error(result.error || 'Upload failed');
+      }
+
+      // Also save to local storage for offline access
+      if (result.document) {
+        const localDocument: Document = {
+          id: result.documentId,
+          title: result.document.title,
+          fileName: fileName, // Required field for SQLite
+          fileUri: fileUri, // Required field for SQLite
+          content: result.document.extractedText,
+          chunks: [result.document.extractedText],
+          totalChunks: 1,
+          isLargeFile: fileSize > 10 * 1024 * 1024,
+          uploadedAt: new Date(),
+          fileType: result.document.fileType,
+          fileSize: result.document.fileSize,
+          pdfCloudUrl: result.document.storagePath,
+          userId: user.id,
+        };
+        
+        await saveDocument(localDocument);
+      }
+
       updateProgress(100, 'Upload complete!');
       await loadDocuments();
 
-      // AUTO-GENERATE SUMMARY IN BACKGROUND (instant when user clicks Summary)
-      // Fire and forget - don't block the upload completion
-      if (parsed.content && parsed.content.length > 50) {
-        console.log('[useDocument] Starting background summary generation...');
-        generateBackgroundSummary(newDocument.id, parsed.content).catch(err => {
-          console.warn('[useDocument] Background summary failed:', err.message);
-        });
-      }
-
-      return { success: true, document: newDocument };
-    } catch (err:  any) {
+      return { 
+        success: true, 
+        document: result.document ? {
+          id: result.documentId,
+          title: result.document.title,
+          content: result.document.extractedText,
+          chunks: [result.document.extractedText],
+          totalChunks: 1,
+          isLargeFile: fileSize > 10 * 1024 * 1024,
+          uploadedAt: new Date(),
+          fileType: result.document.fileType,
+          fileSize: result.document.fileSize,
+        } as Document : undefined
+      };
+    } catch (err: any) {
       const errorMessage = err.message || 'Failed to upload document';
       setError(errorMessage);
-      console.error(err);
+      console.error('[useDocument] Upload error:', err);
       return { success: false, error: errorMessage };
     } finally {
       setIsLoading(false);
@@ -390,14 +168,109 @@ export const useDocument = () => {
     }
   };
 
-  const getDocument = async (id: string): Promise<Document | null> => {
+  /**
+   * RBAC: Get Document with Access Validation
+   * 
+   * Access control flow:
+   * 1. First fetches document from local/cloud storage
+   * 2. For non-admin users, validates access via canAccessDocument()
+   * 3. This check is redundant with RLS but provides better error messages
+   * 
+   * Role-based behavior:
+   * - admin: Can access any document (bypasses validation)
+   * - vendor: Can access own docs + docs shared with them
+   * - user: Can only access own documents
+   */
+  const getDocument = useCallback(async (id: string): Promise<Document | null> => {
     try {
-      return await getDocumentById(id);
+      const document = await getDocumentById(id);
+      
+      if (!document) {
+        return null;
+      }
+      
+      // RBAC: Validate document access for non-admin users
+      // Admins bypass this check as they have full access
+      if (userRole !== 'admin') {
+        const hasAccess = await canAccessDocument(id);
+        if (!hasAccess) {
+          console.warn(`RBAC: Access denied to document ${id} for role ${userRole}`);
+          return null;
+        }
+      }
+      
+      return document;
     } catch (err) {
       console.error('Failed to get document:', err);
       return null;
     }
-  };
+  }, [userRole]);
+
+  /**
+   * RBAC: Delete Document with Access Validation
+   * 
+   * Access control:
+   * - Users can only delete their own documents
+   * - Admins can delete any document
+   * - Vendors can delete docs they own
+   * 
+   * Note: RLS policies on Supabase enforce this server-side,
+   * but we validate client-side for better UX and error handling.
+   */
+  const removeDocument = useCallback(async (id: string): Promise<boolean> => {
+    try {
+      console.log('[useDocument] Deleting document:', id);
+      
+      // For local documents, skip RBAC check (local SQLite storage)
+      // UUID format check: cloud docs use UUIDs, local use generateId() format
+      const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+      
+      if (isUUID && userRole !== 'admin') {
+        // Only check RBAC for cloud documents
+        const hasAccess = await canAccessDocument(id);
+        if (!hasAccess) {
+          console.warn(`RBAC: Delete denied for document ${id} - insufficient permissions`);
+          return false;
+        }
+      }
+      
+      await deleteDocument(id);
+      console.log('[useDocument] Document deleted successfully:', id);
+      // Refresh the documents list
+      await loadDocuments();
+      return true;
+    } catch (err) {
+      console.error('[useDocument] Failed to delete document:', err);
+      return false;
+    }
+  }, [loadDocuments, userRole]);
+
+  /**
+   * RBAC: Delete All Documents
+   * 
+   * For regular users: Deletes all of their OWN documents
+   * For admins: Can delete all documents in the system
+   * 
+   * Uses soft delete - sets deleted_at timestamp
+   */
+  const removeAllDocuments = useCallback(async (): Promise<boolean> => {
+    try {
+      // Users can delete all their OWN documents
+      // The deleteAllDocuments function respects RLS and only deletes user's docs
+      console.log('[useDocument] Deleting all documents for current user...');
+      
+      await deleteAllDocuments();
+      
+      // Refresh the documents list
+      await loadDocuments();
+      
+      console.log('[useDocument] All documents deleted successfully');
+      return true;
+    } catch (err) {
+      console.error('Failed to delete all documents:', err);
+      return false;
+    }
+  }, [loadDocuments]);
 
   return {
     documents,
@@ -407,6 +280,8 @@ export const useDocument = () => {
     uploadMessage,
     uploadDocument,
     getDocument,
+    removeDocument,
+    removeAllDocuments,
     refreshDocuments:  loadDocuments,
   };
 };

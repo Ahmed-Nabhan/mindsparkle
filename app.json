@@ -4,7 +4,6 @@
     "slug": "mindsparkle",
     "version": "1.0.0",
     "scheme": "mindsparkle",
-    "newArchEnabled": false,
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -47,7 +46,8 @@
           "iCloudContainerEnvironment": "Production"
         }
       ],
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-secure-store"
     ],
     "extra": {
       "eas": {

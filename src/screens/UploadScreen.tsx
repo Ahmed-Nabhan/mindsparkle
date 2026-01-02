@@ -20,12 +20,48 @@ import { Card } from '../components/Card';
 import { DocumentUploader } from '../components/DocumentUploader';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { useDocument } from '../hooks/useDocument';
+import { useDocumentContext } from '../context/DocumentContext';
 import { usePremiumContext } from '../context/PremiumContext';
 import { useAuth } from '../context/AuthContext';
 import { onDocumentsSync } from '../services/cloudSyncService';
+import { supabase } from '../services/supabase';
 import { formatDate, formatFileSize } from '../utils/helpers';
 import type { MainDrawerScreenProps } from '../navigation/types';
 import type { Document } from '../types/document';
+import type { RealtimeChannel, RealtimePostgresChangesPayload } from '@supabase/supabase-js';
+
+/**
+ * UploadScreen - Document upload and management screen
+ * 
+ * REAL-TIME INTEGRATION:
+ * - Subscribes to documents table changes for instant list updates
+ * - Shows newly uploaded documents immediately without refresh
+ * - Reflects document deletions from other devices in real-time
+ * - Unsubscribes on unmount to prevent memory leaks
+ * 
+ * REAL-TIME FLOW:
+ * ┌───────────────────────────────────────────────────────────────┐
+ * │ User uploads document on Device A                             │
+ * │                    │                                          │
+ * │                    ▼                                          │
+ * │ ┌─────────────────────────────────────────────────────────┐   │
+ * │ │ Supabase documents table INSERT                          │   │
+ * │ └─────────────────────────────────────────────────────────┘   │
+ * │                    │                                          │
+ * │         ┌─────────┴─────────┐                                │
+ * │         ▼                   ▼                                │
+ * │ ┌─────────────────┐ ┌─────────────────┐                      │
+ * │ │ Device A        │ │ Device B        │                      │
+ * │ │ (local update)  │ │ (realtime push) │                      │
+ * │ └─────────────────┘ └─────────────────┘                      │
+ * │         │                   │                                │
+ * │         └─────────┬─────────┘                                │
+ * │                   ▼                                          │
+ * │         Both show new document instantly                     │
+ * └───────────────────────────────────────────────────────────────┘
+ * 
+ * @component
+ */
 
 type UploadScreenProps = MainDrawerScreenProps<'Upload'>;
 
@@ -39,9 +75,10 @@ interface UploadStats {
 
 export const UploadScreen: React.FC = () => {
   const navigation = useNavigation<UploadScreenProps['navigation']>();
-  const { documents, uploadDocument, isLoading, uploadProgress, uploadMessage, refreshDocuments } = useDocument();
+  const { documents, uploadDocument, isLoading, uploadProgress, uploadMessage, refreshDocuments, removeDocument, removeAllDocuments } = useDocument();
   const { isPremium, features } = usePremiumContext();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, user } = useAuth();
+  const { isRealtimeConnected } = useDocumentContext();
   
   // Upload state
   const [isUploading, setIsUploading] = useState(false);
@@ -65,6 +102,9 @@ export const UploadScreen: React.FC = () => {
   const uploadAbortRef = useRef<AbortController | null>(null);
   const statsIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const lastProgressRef = useRef({ progress: 0, time: Date.now() });
+  
+  // Real-time subscription ref - stored for cleanup
+  const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
   
   // Track app state for background uploads
   const appState = useRef(AppState.currentState);
@@ -90,6 +130,82 @@ export const UploadScreen: React.FC = () => {
     });
     return unsubscribe;
   }, [refreshDocuments, isAuthenticated]);
+
+  // ========================================
+  // SUPABASE REALTIME SUBSCRIPTION
+  // ========================================
+  
+  /**
+   * Subscribe to Supabase Realtime for documents table changes
+   * This provides instant UI updates when:
+   * - New documents are uploaded (even from other devices)
+   * - Documents are deleted
+   * - Document metadata is updated (title, summary, etc.)
+   * 
+   * IMPORTANT: We filter by user_id to only receive updates for
+   * the current user's documents (respects RLS policies)
+   */
+  useEffect(() => {
+    // Only subscribe when authenticated
+    if (!isAuthenticated || !user?.id) {
+      console.log('[UploadScreen] Not authenticated, skipping realtime subscription');
+      return;
+    }
+
+    console.log('[UploadScreen] Setting up Realtime subscription for documents');
+
+    // Create a Supabase Realtime channel for documents table
+    // Filter by user_id to only receive updates for current user's documents
+    realtimeChannelRef.current = supabase
+      .channel('upload-screen-documents')
+      .on(
+        'postgres_changes',
+        {
+          event: '*', // Listen to INSERT, UPDATE, DELETE
+          schema: 'public',
+          table: 'documents',
+          filter: `user_id=eq.${user.id}`, // Only this user's documents
+        },
+        (payload: RealtimePostgresChangesPayload<{ [key: string]: any }>) => {
+          console.log('[UploadScreen] Realtime update:', payload.eventType);
+          
+          // Refresh the document list on any change
+          // This ensures the UI stays in sync with the database
+          switch (payload.eventType) {
+            case 'INSERT':
+              console.log('[UploadScreen] New document detected:', payload.new?.title);
+              // Refresh to show new document
+              refreshDocuments();
+              break;
+              
+            case 'UPDATE':
+              console.log('[UploadScreen] Document updated:', payload.new?.title);
+              // Refresh to show updated metadata
+              refreshDocuments();
+              break;
+              
+            case 'DELETE':
+              console.log('[UploadScreen] Document deleted:', payload.old?.id);
+              // Refresh to remove deleted document
+              refreshDocuments();
+              break;
+          }
+        }
+      )
+      .subscribe((status) => {
+        console.log('[UploadScreen] Realtime channel status:', status);
+      });
+
+    // Cleanup function - CRITICAL for preventing memory leaks
+    // Removes the WebSocket channel when component unmounts
+    return () => {
+      console.log('[UploadScreen] Cleaning up Realtime subscription');
+      if (realtimeChannelRef.current) {
+        supabase.removeChannel(realtimeChannelRef.current);
+        realtimeChannelRef.current = null;
+      }
+    };
+  }, [isAuthenticated, user?.id, refreshDocuments]);
 
   // Handle app state changes for background upload
   useEffect(() => {
@@ -309,6 +425,54 @@ export const UploadScreen: React.FC = () => {
     navigation.navigate('DocumentActions', { documentId: document.id });
   };
 
+  const handleDeleteDocument = (document: Document) => {
+    Alert.alert(
+      '🗑️ Delete Document',
+      `Are you sure you want to delete "${document.title}"? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            const success = await removeDocument(document.id);
+            if (success) {
+              Alert.alert('Deleted', 'Document has been deleted.');
+            } else {
+              Alert.alert('Error', 'Failed to delete document.');
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleDeleteAllDocuments = () => {
+    if (documents.length === 0) {
+      Alert.alert('No Documents', 'There are no documents to delete.');
+      return;
+    }
+    Alert.alert(
+      '🗑️ Delete All Documents',
+      `Are you sure you want to delete ALL ${documents.length} documents? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete All',
+          style: 'destructive',
+          onPress: async () => {
+            const success = await removeAllDocuments();
+            if (success) {
+              Alert.alert('Deleted', 'All documents have been deleted.');
+            } else {
+              Alert.alert('Error', 'Failed to delete documents.');
+            }
+          },
+        },
+      ]
+    );
+  };
+
   const renderDocument = ({ item }: { item: Document }) => (
     <Card onPress={() => handleDocumentPress(item)}>
       <View style={styles.documentCard}>
@@ -333,6 +497,13 @@ export const UploadScreen: React.FC = () => {
             )}
           </View>
         </View>
+        <TouchableOpacity 
+          onPress={() => handleDeleteDocument(item)}
+          style={styles.deleteButton}
+          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        >
+          <Ionicons name="trash-outline" size={20} color="#E53935" />
+        </TouchableOpacity>
         <Ionicons name="chevron-forward" size={20} color={colors.textSecondary} />
       </View>
     </Card>
@@ -449,7 +620,12 @@ export const UploadScreen: React.FC = () => {
       <Header title={strings.upload.title} />
       
       <View style={styles.content}>
-        <DocumentUploader onDocumentSelected={handleDocumentSelected} />
+        <DocumentUploader 
+          onDocumentSelected={handleDocumentSelected}
+          isUploading={isUploading}
+          uploadProgress={currentProgress}
+          uploadMessage={currentMessage}
+        />
 
         {/* Document limit indicator for free users */}
         {!isPremium && features.maxDocuments !== -1 && (
@@ -465,7 +641,15 @@ export const UploadScreen: React.FC = () => {
         <View style={styles.listContainer}>
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionTitle}>My Documents</Text>
-            <Text style={styles.documentCount}>{documents.length} files</Text>
+            <View style={styles.headerRight}>
+              <Text style={styles.documentCount}>{documents.length} files</Text>
+              {documents.length > 0 && (
+                <TouchableOpacity onPress={handleDeleteAllDocuments} style={styles.deleteAllButton}>
+                  <Ionicons name="trash-outline" size={16} color="#E53935" />
+                  <Text style={styles.deleteAllText}>Delete All</Text>
+                </TouchableOpacity>
+              )}
+            </View>
           </View>
           
           {documents.length === 0 ? (
@@ -516,6 +700,25 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: colors.textSecondary,
   },
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  deleteAllButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFEBEE',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    gap: 4,
+  },
+  deleteAllText: {
+    fontSize: 12,
+    color: '#E53935',
+    fontWeight: '600',
+  },
   emptyState: {
     flex: 1,
     justifyContent: 'center',
@@ -541,6 +744,10 @@ const styles = StyleSheet.create({
   documentCard: {
     flexDirection: 'row',
     alignItems: 'center',
+  },
+  deleteButton: {
+    padding: 8,
+    marginRight: 4,
   },
   fileTypeIndicator: {
     width: 48,

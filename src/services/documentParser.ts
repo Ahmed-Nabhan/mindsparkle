@@ -114,6 +114,7 @@ const extractTextSimple = function(binaryString:  string): string {
   var inText = false;
   var currentText = '';
   
+  // Method 1: Standard PDF text in parentheses (...)
   for (var i = 0; i < binaryString.length; i++) {
     var char = binaryString[i];
     var charCode = binaryString.charCodeAt(i);
@@ -139,6 +140,59 @@ const extractTextSimple = function(binaryString:  string): string {
     } else if (inText) {
       currentText += char;
     }
+  }
+  
+  // Method 2: Extract hex-encoded text <...> common in PDFs with custom fonts
+  // Look for patterns like <0048006500..> where each 4 hex chars = 1 character
+  var hexMatches = binaryString.match(/<[0-9A-Fa-f]{8,}>/g) || [];
+  for (var h = 0; h < hexMatches.length && h < 1000; h++) {
+    var hex = hexMatches[h].slice(1, -1); // Remove < >
+    var decoded = '';
+    // Try UTF-16BE decoding (2 bytes per char)
+    for (var k = 0; k < hex.length - 3; k += 4) {
+      var codePoint = parseInt(hex.substr(k, 4), 16);
+      if (codePoint >= 32 && codePoint <= 126) {
+        decoded += String.fromCharCode(codePoint);
+      } else if (codePoint >= 0x20 && codePoint <= 0xFFFF) {
+        // Try as Unicode
+        var ch = String.fromCharCode(codePoint);
+        if (/[\w\s.,!?;:'-]/.test(ch)) {
+          decoded += ch;
+        }
+      }
+    }
+    if (decoded.length > 2 && /[a-zA-Z]{2,}/.test(decoded)) {
+      result += decoded + ' ';
+    }
+  }
+  
+  // Method 3: Look for BT...ET text blocks and extract Tj/TJ operators
+  var btMatches = binaryString.match(/BT[\s\S]{1,2000}?ET/g) || [];
+  for (var b = 0; b < btMatches.length && b < 500; b++) {
+    var block = btMatches[b];
+    // Look for Tj operator (string) Tj
+    var tjMatches = block.match(/\(([^)]{1,200})\)\s*Tj/g) || [];
+    for (var t = 0; t < tjMatches.length; t++) {
+      var match = tjMatches[t].match(/\(([^)]+)\)/);
+      if (match && match[1]) {
+        var txt = match[1];
+        var clean = '';
+        for (var m = 0; m < txt.length; m++) {
+          var code = txt.charCodeAt(m);
+          if (code >= 32 && code <= 126) clean += txt[m];
+        }
+        if (clean.length > 1 && /[a-zA-Z]/.test(clean)) {
+          result += clean + ' ';
+        }
+      }
+    }
+  }
+  
+  // Method 4: Extract text from stream content (decompressed text)
+  // Look for readable word sequences
+  var words = binaryString.match(/[A-Za-z][a-z]{2,15}(?:\s+[A-Za-z][a-z]{2,15}){2,}/g) || [];
+  for (var w = 0; w < words.length && w < 500; w++) {
+    result += words[w] + ' ';
   }
   
   return result;
@@ -217,9 +271,9 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
     
     // True streaming: read file in small chunks, never load entire file
     const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB raw chunks
-    const MAX_TOTAL_TEXT = 500000; // Max chars to extract
-    const MAX_PPTX_MATCHES = 3000;
-    const MAX_BYTES_TO_READ = 100 * 1024 * 1024; // Only read first 100MB max
+    const MAX_TOTAL_TEXT = 800000; // Increased max chars to extract for large presentations
+    const MAX_PPTX_MATCHES = 10000; // Increased: 542 slides × ~10-15 blocks each = need 5000-8000+
+    const MAX_BYTES_TO_READ = 150 * 1024 * 1024; // Increased: read more of large files (150MB max)
     
     let textContent = '';
     let pptxMatches = 0;

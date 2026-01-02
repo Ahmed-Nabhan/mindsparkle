@@ -68,9 +68,29 @@ export const SummaryScreen: React.FC = () => {
     const doc = await getDocument(documentId);
     setDocument(doc);
     
-    if (doc?.summary) {
-      // Summary already exists - show it instantly
+    // Check if the summary is a "fake" summary generated from help message content
+    const isFakeSummary = (text: string): boolean => {
+      const lower = text.toLowerCase();
+      return (lower.includes('pdf') && lower.includes('text extraction')) ||
+             (lower.includes('custom font') && lower.includes('encoding')) ||
+             (lower.includes('google drive') && lower.includes('ocr')) ||
+             lower.includes('standard text extraction tools') ||
+             lower.includes('pdf processing notice') ||
+             lower.includes('embedded custom fonts') ||
+             lower.includes('ilovepdf.com') ||
+             lower.includes('npx expo run') ||
+             lower.includes('vision ocr') ||
+             lower.includes('proprietary font encoding') ||
+             lower.includes('how to fix');
+    };
+    
+    if (doc?.summary && !isFakeSummary(doc.summary)) {
+      // Summary already exists and is valid - show it instantly
       setSummary(doc.summary);
+      setIsLoading(false);
+    } else if (doc?.summary && isFakeSummary(doc.summary)) {
+      // Cached summary is fake (generated from help text) - clear it and show generate button
+      console.log('[Summary] Detected fake summary from help message, clearing...');
       setIsLoading(false);
     } else if (isSummaryGenerating(documentId)) {
       // Background generation in progress - poll for completion
@@ -220,46 +240,60 @@ export const SummaryScreen: React.FC = () => {
 
         {!summary && !isGenerating && !isBackgroundGenerating && (
           <Card>
-            <Text style={styles.infoText}>
-              No summary available yet. Generate one now! 
-            </Text>
-            
-            {/* Language Selection */}
-            <View style={styles.languageSelector}>
-              <Text style={styles.languageLabel}>Summary Language:</Text>
-              <View style={styles.languageButtons}>
-                <TouchableOpacity
-                  style={[
-                    styles.languageButton,
-                    summaryLanguage === 'en' && styles.languageButtonActive
-                  ]}
-                  onPress={() => setSummaryLanguage('en')}
-                >
-                  <Text style={[
-                    styles.languageButtonText,
-                    summaryLanguage === 'en' && styles.languageButtonTextActive
-                  ]}>🇺🇸 English</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[
-                    styles.languageButton,
-                    summaryLanguage === 'ar' && styles.languageButtonActive
-                  ]}
-                  onPress={() => setSummaryLanguage('ar')}
-                >
-                  <Text style={[
-                    styles.languageButtonText,
-                    summaryLanguage === 'ar' && styles.languageButtonTextActive
-                  ]}>🇸🇦 العربية</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-            
-            <Button
-              title={summaryLanguage === 'ar' ? 'إنشاء ملخص' : 'Generate Summary'}
-              onPress={handleGenerateSummary}
-              style={styles.button}
-            />
+            {/* Check if document content is a help message */}
+            {document.content && (
+              document.content.toLowerCase().includes('pdf processing notice') || 
+              document.content.toLowerCase().includes('embedded custom fonts') ||
+              document.content.toLowerCase().includes('__needs_ocr__')
+            ) ? (
+              <>
+                <Text style={styles.sectionTitle}>📄 Document Notice</Text>
+                <Text style={styles.summaryText}>{document.content}</Text>
+              </>
+            ) : (
+              <>
+                <Text style={styles.infoText}>
+                  No summary available yet. Generate one now! 
+                </Text>
+                
+                {/* Language Selection */}
+                <View style={styles.languageSelector}>
+                  <Text style={styles.languageLabel}>Summary Language:</Text>
+                  <View style={styles.languageButtons}>
+                    <TouchableOpacity
+                      style={[
+                        styles.languageButton,
+                        summaryLanguage === 'en' && styles.languageButtonActive
+                      ]}
+                      onPress={() => setSummaryLanguage('en')}
+                    >
+                      <Text style={[
+                        styles.languageButtonText,
+                        summaryLanguage === 'en' && styles.languageButtonTextActive
+                      ]}>🇺🇸 English</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.languageButton,
+                        summaryLanguage === 'ar' && styles.languageButtonActive
+                      ]}
+                      onPress={() => setSummaryLanguage('ar')}
+                    >
+                      <Text style={[
+                        styles.languageButtonText,
+                        summaryLanguage === 'ar' && styles.languageButtonTextActive
+                      ]}>🇸🇦 العربية</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+                
+                <Button
+                  title={summaryLanguage === 'ar' ? 'إنشاء ملخص' : 'Generate Summary'}
+                  onPress={handleGenerateSummary}
+                  style={styles.button}
+                />
+              </>
+            )}
           </Card>
         )}
 
@@ -288,7 +322,9 @@ export const SummaryScreen: React.FC = () => {
 
         {summary && ! isGenerating && (
           <Card>
-            <Text style={styles.sectionTitle}>AI Summary</Text>
+            <Text style={styles.sectionTitle}>
+              {summary.includes('⚠️') || summary.includes('Unable to Generate') ? 'Notice' : 'AI Summary'}
+            </Text>
             
             {summaryImage && (
               <Image 
@@ -325,12 +361,15 @@ export const SummaryScreen: React.FC = () => {
               </View>
             )}
             
-            <Button
-              title="Regenerate"
-              onPress={handleGenerateSummary}
-              variant="outline"
-              style={styles.button}
-            />
+            {/* Only show Regenerate button if this is a real summary, not a warning */}
+            {!summary.includes('⚠️') && !summary.includes('Unable to Generate') && (
+              <Button
+                title="Regenerate"
+                onPress={handleGenerateSummary}
+                variant="outline"
+                style={styles.button}
+              />
+            )}
           </Card>
         )}
       </ScrollView>

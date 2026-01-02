@@ -15,12 +15,87 @@ interface ExtractedDocument {
   fullText: string;
   isScanned?: boolean;
   usedServerExtraction?: boolean;
+  extractionQuality?: 'good' | 'poor' | 'garbage'; // NEW: quality indicator
 }
 
 // File size thresholds
 const SMALL_FILE_LIMIT = 5 * 1024 * 1024;      // 5MB - process locally
 const MEDIUM_FILE_LIMIT = 50 * 1024 * 1024;    // 50MB - process in chunks locally
 // Files > 50MB - use server extraction
+
+/**
+ * Check if extracted text is readable or garbage
+ * Returns 'good' if text is readable English
+ * Returns 'poor' if partially readable
+ * Returns 'garbage' if text is mostly symbols/unreadable (custom font encoding)
+ */
+const checkTextQuality = (text: string): 'good' | 'poor' | 'garbage' => {
+  if (!text || text.length < 50) return 'garbage';
+  
+  // Sample the text (first 5000 chars to be efficient)
+  const sample = text.slice(0, 5000);
+  
+  // Count different character types
+  let letters = 0;
+  let digits = 0;
+  let spaces = 0;
+  let symbols = 0;
+  let printable = 0;
+  
+  for (let i = 0; i < sample.length; i++) {
+    const code = sample.charCodeAt(i);
+    if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+      letters++;
+      printable++;
+    } else if (code >= 48 && code <= 57) {
+      digits++;
+      printable++;
+    } else if (code === 32 || code === 10 || code === 13) {
+      spaces++;
+      printable++;
+    } else if (code >= 33 && code <= 126) {
+      // Other printable ASCII (punctuation, symbols)
+      // Common in readable text: . , ; : ' " - ( ) [ ] / ! ?
+      if ('.,;:\'"!?()-[]/<>'.includes(sample[i])) {
+        printable++;
+      } else {
+        symbols++; // Unusual symbols suggest garbage
+      }
+    } else {
+      symbols++; // Non-ASCII suggests garbage
+    }
+  }
+  
+  const total = sample.length;
+  const letterRatio = letters / total;
+  const symbolRatio = symbols / total;
+  const spaceRatio = spaces / total;
+  
+  // Check for common English words
+  const commonWords = ['the', 'and', 'is', 'to', 'of', 'in', 'for', 'that', 'with', 'on', 'are', 'be', 'this', 'or', 'by'];
+  let wordMatches = 0;
+  const lowerSample = sample.toLowerCase();
+  for (const word of commonWords) {
+    if (lowerSample.includes(` ${word} `) || lowerSample.includes(`${word} `) || lowerSample.includes(` ${word}`)) {
+      wordMatches++;
+    }
+  }
+  
+  console.log(`[PDFExtractor] Text quality check: letters=${(letterRatio * 100).toFixed(1)}%, symbols=${(symbolRatio * 100).toFixed(1)}%, commonWords=${wordMatches}/15`);
+  
+  // Good: >40% letters, <15% symbols, reasonable spacing, some common words
+  if (letterRatio > 0.4 && symbolRatio < 0.15 && spaceRatio > 0.08 && wordMatches >= 3) {
+    return 'good';
+  }
+  
+  // Poor: 20-40% letters or few common words
+  if (letterRatio > 0.2 && symbolRatio < 0.3 && wordMatches >= 1) {
+    return 'poor';
+  }
+  
+  // Garbage: Too many symbols, no common words
+  return 'garbage';
+};
 
 // Decode PDF escape sequences
 const decodePdfString = (str: string): string => {
@@ -277,13 +352,16 @@ const processSmallFile = async (
   
   if (onProgress) onProgress(100, 'Extraction complete!');
   
-  console.log('[PDFExtractor] Extracted', fullText.length, 'chars from', pages.length, 'pages');
+  // Check extraction quality
+  const quality = checkTextQuality(fullText);
+  console.log('[PDFExtractor] Extracted', fullText.length, 'chars from', pages.length, 'pages, quality:', quality);
   
   return {
     pageCount: pages.length || 1,
     pages,
     fullText,
-    isScanned: fullText.length < 100,
+    isScanned: fullText.length < 100 || quality === 'garbage',
+    extractionQuality: quality,
   };
 };
 
@@ -310,7 +388,55 @@ const processMediumFile = async (
     throw new Error('Invalid PDF file format');
   }
   
-  if (onProgress) onProgress(40, 'Extracting text from chunks...');
+  // Count actual pages in PDF
+  let pageCount = 0;
+  try {
+    // Method 1: Look for /Count in trailer/catalog (most accurate)
+    const countMatch = binaryString.match(/\/Count\s+(\d+)/);
+    if (countMatch) {
+      pageCount = parseInt(countMatch[1], 10);
+    }
+    
+    // Method 2: Count /Type /Page or /Type/Page objects (fallback)
+    if (pageCount === 0) {
+      let pageIndex = 0;
+      let count = 0;
+      while (count < 10000) {
+        const pageMatch = binaryString.indexOf('/Type/Page', pageIndex);
+        const pageMatch2 = binaryString.indexOf('/Type /Page', pageIndex);
+        const nextMatch = Math.min(
+          pageMatch === -1 ? Infinity : pageMatch,
+          pageMatch2 === -1 ? Infinity : pageMatch2
+        );
+        
+        if (nextMatch === Infinity) break;
+        
+        // Make sure it's not /Pages
+        const afterType = binaryString.substring(nextMatch, nextMatch + 20);
+        if (!afterType.includes('/Pages')) {
+          pageCount++;
+        }
+        
+        pageIndex = nextMatch + 10;
+        count++;
+      }
+    }
+    
+    // Method 3: Estimate based on file size for image-heavy PDFs (~100-200KB per page)
+    if (pageCount < 5 && fileSize > 5 * 1024 * 1024) {
+      const estimatedBySize = Math.ceil(fileSize / (150 * 1024)); // ~150KB per page average
+      pageCount = Math.max(pageCount, Math.min(estimatedBySize, 500)); // Cap at 500 pages
+      console.log('[PDFExtractor] Estimated page count by file size:', pageCount);
+    }
+    
+    pageCount = Math.max(pageCount, 1);
+    console.log('[PDFExtractor] Detected page count:', pageCount);
+  } catch (e) {
+    console.log('[PDFExtractor] Page count detection failed, estimating by file size');
+    pageCount = Math.max(Math.ceil(fileSize / (150 * 1024)), 10); // Estimate ~150KB per page
+  }
+  
+  if (onProgress) onProgress(40, `Extracting text from ${pageCount} pages...`);
   
   // Process in 2MB chunks with overlap
   const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB chunks
@@ -359,40 +485,59 @@ const processMediumFile = async (
   const uniqueSentences = [...new Set(sentences)];
   fullText = uniqueSentences.join('\n');
   
-  // Estimate pages (can't count accurately in chunks)
-  const estimatedPages = Math.max(Math.ceil(fullText.length / 3000), 1);
+  // Determine if this is a scanned/image-heavy PDF (very little text extracted)
+  const isScannedOrImageBased = fullText.length < 1000 && fileSize > 5 * 1024 * 1024;
+  
+  // Use detected page count, not estimated by text length
+  const finalPageCount = isScannedOrImageBased 
+    ? pageCount  // Use file-size estimated count for scanned docs
+    : Math.max(pageCount, Math.ceil(fullText.length / 3000), 1);
   
   // Create pages
   const pages: PDFPage[] = [];
-  const avgPageLength = Math.max(Math.ceil(fullText.length / estimatedPages), 1500);
-  let pos = 0;
-  let pageNum = 1;
   
-  while (pos < fullText.length && pageNum <= estimatedPages + 10) {
-    let endPos = Math.min(pos + avgPageLength, fullText.length);
-    const breakPos = fullText.lastIndexOf('.', endPos);
-    if (breakPos > pos + avgPageLength / 2) {
-      endPos = breakPos + 1;
-    }
+  if (fullText.length > 50) {
+    const avgPageLength = Math.max(Math.ceil(fullText.length / finalPageCount), 100);
+    let pos = 0;
+    let pNum = 1;
     
-    const pageText = fullText.slice(pos, endPos).trim();
-    if (pageText.length > 20) {
-      pages.push({ pageNum, text: pageText });
-      pageNum++;
+    while (pos < fullText.length && pNum <= finalPageCount + 10) {
+      let endPos = Math.min(pos + avgPageLength, fullText.length);
+      const breakPos = fullText.lastIndexOf('.', endPos);
+      if (breakPos > pos + avgPageLength / 2) {
+        endPos = breakPos + 1;
+      }
+      
+      const pageText = fullText.slice(pos, endPos).trim();
+      if (pageText.length > 10) {
+        pages.push({ pageNum: pNum, text: pageText });
+        pNum++;
+      }
+      
+      pos = endPos;
     }
-    
-    pos = endPos;
+  }
+  
+  // For scanned PDFs with very little text, still create page entries
+  if (pages.length < finalPageCount && isScannedOrImageBased) {
+    const existingPages = pages.length;
+    for (let i = existingPages + 1; i <= finalPageCount; i++) {
+      pages.push({ pageNum: i, text: `[Page ${i} - Image/scanned content]` });
+    }
   }
   
   if (onProgress) onProgress(100, 'Extraction complete!');
   
-  console.log('[PDFExtractor] Extracted', fullText.length, 'chars from', pages.length, 'estimated pages');
+  // Check extraction quality
+  const quality = checkTextQuality(fullText);
+  console.log('[PDFExtractor] Extracted', fullText.length, 'chars from', pages.length, 'pages (detected:', pageCount, '), quality:', quality);
   
   return {
-    pageCount: pages.length || 1,
+    pageCount: pages.length || finalPageCount,
     pages,
     fullText,
-    isScanned: fullText.length < 100,
+    isScanned: isScannedOrImageBased || quality === 'garbage',
+    extractionQuality: quality,
   };
 };
 
@@ -574,13 +719,16 @@ const processVeryLargeFileLocally = async (
     
     if (onProgress) onProgress(100, 'Extraction complete!');
     
-    console.log('[PDFExtractor] Large file extraction got', fullText.length, 'chars,', pages.length, 'pages');
+    // Check extraction quality
+    const quality = checkTextQuality(fullText);
+    console.log('[PDFExtractor] Large file extraction got', fullText.length, 'chars,', pages.length, 'pages, quality:', quality);
     
     return {
       pageCount: pages.length || estimatedPages,
       pages,
       fullText: fullText.length > 100 ? fullText : `Unable to fully extract text from this ${fileSizeMB}MB document. The document may be scanned/image-based. For best results with large scanned documents, please use Google Drive's OCR feature to convert it first.`,
-      isScanned: fullText.length < 100,
+      isScanned: fullText.length < 100 || quality === 'garbage',
+      extractionQuality: quality,
     };
     
   } catch (error: any) {

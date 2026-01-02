@@ -176,6 +176,73 @@ export const getDocumentById = async (id: string): Promise<Document | null> => {
   }
 };
 
+export const deleteDocument = async (id: string): Promise<void> => {
+  try {
+    const db = await getDb();
+    await db.runAsync('DELETE FROM documents WHERE id = ?;', [id]);
+    console.log('[Storage] Document deleted:', id);
+    
+    // Also try to soft delete from cloud if it's a UUID (cloud document)
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+    if (isUUID) {
+      try {
+        const { supabase } = await import('./supabase');
+        // Try soft delete on documents table (new schema)
+        await supabase.rpc('soft_delete_document', { doc_id: id });
+        console.log('[Storage] Cloud document soft deleted:', id);
+      } catch (cloudError) {
+        // Silently fail - cloud document may not exist
+        console.log('[Storage] Cloud delete skipped (may not exist):', id);
+      }
+    }
+  } catch (error) {
+    console.error('Error deleting document:', error);
+    throw error;
+  }
+};
+
+export const deleteAllDocuments = async (): Promise<void> => {
+  try {
+    // 1. Delete all local documents
+    const db = await getDb();
+    await db.runAsync('DELETE FROM documents;');
+    console.log('[Storage] All local documents deleted');
+    
+    // 2. Soft delete all cloud documents for the current user
+    try {
+      const { supabase } = await import('./supabase');
+      const { data: { user } } = await supabase.auth.getUser();
+      
+      if (user) {
+        // Soft delete all user's documents (set deleted_at)
+        const { error } = await supabase
+          .from('documents')
+          .update({ deleted_at: new Date().toISOString() })
+          .eq('user_id', user.id)
+          .is('deleted_at', null);
+        
+        if (error) {
+          console.warn('[Storage] Cloud documents soft delete error:', error.message);
+        } else {
+          console.log('[Storage] All cloud documents soft deleted for user:', user.id);
+        }
+        
+        // Also try cloud_documents table (legacy)
+        await supabase
+          .from('cloud_documents')
+          .update({ deleted_at: new Date().toISOString() })
+          .eq('user_id', user.id);
+      }
+    } catch (cloudError: any) {
+      console.warn('[Storage] Cloud delete error:', cloudError.message);
+      // Continue - local documents were deleted
+    }
+  } catch (error) {
+    console.error('Error deleting all documents:', error);
+    throw error;
+  }
+};
+
 export const saveTestResult = async (result: TestResult): Promise<void> => {
   try {
     const db = await getDb();
