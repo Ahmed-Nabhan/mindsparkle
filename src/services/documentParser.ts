@@ -1,4 +1,5 @@
 import * as FileSystem from 'expo-file-system';
+import JSZip from 'jszip';
 
 const MAX_CHUNK_SIZE = 12000;
 const MAX_FILE_SIZE_MB = 10240;
@@ -259,7 +260,7 @@ const extractDocText = async (fileUri: string): Promise<string> => {
   }
 };
 
-// Extract text from PowerPoint (PPTX) files - handles large files with true streaming
+// Extract text from PowerPoint (PPTX) files using proper ZIP parsing
 const extractPptxText = async (fileUri: string): Promise<string> => {
   try {
     // Get file info first
@@ -267,25 +268,151 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
     const fileSize = (fileInfo as any).size || 0;
     const fileSizeMB = Math.round(fileSize / (1024 * 1024));
     
-    console.log('[PPTX] Processing file, size:', fileSizeMB, 'MB');
+    console.log('[PPTX] Processing file with JSZip, size:', fileSizeMB, 'MB');
     
-    // True streaming: read file in small chunks, never load entire file
+    // Read file as base64
+    const base64Content = await FileSystem.readAsStringAsync(fileUri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    
+    // PPTX is a ZIP file - use JSZip to properly extract
+    const zip = new JSZip();
+    await zip.loadAsync(base64Content, { base64: true });
+    
+    // Find all slide XML files
+    const slideFiles: string[] = [];
+    zip.forEach((relativePath: string) => {
+      if (relativePath.match(/ppt\/slides\/slide\d+\.xml$/)) {
+        slideFiles.push(relativePath);
+      }
+    });
+    
+    // Sort by slide number
+    slideFiles.sort((a, b) => {
+      const numA = parseInt(a.match(/slide(\d+)/)?.[1] || '0');
+      const numB = parseInt(b.match(/slide(\d+)/)?.[1] || '0');
+      return numA - numB;
+    });
+    
+    console.log('[PPTX] Found', slideFiles.length, 'slides');
+    
+    let allText = '';
+    
+    // Extract text from each slide
+    for (let i = 0; i < slideFiles.length; i++) {
+      const slideFile = slideFiles[i];
+      const slideXml = await zip.file(slideFile)?.async('string');
+      
+      if (slideXml) {
+        // Extract all <a:t> text elements
+        const textPattern = /<a:t[^>]*>([^<]*)<\/a:t>/g;
+        let match;
+        const slideTexts: string[] = [];
+        
+        while ((match = textPattern.exec(slideXml)) !== null) {
+          const text = match[1].trim();
+          if (text) {
+            // Decode XML entities
+            const decoded = text
+              .replace(/&amp;/g, '&')
+              .replace(/&lt;/g, '<')
+              .replace(/&gt;/g, '>')
+              .replace(/&quot;/g, '"')
+              .replace(/&apos;/g, "'")
+              .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code)));
+            slideTexts.push(decoded);
+          }
+        }
+        
+        if (slideTexts.length > 0) {
+          allText += `\n--- Slide ${i + 1} ---\n${slideTexts.join(' ')}\n`;
+        }
+      }
+      
+      // Progress logging every 50 slides
+      if (i > 0 && i % 50 === 0) {
+        console.log('[PPTX] Processed', i, '/', slideFiles.length, 'slides');
+      }
+    }
+    
+    // Also try to extract from notesSlides (speaker notes)
+    try {
+      const notesFiles: string[] = [];
+      zip.forEach((relativePath: string) => {
+        if (relativePath.match(/ppt\/notesSlides\/notesSlide\d+\.xml$/)) {
+          notesFiles.push(relativePath);
+        }
+      });
+      
+      if (notesFiles.length > 0) {
+        console.log('[PPTX] Found', notesFiles.length, 'notes slides');
+        allText += '\n\n--- Speaker Notes ---\n';
+        
+        for (const notesFile of notesFiles) {
+          const notesXml = await zip.file(notesFile)?.async('string');
+          if (notesXml) {
+            const textPattern = /<a:t[^>]*>([^<]*)<\/a:t>/g;
+            let match;
+            while ((match = textPattern.exec(notesXml)) !== null) {
+              const text = match[1].trim();
+              if (text && text.length > 2) {
+                allText += text + ' ';
+              }
+            }
+          }
+        }
+      }
+    } catch (notesError) {
+      // Ignore notes extraction errors
+    }
+    
+    // Clean up the text
+    allText = allText.trim();
+    
+    console.log('[PPTX] Extracted', allText.length, 'chars from', slideFiles.length, 'slides');
+    
+    if (allText.length < 30) {
+      throw new Error('Could not extract text from PowerPoint. The file may contain only images or be corrupted.');
+    }
+    
+    return allText;
+    
+  } catch (error: any) {
+    console.error('[PPTX] Extraction error:', error.message);
+    
+    // Fall back to legacy streaming extraction for very large files
+    if (error.message?.includes('memory') || error.message?.includes('heap')) {
+      console.log('[PPTX] Falling back to streaming extraction due to memory');
+      return extractPptxTextStreaming(fileUri);
+    }
+    
+    throw new Error(error.message || 'Could not extract text from PowerPoint document.');
+  }
+};
+
+// Legacy streaming extraction for very large PPTX files
+const extractPptxTextStreaming = async (fileUri: string): Promise<string> => {
+  try {
+    const fileInfo = await FileSystem.getInfoAsync(fileUri);
+    const fileSize = (fileInfo as any).size || 0;
+    const fileSizeMB = Math.round(fileSize / (1024 * 1024));
+    
+    console.log('[PPTX] Streaming fallback for', fileSizeMB, 'MB file');
+    
+    // True streaming: read file in small chunks
     const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB raw chunks
-    const MAX_TOTAL_TEXT = 800000; // Increased max chars to extract for large presentations
-    const MAX_PPTX_MATCHES = 10000; // Increased: 542 slides × ~10-15 blocks each = need 5000-8000+
-    const MAX_BYTES_TO_READ = 150 * 1024 * 1024; // Increased: read more of large files (150MB max)
+    const MAX_TOTAL_TEXT = 800000;
+    const MAX_PPTX_MATCHES = 10000;
+    const MAX_BYTES_TO_READ = 150 * 1024 * 1024;
     
     let textContent = '';
     let pptxMatches = 0;
     let bytesRead = 0;
     let chunkIdx = 0;
-    let carryOver = ''; // Text that spans chunk boundaries
-    
-    console.log('[PPTX] Using streaming mode for', fileSizeMB, 'MB file');
+    let carryOver = '';
     
     while (bytesRead < fileSize && bytesRead < MAX_BYTES_TO_READ && pptxMatches < MAX_PPTX_MATCHES) {
       try {
-        // Read chunk directly from file (this is the key - read only what we need)
         const base64Chunk = await FileSystem.readAsStringAsync(fileUri, {
           encoding: FileSystem.EncodingType.Base64,
           position: bytesRead,
@@ -294,18 +421,15 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
         
         if (!base64Chunk || base64Chunk.length === 0) break;
         
-        // Decode this chunk only
         let binaryChunk: string;
         try {
           binaryChunk = atob(base64Chunk);
         } catch (e) {
-          console.log('[PPTX] Chunk', chunkIdx, 'decode failed, skipping');
           bytesRead += CHUNK_SIZE;
           chunkIdx++;
           continue;
         }
         
-        // Prepend any carry-over from previous chunk
         const fullChunk = carryOver + binaryChunk;
         carryOver = '';
         
@@ -319,9 +443,7 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
             const closeTag = '</a:t>';
             const endIdx = fullChunk.indexOf(closeTag, startTagEnd + 1);
             
-            // If we can't find close tag, might span chunks
             if (endIdx === -1) {
-              // Save the rest for next chunk
               carryOver = fullChunk.substring(i);
               break;
             }
@@ -330,7 +452,6 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
             
             const text = fullChunk.substring(startTagEnd + 1, endIdx);
             if (text && text.length > 0 && text.length < 200) {
-              // Clean text char by char (no regex)
               let cleanText = '';
               for (let c = 0; c < text.length; c++) {
                 const code = text.charCodeAt(c);
@@ -346,7 +467,6 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
           }
         }
         
-        // Check if we have enough text
         if (textContent.length > MAX_TOTAL_TEXT) {
           textContent = textContent.substring(0, MAX_TOTAL_TEXT);
           break;
@@ -355,38 +475,28 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
         bytesRead += CHUNK_SIZE;
         chunkIdx++;
         
-        // Log progress every 10 chunks
         if (chunkIdx % 10 === 0) {
-          console.log('[PPTX] Processed', Math.round(bytesRead / (1024 * 1024)), 'MB, found', pptxMatches, 'text blocks');
+          console.log('[PPTX Streaming] Processed', Math.round(bytesRead / (1024 * 1024)), 'MB');
         }
         
       } catch (chunkError: any) {
-        console.log('[PPTX] Chunk', chunkIdx, 'error:', chunkError.message);
         bytesRead += CHUNK_SIZE;
         chunkIdx++;
         continue;
       }
     }
     
-    // Simple cleanup
     textContent = textContent.trim();
     
-    // Add note if file was truncated
-    if (bytesRead < fileSize) {
-      const percentRead = Math.round((bytesRead / fileSize) * 100);
-      textContent = '[Note: Large presentation (' + fileSizeMB + 'MB). Processed ' + percentRead + '% of content.]\n\n' + textContent;
-    }
-
-    console.log('[PPTX] Extracted', textContent.length, 'chars,', pptxMatches, 'text blocks from', Math.round(bytesRead / (1024 * 1024)), 'MB');
-
     if (textContent.length < 30) {
       throw new Error('Could not extract text from PowerPoint. The file may contain only images.');
     }
-
-    console.log('[PPTX] Extracted ' + textContent.length + ' characters, ' + pptxMatches + ' text blocks');
+    
+    console.log('[PPTX Streaming] Extracted', textContent.length, 'chars');
     return textContent;
+    
   } catch (error: any) {
-    console.error('[PPTX] Extraction error:', error.message);
+    console.error('[PPTX Streaming] Error:', error.message);
     throw new Error(error.message || 'Could not extract text from PowerPoint document.');
   }
 };
