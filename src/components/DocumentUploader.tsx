@@ -268,12 +268,17 @@ export const DocumentUploader: React.FC<DocumentUploaderProps> = ({
    */
   const pickDocument = async () => {
     // Prevent double-tap
-    if (isPicking || externalIsUploading) return;
+    if (isPicking || externalIsUploading) {
+      console.log('[DocumentUploader] Pick blocked - isPicking:', isPicking, 'isUploading:', externalIsUploading);
+      return;
+    }
     
+    console.log('[DocumentUploader] Starting document picker...');
     setIsPicking(true);
     
     try {
       // Step 1: Show document picker
+      console.log('[DocumentUploader] Opening system file picker...');
       const result = await DocumentPicker.getDocumentAsync({
         type: [
           'application/pdf',
@@ -288,14 +293,18 @@ export const DocumentUploader: React.FC<DocumentUploaderProps> = ({
         ],
         copyToCacheDirectory: true,
       });
+      
+      console.log('[DocumentUploader] Picker result:', result.canceled ? 'canceled' : 'file selected');
 
       // User cancelled
       if (result.canceled || !result.assets || result.assets.length === 0) {
+        console.log('[DocumentUploader] User cancelled or no assets');
         setIsPicking(false);
         return;
       }
 
       const file = result.assets[0];
+      console.log('[DocumentUploader] File selected:', file.name, 'size:', file.size);
       
       // Step 2: Validate file type
       if (!isValidFileType(file.name, config.supportedFileTypes.documents)) {
@@ -354,13 +363,14 @@ export const DocumentUploader: React.FC<DocumentUploaderProps> = ({
 
       // Step 4: Return result to parent - parent handles ALL upload/processing
       // via useDocument.uploadDocument() - this prevents duplicate uploads
+      console.log('[DocumentUploader] Calling onDocumentSelected...');
+      setIsPicking(false); // Reset picking state BEFORE calling parent
       onDocumentSelected(result);
       
     } catch (error: any) {
       console.error('[DocumentUploader] Error picking document:', error);
       onError?.(error.message || 'Failed to pick document');
       Alert.alert('Error', 'Failed to pick document. Please try again.');
-    } finally {
       setIsPicking(false);
     }
   };

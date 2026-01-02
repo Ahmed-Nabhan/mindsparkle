@@ -348,10 +348,15 @@ export const UploadScreen: React.FC = () => {
   };
 
   const handleDocumentSelected = async (result: any) => {
-    if (result.canceled || !result.assets || result.assets.length === 0) return;
+    console.log('[UploadScreen] handleDocumentSelected called');
+    if (result.canceled || !result.assets || result.assets.length === 0) {
+      console.log('[UploadScreen] No file selected or cancelled');
+      return;
+    }
 
     // Check document limit for free users
     if (!canUploadMore) {
+      console.log('[UploadScreen] Document limit reached');
       Alert.alert(
         '📚 Document Limit Reached',
         `Free users can upload up to ${features.maxDocuments} documents. Upgrade to Pro for unlimited documents!`,
@@ -365,6 +370,7 @@ export const UploadScreen: React.FC = () => {
 
     const file = result.assets[0];
     const fileSize = file.size || 0;
+    console.log('[UploadScreen] Starting upload for:', file.name, 'size:', fileSize);
     
     // Set up preview
     setPreviewFile({
@@ -391,6 +397,7 @@ export const UploadScreen: React.FC = () => {
     setCurrentProgress(0);
     setCurrentMessage('Starting upload...');
     
+    console.log('[UploadScreen] Calling uploadDocument...');
     const uploadResult = await uploadDocument(
       file.name,
       file.uri,
@@ -403,8 +410,10 @@ export const UploadScreen: React.FC = () => {
         }
       }
     );
+    console.log('[UploadScreen] uploadDocument returned:', uploadResult.success ? 'success' : 'failed');
 
     if (uploadCancelled) {
+      console.log('[UploadScreen] Upload was cancelled');
       return;
     }
 
@@ -422,10 +431,12 @@ export const UploadScreen: React.FC = () => {
   };
 
   const handleDocumentPress = (document: Document) => {
+    console.log('[UploadScreen] Document pressed:', document.id);
     navigation.navigate('DocumentActions', { documentId: document.id });
   };
 
   const handleDeleteDocument = (document: Document) => {
+    console.log('[UploadScreen] Delete document requested:', document.id);
     Alert.alert(
       '🗑️ Delete Document',
       `Are you sure you want to delete "${document.title}"? This cannot be undone.`,
