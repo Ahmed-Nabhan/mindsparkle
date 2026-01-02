@@ -117,8 +117,14 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
   // 👑 Check premium status when user email changes
   // This ensures owner gets Pro access immediately after sign in
   useEffect(() => {
-    const OWNER_EMAIL = 'ahmedadel737374@icloud.com';
-    if (user?.email?.toLowerCase() === OWNER_EMAIL.toLowerCase()) {
+    const OWNER_EMAILS = [
+      'ahmedadel737374@icloud.com',
+      'jzggwd5ynj@privaterelay.appleid.com', // Apple private relay email
+    ];
+    const userEmail = user?.email?.toLowerCase();
+    const isOwner = OWNER_EMAILS.some(email => email.toLowerCase() === userEmail);
+    
+    if (isOwner) {
       console.log('[Premium] 👑 Owner email detected - auto-granting Pro!');
       setIsPremium(true);
       setFeatures(PRO_TIER_LIMITS);
