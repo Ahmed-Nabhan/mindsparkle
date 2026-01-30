@@ -1,0 +1,75 @@
+{
+  "cleanUrls": true,
+  "rewrites": [
+    {
+      "source": "/app/(.*)",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/app/$1"
+    },
+    {
+      "source": "/assets/(.*)",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/app/assets/$1"
+    },
+    {
+      "source": "/_expo/(.*)",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/app/_expo/$1"
+    },
+    {
+      "source": "/favicon.ico",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/app/favicon.ico"
+    },
+    {
+      "source": "/(.*)",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/app/index.html"
+    },
+    {
+      "source": "/app/(.*)",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/app/$1"
+    },
+    {
+      "source": "/assets/(.*)",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/app/assets/$1"
+    },
+    {
+      "source": "/_expo/(.*)",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/app/_expo/$1"
+    },
+    {
+      "source": "/favicon.ico",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/app/favicon.ico"
+    },
+    {
+      "source": "/(.*)",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/app/index.html"
+    },
+    {
+      "source": "/assets/(.*)",
+      "has": [{ "type": "host", "value": "marketing.mindsparkleai.com" }],
+      "destination": "/assets/$1"
+    },
+    {
+      "source": "/_expo/(.*)",
+      "has": [{ "type": "host", "value": "marketing.mindsparkleai.com" }],
+      "destination": "/_expo/$1"
+    },
+    {
+      "source": "/favicon.ico",
+      "has": [{ "type": "host", "value": "marketing.mindsparkleai.com" }],
+      "destination": "/favicon.ico"
+    },
+    {
+      "source": "/(.*)",
+      "has": [{ "type": "host", "value": "marketing.mindsparkleai.com" }],
+      "destination": "/index.html"
+    }
+  ]
+}
