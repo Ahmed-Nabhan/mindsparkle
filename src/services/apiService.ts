@@ -972,8 +972,8 @@ async function chatStreamWithAction(
   onDone?: () => void,
   onError?: (err: any) => void
 ): Promise<void> {
-  // Streaming endpoints are backed by openai-proxy which requires a user JWT.
-  if (action !== 'test') {
+  // Streaming endpoints are backed by openai-proxy. Allow guest for ChatMind.
+  if (action !== 'test' && action !== 'chatMindStream') {
     const token = await getSessionAccessToken();
     if (!token) {
       const err: any = new Error('Please sign in to use AI chat.');
