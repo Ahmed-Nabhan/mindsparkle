@@ -472,13 +472,14 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // Truncate if too long (max 2MB)
-    const MAX_TEXT_LENGTH = 2 * 1024 * 1024;
+    // Truncate if too long (max 10MB)
+    const MAX_TEXT_LENGTH = 10 * 1024 * 1024;
     let extractedText = result.text;
     
     if (extractedText.length > MAX_TEXT_LENGTH) {
-      extractedText = extractedText.substring(0, MAX_TEXT_LENGTH) + 
-        "\n\n[Note: Text truncated due to size limit]";
+      const originalLen = extractedText.length;
+      extractedText = extractedText.substring(0, MAX_TEXT_LENGTH) +
+        `\n\n[Note: Text truncated due to size limit. Full document is ${(originalLen / (1024 * 1024)).toFixed(1)}MB]`;
     }
 
     // Update document with extracted text

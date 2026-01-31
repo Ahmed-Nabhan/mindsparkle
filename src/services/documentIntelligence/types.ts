@@ -59,17 +59,47 @@ export type AICapability =
 // ============================================
 
 export type VendorId = 
+  // Cloud & Infrastructure
   | 'cisco' 
   | 'aws' 
   | 'microsoft' 
   | 'google' 
   | 'oracle'
+  | 'ibm'
+  | 'salesforce'
+  | 'sap'
+  // Virtualization & Containers
   | 'vmware'
   | 'redhat'
-  | 'comptia'
+  | 'docker'
+  | 'kubernetes'
+  // Security
   | 'fortinet'
   | 'paloalto'
+  | 'checkpoint'
+  | 'crowdstrike'
+  | 'splunk'
+  | 'isc2'
+  | 'isaca'
+  | 'ec-council'
+  // Networking
   | 'juniper'
+  | 'arista'
+  | 'f5'
+  | 'netapp'
+  // General IT Certs
+  | 'comptia'
+  | 'itil'
+  | 'pmi'
+  // Development
+  | 'hashicorp'
+  | 'mongodb'
+  | 'snowflake'
+  | 'databricks'
+  | 'servicenow'
+  // Wireless & Mobile
+  | 'aruba'
+  // Default
   | 'generic';
 
 export interface VendorConfig {

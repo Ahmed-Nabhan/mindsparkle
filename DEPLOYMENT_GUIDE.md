@@ -80,6 +80,17 @@ npx supabase secrets set GOOGLE_AI_API_KEY=your_google_key  # For Gemini
 npx supabase secrets set ANTHROPIC_API_KEY=your_anthropic_key  # For Claude
 ```
 
+### Configure Supabase Auth Redirect URLs (Required for password reset)
+
+If your password reset emails are sending users to `http://localhost:3000`, your Supabase Auth URL settings are still in local-dev mode.
+
+- Supabase Dashboard → Authentication → URL Configuration
+- Set **Site URL** to your production site (or a non-local URL)
+- Add these to **Redirect URLs**:
+  - `mindsparkle://auth/callback`
+
+Note: The app sends password reset emails with `redirectTo: mindsparkle://auth/callback`. If that redirect URL isn’t allow-listed, Supabase will fall back to your Site URL (often `localhost`).
+
 ## Step 3: Update App Code
 
 ### Replace Old Service with New
@@ -186,7 +197,7 @@ eas submit --platform android
 
 ### Test RBAC
 
-1. Sign in as admin (ahmedadel737374@icloud.com)
+1. Sign in as admin
 2. Verify admin can see all documents
 3. Sign in as regular user
 4. Verify user only sees own documents
@@ -306,4 +317,4 @@ For issues:
 2. Check Edge Function logs: `npx supabase functions logs`
 3. Enable debug logging in app: Set `__DEV__` to true
 
-Owner email: ahmedadel737374@icloud.com (auto-admin)
+Pro Version: All users have full access

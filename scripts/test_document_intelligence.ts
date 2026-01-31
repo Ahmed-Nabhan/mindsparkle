@@ -5,7 +5,7 @@
  */
 
 // Test Vendor Detection
-import { vendorDetector, modelRouter, promptBuilder, createKnowledgeGraph } from '../src/services/documentIntelligence/index.js';
+import { vendorDetector, modelRouter, promptBuilder, createKnowledgeGraph } from '../src/services/documentIntelligence/index';
 
 console.log('🧪 Document Intelligence Test Suite\n');
 console.log('='.repeat(50));

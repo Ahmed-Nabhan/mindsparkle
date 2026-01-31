@@ -4,30 +4,38 @@ import { createDrawerNavigator } from '@react-navigation/drawer';
 import { Sidebar } from '../components/Sidebar';
 import { colors } from '../constants/colors';
 import { strings } from '../constants/strings';
+import { useAuth } from '../context/AuthContext';
+import { LoadingSpinner } from '../components/LoadingSpinner';
 
 // Screens
-import { WelcomeScreen } from '../screens/WelcomeScreen';
 import { HomeScreen } from '../screens/HomeScreen';
 import { UploadScreen } from '../screens/UploadScreen';
 import { DocumentActionsScreen } from '../screens/DocumentActionsScreen';
 import { SummaryScreen } from '../screens/SummaryScreen';
-import { StudyScreen } from '../screens/StudyScreen';
+import { DeepExplainScreen } from '../screens/DeepExplainScreen';
+import { GuideScreen } from '../screens/GuideScreen';
+import { WhiteboardScreen } from '../screens/WhiteboardScreen';
+import PlanScreen from '../screens/PlanScreen';
 import { VideoScreen } from '../screens/VideoScreen';
 import { TestScreen } from '../screens/TestScreen';
 import { LabsScreen } from '../screens/LabsScreen';
 import { PerformanceScreen } from '../screens/PerformanceScreen';
 import { ExamsScreen } from '../screens/ExamsScreen';
-import { InterviewScreen } from '../screens/InterviewScreen';
+import { InterviewScreen } from '../screens/InterviewScreenText';
 
 // New Screens
 import { AuthScreen } from '../screens/AuthScreen';
 import { PaywallScreen } from '../screens/PaywallScreen';
 import { FlashcardScreen } from '../screens/FlashcardScreen';
 import { ChatScreen } from '../screens/ChatScreen';
-import { AchievementsScreen } from '../screens/AchievementsScreen';
 import { AudioPlayerScreen } from '../screens/AudioPlayerScreen';
+import { AchievementsScreen } from '../screens/AchievementsScreen';
 import { FoldersScreen } from '../screens/FoldersScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
+import { PresentationScreen } from '../screens/PresentationScreen';
+import { ResetPasswordScreen } from '../screens/ResetPasswordScreen';
+import { WelcomeScreen } from '../screens/WelcomeScreen';
+import { AgentsScreen } from '../screens/AgentsScreen';
 
 import type { RootStackParamList, MainDrawerParamList } from './types';
 
@@ -65,6 +73,14 @@ const MainDrawer = () => {
           title: strings.upload.title,
         }}
       />
+      <Drawer.Screen
+        name="Agents"
+        component={AgentsScreen}
+        options={{
+          title: 'Agents',
+          drawerItemStyle: { display: 'none' },
+        }}
+      />
       <Drawer.Screen 
         name="DocumentActions" 
         component={DocumentActionsScreen}
@@ -82,11 +98,37 @@ const MainDrawer = () => {
         }}
       />
       <Drawer.Screen 
-        name="Study" 
-        component={StudyScreen}
+        name="DeepExplain" 
+        component={DeepExplainScreen}
         options={{
-          title:  'Study',
+          title: 'Deep Explain',
           drawerItemStyle:  { display: 'none' },
+        }}
+      />
+      <Drawer.Screen
+        name="Guide"
+        component={GuideScreen}
+        options={{
+          title: 'Guide',
+          drawerItemStyle: { display: 'none' },
+        }}
+      />
+
+      <Drawer.Screen
+        name="Whiteboard"
+        component={WhiteboardScreen}
+        options={{
+          title: 'Whiteboard',
+          drawerItemStyle: { display: 'none' },
+        }}
+      />
+
+      <Drawer.Screen
+        name="Plan"
+        component={PlanScreen}
+        options={{
+          title: 'Plan',
+          drawerItemStyle: { display: 'none' },
         }}
       />
       <Drawer.Screen 
@@ -143,10 +185,25 @@ const MainDrawer = () => {
         }}
       />
       <Drawer.Screen 
-        name="Chat" 
+        name="ChatMind" 
         component={ChatScreen}
         options={{
-          title: 'AI Chat',
+          title: 'Chat Mind',
+        }}
+      />
+      <Drawer.Screen
+        name="DocChat"
+        component={ChatScreen}
+        options={{
+          title: 'AI Chat (Doc)',
+          drawerItemStyle: { display: 'none' },
+        }}
+      />
+      <Drawer.Screen
+        name="AudioPlayer"
+        component={AudioPlayerScreen}
+        options={{
+          title: 'Audio Player',
           drawerItemStyle: { display: 'none' },
         }}
       />
@@ -155,14 +212,6 @@ const MainDrawer = () => {
         component={AchievementsScreen}
         options={{
           title: 'Achievements',
-        }}
-      />
-      <Drawer.Screen 
-        name="AudioPlayer" 
-        component={AudioPlayerScreen}
-        options={{
-          title: 'Audio Player',
-          drawerItemStyle: { display: 'none' },
         }}
       />
       <Drawer.Screen 
@@ -179,11 +228,27 @@ const MainDrawer = () => {
           title: 'Settings',
         }}
       />
+      <Drawer.Screen 
+        name="Presentation" 
+        component={PresentationScreen}
+        options={{
+          title: 'AI Presentation',
+          // Presentation should be accessed from Document Actions (not from the sidebar)
+          drawerItemStyle: { display: 'none' },
+        }}
+      />
     </Drawer.Navigator>
   );
 };
 
 export const AppNavigator = () => {
+  const { isAuthenticated, isLoading } = useAuth();
+
+  // Ensure the first screen is Login when logged out.
+  if (isLoading) {
+    return <LoadingSpinner message="Loading…" />;
+  }
+
   return (
     <Stack.Navigator
       screenOptions={{
@@ -191,8 +256,9 @@ export const AppNavigator = () => {
       }}
     >
       <Stack.Screen name="Welcome" component={WelcomeScreen} />
-      <Stack.Screen name="Auth" component={AuthScreen} />
       <Stack.Screen name="Main" component={MainDrawer} />
+      <Stack.Screen name="Auth" component={AuthScreen} />
+      <Stack.Screen name="ResetPassword" component={ResetPasswordScreen} />
       <Stack.Screen 
         name="Paywall" 
         component={PaywallScreen}

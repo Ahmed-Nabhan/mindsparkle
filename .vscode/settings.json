@@ -20,5 +20,15 @@
   ],
   "[typescript]": {
     "editor.defaultFormatter": "denoland.vscode-deno"
+  },
+  "typescript.tsserver.excludeDirectories": [
+    "**/node_modules"
+  ],
+  "typescript.tsserver.experimental.enableProjectDiagnostics": false,
+  "javascript.tsserver.excludeDirectories": [
+    "**/node_modules"
+  ],
+  "files.watcherExclude": {
+    "**/node_modules/**": true
   }
 }

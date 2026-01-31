@@ -70,6 +70,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
     signInWithApple, 
     signInWithMagicLink,
     resetPassword,
+    isAuthenticated,
     authError,
     clearError,
   } = useAuth();
@@ -115,6 +116,26 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
     clearError();
     setSuccessMessage(null);
   }, [mode, clearError]);
+
+  const resetToMain = () => {
+    const parentNav = typeof navigation.getParent === 'function' ? navigation.getParent() : null;
+    const nav = parentNav || navigation;
+
+    nav.dispatch(
+      CommonActions.reset({
+        index: 0,
+        routes: [{ name: 'Main' }],
+      })
+    );
+  };
+
+  // If auth state flips to authenticated while this screen is mounted
+  // (e.g., delayed propagation, OAuth callback, magic link), ensure we exit Auth.
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    resetToMain();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated]);
 
   // ============================================
   // VALIDATION
@@ -197,13 +218,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
         // Wait for auth state to propagate
         await new Promise(resolve => setTimeout(resolve, 300));
         
-        // Reset navigation stack and go to Main
-        navigation.dispatch(
-          CommonActions.reset({
-            index: 0,
-            routes: [{ name: 'Main' }],
-          })
-        );
+        resetToMain();
       } else {
         throw new Error('No identity token received from Apple');
       }
@@ -263,8 +278,12 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ navigation }) => {
       // Sign in via context (handles JWT storage automatically)
       await signIn(email.trim().toLowerCase(), password);
       
-      // Navigation happens automatically via auth state change
-      console.log('[Auth] Sign in successful');
+      console.log('[Auth] Sign in successful, navigating to Main...');
+      
+      // Wait briefly for auth state to propagate
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+      resetToMain();
     } catch (error: any) {
       Alert.alert('Sign In Failed', error.message || 'Invalid email or password');
     } finally {

@@ -11,6 +11,7 @@ import {
 import * as DocumentPicker from 'expo-document-picker';
 import { colors } from '../constants/colors';
 import { useDocument } from '../hooks/useDocument';
+import { usePremiumContext } from '../context/PremiumContext';
 import { Card } from './Card';
 import { Button } from './Button';
 import { LoadingSpinner } from './LoadingSpinner';
@@ -28,6 +29,7 @@ export const DocumentSelector: React.FC<DocumentSelectorProps> = ({
   subtitle = 'Choose from your library or upload a new document',
 }) => {
   const { documents, isLoading, uploadDocument, refreshDocuments } = useDocument();
+  const { isPremium } = usePremiumContext();
   const [isUploading, setIsUploading] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
 
@@ -54,7 +56,9 @@ export const DocumentSelector: React.FC<DocumentSelectorProps> = ({
         file.name,
         file.uri,
         file.mimeType || 'application/pdf',
-        file.size || 0
+        file.size || 0,
+        undefined, // onProgress
+        isPremium  // isPro - for premium Adobe OCR
       );
 
       if (uploadResult.success && uploadResult.document) {

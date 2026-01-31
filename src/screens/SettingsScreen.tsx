@@ -7,6 +7,8 @@ import {
   TouchableOpacity,
   Switch,
   Alert,
+  Linking,
+  Platform,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { colors } from '../constants/colors';
@@ -27,6 +29,11 @@ export const SettingsScreen: React.FC = () => {
   const navigation = useNavigation<SettingsScreenProps['navigation']>();
   const { isPremium, features, checkPremiumStatus, debugPremium, toggleDebugPremium } = usePremiumContext();
   const { user, signOut } = useAuth();
+
+  const termsUrl =
+    Platform.OS === 'ios'
+      ? 'https://www.apple.com/legal/internet-services/itunes/dev/stdeula/'
+      : 'https://ahmed-nabhan.github.io/mindsparkle/terms.html';
   
   const [isLoading, setIsLoading] = useState(false);
   const [studyReminders, setStudyReminders] = useState(true);
@@ -312,7 +319,7 @@ export const SettingsScreen: React.FC = () => {
         <Card style={styles.card}>
           <View style={styles.row}>
             <Text style={styles.label}>Documents</Text>
-            <Text style={styles.value}>{features.maxDocuments === -1 ? 'Unlimited' : `${features.maxDocuments} max`}</Text>
+            <Text style={styles.value}>{features.maxDocuments === -1 ? 'Unlimited' : `${features.maxDocuments}/day`}</Text>
           </View>
           <View style={styles.row}>
             <Text style={styles.label}>Quizzes/Day</Text>
@@ -344,6 +351,27 @@ export const SettingsScreen: React.FC = () => {
             <Text style={styles.label}>Build</Text>
             <Text style={styles.value}>100</Text>
           </View>
+          <TouchableOpacity 
+            style={styles.linkRow}
+            onPress={() => Linking.openURL(termsUrl)}
+          >
+            <Text style={styles.linkText}>Terms of Use (EULA)</Text>
+            <Text style={styles.linkArrow}>→</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={styles.linkRow}
+            onPress={() => Linking.openURL('https://ahmed-nabhan.github.io/mindsparkle/privacy.html')}
+          >
+            <Text style={styles.linkText}>Privacy Policy</Text>
+            <Text style={styles.linkArrow}>→</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={styles.linkRow}
+            onPress={() => Linking.openURL('https://ahmed-nabhan.github.io/mindsparkle/support.html')}
+          >
+            <Text style={styles.linkText}>Support</Text>
+            <Text style={styles.linkArrow}>→</Text>
+          </TouchableOpacity>
         </Card>
 
         {/* Debug Section - Development Only */}
@@ -513,6 +541,23 @@ const styles = StyleSheet.create({
     color: colors.error,
     fontSize: 14,
     fontWeight: '600',
+  },
+  linkRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+  },
+  linkText: {
+    fontSize: 15,
+    color: colors.primary,
+    fontWeight: '500',
+  },
+  linkArrow: {
+    fontSize: 16,
+    color: colors.primary,
   },
   signOutButton: {
     marginTop: 16,

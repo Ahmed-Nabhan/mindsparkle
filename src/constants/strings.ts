@@ -1,7 +1,7 @@
 export const strings = {
   welcome: {
     title: 'Welcome to MindSparkle',
-    subtitle: 'Here you can learn and sparkle your information with simple colors',
+    subtitle: 'Upload documents, get great summaries, and chat with AI.',
   },
   home: {
     title: 'MindSparkle',
@@ -17,7 +17,7 @@ export const strings = {
   },
   actions: {
     summarize: 'Summarize',
-    study: 'Study',
+    study: 'Plan',
     generateVideo: 'Generate Video',
     test: 'Test',
     labs: 'Labs',

@@ -73,7 +73,7 @@ export const QuizScreen: React.FC<QuizScreenProps> = ({ route, navigation }) => 
   const [questionCount, setQuestionCount] = useState(5);
   const [timeLeft, setTimeLeft] = useState(0);
   const [timedOut, setTimedOut] = useState(false);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Timer effect
   useEffect(() => {

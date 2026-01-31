@@ -35,9 +35,11 @@ const SUPABASE_ANON_KEY: string =
   process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || 
   '';
 
-// Storage keys for secure token storage
-const ACCESS_TOKEN_KEY = 'supabase_access_token';
-const REFRESH_TOKEN_KEY = 'supabase_refresh_token';
+// SecureStore has practical per-item size limits (Expo warns at ~2048 bytes).
+// Supabase session blobs can exceed this, so we chunk large values.
+const SECURESTORE_MAX_VALUE_CHARS = 1900;
+const CHUNK_COUNT_SUFFIX = '__chunk_count';
+const CHUNK_KEY_SEPARATOR = '__chunk__';
 
 // ============================================
 // SECURE STORAGE ADAPTER
@@ -56,6 +58,22 @@ const ExpoSecureStoreAdapter = {
    */
   getItem: async (key: string): Promise<string | null> => {
     try {
+      // If chunked, reconstruct
+      const chunkCountRaw = await SecureStore.getItemAsync(`${key}${CHUNK_COUNT_SUFFIX}`);
+      const chunkCount = chunkCountRaw ? parseInt(chunkCountRaw, 10) : 0;
+      if (chunkCount && Number.isFinite(chunkCount) && chunkCount > 0) {
+        let value = '';
+        for (let i = 0; i < chunkCount; i++) {
+          const part = await SecureStore.getItemAsync(`${key}${CHUNK_KEY_SEPARATOR}${i}`);
+          if (part == null) {
+            // Corrupt chunk set; treat as missing
+            return null;
+          }
+          value += part;
+        }
+        return value;
+      }
+
       const value = await SecureStore.getItemAsync(key);
       return value;
     } catch (error) {
@@ -71,7 +89,31 @@ const ExpoSecureStoreAdapter = {
    */
   setItem: async (key: string, value: string): Promise<void> => {
     try {
-      await SecureStore.setItemAsync(key, value);
+      // Clean up any previous chunks
+      const existingCountRaw = await SecureStore.getItemAsync(`${key}${CHUNK_COUNT_SUFFIX}`);
+      const existingCount = existingCountRaw ? parseInt(existingCountRaw, 10) : 0;
+      if (existingCount && Number.isFinite(existingCount) && existingCount > 0) {
+        for (let i = 0; i < existingCount; i++) {
+          await SecureStore.deleteItemAsync(`${key}${CHUNK_KEY_SEPARATOR}${i}`);
+        }
+        await SecureStore.deleteItemAsync(`${key}${CHUNK_COUNT_SUFFIX}`);
+      }
+
+      if (value.length <= SECURESTORE_MAX_VALUE_CHARS) {
+        await SecureStore.setItemAsync(key, value);
+        return;
+      }
+
+      // Store chunked
+      const chunks: string[] = [];
+      for (let i = 0; i < value.length; i += SECURESTORE_MAX_VALUE_CHARS) {
+        chunks.push(value.slice(i, i + SECURESTORE_MAX_VALUE_CHARS));
+      }
+
+      await SecureStore.setItemAsync(`${key}${CHUNK_COUNT_SUFFIX}`, String(chunks.length));
+      for (let i = 0; i < chunks.length; i++) {
+        await SecureStore.setItemAsync(`${key}${CHUNK_KEY_SEPARATOR}${i}`, chunks[i]);
+      }
     } catch (error) {
       console.warn('[Supabase] SecureStore setItem failed:', error);
     }
@@ -83,6 +125,14 @@ const ExpoSecureStoreAdapter = {
    */
   removeItem: async (key: string): Promise<void> => {
     try {
+      const chunkCountRaw = await SecureStore.getItemAsync(`${key}${CHUNK_COUNT_SUFFIX}`);
+      const chunkCount = chunkCountRaw ? parseInt(chunkCountRaw, 10) : 0;
+      if (chunkCount && Number.isFinite(chunkCount) && chunkCount > 0) {
+        for (let i = 0; i < chunkCount; i++) {
+          await SecureStore.deleteItemAsync(`${key}${CHUNK_KEY_SEPARATOR}${i}`);
+        }
+        await SecureStore.deleteItemAsync(`${key}${CHUNK_COUNT_SUFFIX}`);
+      }
       await SecureStore.deleteItemAsync(key);
     } catch (error) {
       console.warn('[Supabase] SecureStore removeItem failed:', error);
@@ -143,6 +193,15 @@ export const getSupabaseAnonKey = (): string => {
 // AUTHENTICATION FUNCTIONS
 // ============================================
 
+const debugLog = (...args: any[]) => {
+  if (__DEV__) console.log(...args);
+};
+
+const debugError = (...args: any[]) => {
+  // Keep errors visible in production for diagnostics.
+  console.error(...args);
+};
+
 /**
  * Sign up a new user with email and password
  * Creates a new account and sends verification email
@@ -160,7 +219,7 @@ export const signUp = async (
   password: string,
   metadata?: { [key: string]: any }
 ) => {
-  console.log('[Supabase] Signing up user:', email);
+  debugLog('[Supabase] Signing up user');
   
   const { data, error } = await supabase.auth.signUp({
     email,
@@ -171,9 +230,9 @@ export const signUp = async (
   });
   
   if (error) {
-    console.error('[Supabase] Sign up error:', error.message);
+    debugError('[Supabase] Sign up error:', error.message);
   } else {
-    console.log('[Supabase] Sign up successful:', data.user?.id);
+    debugLog('[Supabase] Sign up successful');
   }
   
   return { data, error };
@@ -191,7 +250,7 @@ export const signUp = async (
  * if (data.session) console.log('Logged in!');
  */
 export const signIn = async (email: string, password: string) => {
-  console.log('[Supabase] Signing in user:', email);
+  debugLog('[Supabase] Signing in user');
   
   const { data, error } = await supabase.auth.signInWithPassword({
     email,
@@ -199,9 +258,9 @@ export const signIn = async (email: string, password: string) => {
   });
   
   if (error) {
-    console.error('[Supabase] Sign in error:', error.message);
+    debugError('[Supabase] Sign in error:', error.message);
   } else {
-    console.log('[Supabase] Sign in successful:', data.user?.id);
+    debugLog('[Supabase] Sign in successful');
   }
   
   return { data, error };
@@ -216,7 +275,7 @@ export const signIn = async (email: string, password: string) => {
  * @returns Promise with session data or error
  */
 export const signInWithApple = async (identityToken: string, nonce: string) => {
-  console.log('[Supabase] Signing in with Apple');
+  debugLog('[Supabase] Signing in with Apple');
   
   const { data, error } = await supabase.auth.signInWithIdToken({
     provider: 'apple',
@@ -225,7 +284,7 @@ export const signInWithApple = async (identityToken: string, nonce: string) => {
   });
   
   if (error) {
-    console.error('[Supabase] Apple sign in error:', error.message);
+    debugError('[Supabase] Apple sign in error:', error.message);
   }
   
   return { data, error };
@@ -241,18 +300,14 @@ export const signInWithApple = async (identityToken: string, nonce: string) => {
  * await signOut();
  */
 export const signOut = async () => {
-  console.log('[Supabase] Signing out user');
+  debugLog('[Supabase] Signing out user');
   
   const { error } = await supabase.auth.signOut();
   
-  // Clear any cached tokens
-  await ExpoSecureStoreAdapter.removeItem(ACCESS_TOKEN_KEY);
-  await ExpoSecureStoreAdapter.removeItem(REFRESH_TOKEN_KEY);
-  
   if (error) {
-    console.error('[Supabase] Sign out error:', error.message);
+    debugError('[Supabase] Sign out error:', error.message);
   } else {
-    console.log('[Supabase] Sign out successful');
+    debugLog('[Supabase] Sign out successful');
   }
   
   return { error };
@@ -266,10 +321,12 @@ export const signOut = async () => {
  * @returns Promise with error if failed
  */
 export const resetPassword = async (email: string) => {
-  console.log('[Supabase] Sending password reset to:', email);
+  debugLog('[Supabase] Sending password reset');
   
   const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
-    redirectTo: 'mindsparkle://reset-password',  // Deep link for app
+    // Use the same deep-link callback path used by OAuth/magic-link flows.
+    // Make sure this URL is allow-listed in Supabase Auth settings (Redirect URLs).
+    redirectTo: 'mindsparkle://auth/callback',
   });
   
   return { data, error };
@@ -337,6 +394,22 @@ export const onAuthStateChange = (
  */
 export const refreshSession = async () => {
   const { data, error } = await supabase.auth.refreshSession();
+
+  // If a stale/invalid refresh token is cached locally (common on simulators after many rebuilds),
+  // clear local auth state so the app can render the login flow without repeated errors.
+  if (error?.message && typeof error.message === 'string') {
+    const msg = error.message.toLowerCase();
+    if (msg.includes('invalid refresh token')) {
+      try {
+        // local-only sign out avoids additional network calls
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (supabase.auth as any).signOut({ scope: 'local' });
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
   return { data, error };
 };
 

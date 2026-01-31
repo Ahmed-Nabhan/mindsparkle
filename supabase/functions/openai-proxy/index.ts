@@ -1,1940 +1,3028 @@
-// @ts-nocheck - This file runs in Deno runtime, not Node.js
+// @ts-nocheck - Deno runtime
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*", // narrowed at runtime
+  "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-const ALLOWED_ORIGINS = (Deno.env.get("ALLOWED_ORIGINS") || "")
-  .split(",")
-  .map((o) => o.trim())
-  .filter(Boolean);
-const MAX_CONTENT_LENGTH = 400000; // Increased for larger summaries - handles 200+ page documents
-const MAX_REQUESTS_PER_MIN = 200; // INSTANT RESULTS: handle ALL parallel chunks at once
-const rateBuckets = new Map<string, { count: number; windowStart: number }>();
+const MAX_CONTENT_LENGTH = 100000;
+const MAX_MODULE_CONTENT_LENGTH = 120000;
 
-// ========== RBAC: Role Types and Helpers ==========
-/**
- * RBAC Configuration
- * 
- * Role definitions:
- * - user: Standard user, can only access own documents
- * - admin: Full access to all documents and admin functions
- * - vendor: Can access own docs and those shared with them
- * 
- * Role is fetched from user_roles table via get_user_role() RPC
- */
-type UserRole = 'user' | 'admin' | 'vendor';
+// Hard cap to prevent runaway payloads. Above this we return 413.
+// For anything above MAX_CONTENT_LENGTH but below this cap, we truncate server-side
+// (most handlers already truncate internally anyway).
+const HARD_CONTENT_LENGTH = 400000;
 
-/**
- * RBAC: Fetch user role from database
- * Uses service role key to bypass RLS and get actual role
- * 
- * @param userId - The authenticated user's ID
- * @returns UserRole - defaults to 'user' if not found
- */
-async function getUserRole(userId: string): Promise<UserRole> {
-  if (!userId || userId.startsWith('anonymous')) {
-    return 'user'; // Anonymous users get basic role
+const OPENAI_TIMEOUT_MS = 45000;
+const OPENAI_MAX_RETRIES = 2;
+
+const OPENAI_IMAGE_TIMEOUT_MS = 60000;
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
   }
-  
-  const supabaseUrl = Deno.env.get("PROJECT_URL") || Deno.env.get("SUPABASE_URL");
-  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  
-  if (!supabaseUrl || !supabaseServiceKey) {
-    console.warn('[RBAC] Missing Supabase config, defaulting to user role');
-    return 'user';
-  }
-  
+  return btoa(binary);
+}
+
+function redactSecrets(input: string): string {
+  return String(input || '')
+    // OpenAI keys
+    .replace(/sk-[A-Za-z0-9_\-]{16,}/g, '[REDACTED]');
+}
+
+function summarizeOpenAIError(status: number, bodyText: string): string {
   try {
-    const supabase = createClient(supabaseUrl, supabaseServiceKey);
-    
-    // Call the get_user_role RPC function we created in the migration
-    const { data, error } = await supabase.rpc('get_user_role', { user_id: userId });
-    
-    if (error) {
-      console.warn('[RBAC] Failed to fetch role:', error.message);
-      return 'user';
-    }
-    
-    // Validate the role is one of our known types
-    if (data && ['user', 'admin', 'vendor'].includes(data)) {
-      return data as UserRole;
-    }
-    
-    return 'user';
-  } catch (err) {
-    console.error('[RBAC] Error fetching role:', err);
-    return 'user';
+    const parsed = JSON.parse(bodyText || '{}');
+    const msg = parsed?.error?.message;
+    if (msg) return redactSecrets(String(msg));
+  } catch {
+    // ignore
+  }
+
+  if (status === 401) return "OpenAI authentication failed (server misconfigured).";
+  if (status === 403) return "OpenAI access denied (server misconfigured).";
+  if (status === 429) return "OpenAI rate limited. Please retry.";
+  if (status >= 500) return "OpenAI service error. Please retry.";
+
+  return "OpenAI request failed.";
+}
+
+function isLikelyModelError(status: number, bodyText: string): boolean {
+  if (!(status === 400 || status === 404)) return false;
+  const lower = String(bodyText || '').toLowerCase();
+  if (!lower.includes('model')) return false;
+  return (
+    lower.includes('does not exist') ||
+    lower.includes('not found') ||
+    lower.includes('unsupported') ||
+    lower.includes('invalid') ||
+    lower.includes('no such')
+  );
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
-/**
- * RBAC: Check if user can access a specific document
- * Uses can_access_document() database function for consistent enforcement
- * 
- * @param userId - The user requesting access
- * @param documentId - The document being accessed
- * @returns boolean - true if access allowed
- */
-async function canAccessDocument(userId: string, documentId: string): Promise<boolean> {
-  if (!userId || !documentId) return false;
-  
-  const supabaseUrl = Deno.env.get("PROJECT_URL") || Deno.env.get("SUPABASE_URL");
-  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  
-  if (!supabaseUrl || !supabaseServiceKey) {
-    console.warn('[RBAC] Missing Supabase config for document access check');
-    return false;
+// ========== VENDOR KNOWLEDGE BASE ==========
+const VENDOR_KNOWLEDGE: Record<string, { expertise: string; examTips: string; keyAreas: string[] }> = {
+  "Cisco": {
+    expertise: "You are a Cisco Certified Internetwork Expert (CCIE) with deep knowledge of Cisco networking technologies, IOS commands, routing protocols (OSPF, EIGRP, BGP), switching (VLANs, STP, VTP), security (ASA, Firepower), SD-WAN, ACI, and wireless (WLC). You understand Cisco exam formats and question styles.",
+    examTips: "Cisco exams focus heavily on subnetting, protocol behavior, troubleshooting scenarios, and command syntax. Pay attention to administrative distance, metric calculations, and default behaviors.",
+    keyAreas: ["Subnetting & VLSM", "Routing Protocol Metrics", "Switching & STP", "ACLs & NAT", "Troubleshooting Commands", "Network Design"]
+  },
+  "AWS": {
+    expertise: "You are an AWS Solutions Architect Professional with expertise in all AWS services including EC2, S3, Lambda, RDS, DynamoDB, VPC, IAM, CloudFormation, EKS, ECS, and the Well-Architected Framework. You understand AWS pricing, security best practices, and architectural patterns.",
+    examTips: "AWS exams test scenario-based decision making. Focus on understanding when to use which service, cost optimization, security (least privilege), high availability patterns, and the shared responsibility model.",
+    keyAreas: ["Service Selection", "Cost Optimization", "Security & IAM", "High Availability", "Serverless Architecture", "Migration Strategies"]
+  },
+  "Microsoft": {
+    expertise: "You are a Microsoft Certified Solutions Expert with deep knowledge of Azure, Microsoft 365, Windows Server, Active Directory, PowerShell, Intune, Exchange, SharePoint, and Teams. You understand Microsoft's cloud ecosystem and hybrid configurations.",
+    examTips: "Microsoft exams include scenario-based questions and may have drag-and-drop or hot area questions. Focus on Azure services, identity management (Azure AD), and hybrid scenarios.",
+    keyAreas: ["Azure Services", "Identity & Access", "Microsoft 365 Admin", "PowerShell Automation", "Hybrid Configurations", "Security & Compliance"]
+  },
+  "Azure": {
+    expertise: "You are an Azure Solutions Architect Expert with comprehensive knowledge of Azure compute, storage, networking, identity, security, and DevOps services. You understand ARM templates, Azure CLI, Azure AD, and cloud design patterns.",
+    examTips: "Azure exams emphasize practical scenarios, ARM/Bicep templates, cost management, and security. Know the difference between Azure services and when to choose each.",
+    keyAreas: ["Compute Options", "Storage Types", "Networking & VNets", "Azure AD & RBAC", "ARM Templates", "Monitoring & Governance"]
+  },
+  "Google Cloud": {
+    expertise: "You are a Google Cloud Professional Architect with expertise in GCP services including Compute Engine, GKE, Cloud Functions, BigQuery, Cloud Storage, IAM, VPC, and Anthos. You understand Google's approach to infrastructure and data analytics.",
+    examTips: "GCP exams focus on practical scenarios, BigQuery optimization, Kubernetes, and data processing. Understand IAM roles, service accounts, and Google's security model.",
+    keyAreas: ["GKE & Kubernetes", "BigQuery & Analytics", "IAM & Security", "Networking", "Data Processing", "Cost Management"]
+  },
+  "Penetration Testing": {
+    expertise: "You are an experienced penetration tester and ethical hacker with OSCP, CEH, and GPEN certifications. You have deep knowledge of Kali Linux, Metasploit, Burp Suite, Nmap, exploitation techniques, privilege escalation, buffer overflows, web app security (OWASP Top 10), and social engineering.",
+    examTips: "Pentesting exams like OSCP are hands-on and require practical skills. Focus on methodology, enumeration, exploitation, post-exploitation, and documentation. Practice in labs extensively.",
+    keyAreas: ["Reconnaissance & Enumeration", "Exploitation Techniques", "Privilege Escalation", "Web Application Attacks", "Network Attacks", "Post-Exploitation", "Report Writing"]
+  },
+  "Offensive Security": {
+    expertise: "You are an Offensive Security certified professional (OSCP, OSWE, OSEP) with expertise in penetration testing methodology, Kali Linux, Metasploit Framework, custom exploit development, Active Directory attacks, and advanced evasion techniques.",
+    examTips: "Offensive Security exams are 100% practical. You must demonstrate hands-on ability to compromise machines and write professional reports. Time management and methodology are critical.",
+    keyAreas: ["PWK Methodology", "Linux Exploitation", "Windows Exploitation", "Active Directory Attacks", "Web App Pentesting", "Exploit Development"]
+  },
+  "CompTIA": {
+    expertise: "You are CompTIA certified across multiple tracks (A+, Network+, Security+, Linux+, Cloud+, PenTest+, CySA+, CASP+). You understand foundational IT concepts, troubleshooting methodology, and vendor-neutral best practices.",
+    examTips: "CompTIA exams use performance-based questions (PBQs) and multiple choice. Focus on understanding concepts, troubleshooting steps, and security best practices. Know port numbers and protocols.",
+    keyAreas: ["Troubleshooting Methodology", "Network Protocols & Ports", "Security Concepts", "Hardware & Software", "Cloud Concepts", "Risk Management"]
+  },
+  "Linux": {
+    expertise: "You are a Linux Systems Administrator with RHCSA, RHCE, and LPIC certifications. You have deep knowledge of Linux distributions, shell scripting, systemd, package management, networking, security, and containerization.",
+    examTips: "Linux certification exams (especially RHCSA/RHCE) are hands-on. You must perform tasks in a live environment. Practice commands, shell scripting, and system administration tasks repeatedly.",
+    keyAreas: ["File Systems & Permissions", "User & Group Management", "Systemd & Services", "Networking Configuration", "Shell Scripting", "SELinux & Security", "LVM & Storage"]
+  },
+  "Kubernetes": {
+    expertise: "You are a Certified Kubernetes Administrator (CKA) and Certified Kubernetes Application Developer (CKAD) with expertise in container orchestration, YAML manifests, kubectl, Helm, networking (CNI, Services, Ingress), storage, and security.",
+    examTips: "CKA/CKAD exams are hands-on performance-based. Speed and accuracy matter. Know kubectl commands by heart, understand YAML structure, and practice troubleshooting pods and networking.",
+    keyAreas: ["Pods & Deployments", "Services & Networking", "Storage & PVs", "ConfigMaps & Secrets", "RBAC & Security", "Troubleshooting", "Helm Charts"]
+  },
+  "VMware": {
+    expertise: "You are a VMware Certified Professional (VCP) with expertise in vSphere, ESXi, vCenter, NSX-T, vSAN, Horizon, and vRealize. You understand virtualization concepts, high availability, DRS, and virtual networking.",
+    examTips: "VMware exams require understanding of the entire vSphere stack. Focus on vCenter operations, HA/DRS configurations, networking (vDS, NSX), and storage (VMFS, vSAN). Know the vSphere client well.",
+    keyAreas: ["vSphere Architecture", "ESXi & vCenter", "Networking (vDS, NSX)", "Storage (VMFS, vSAN)", "HA & DRS", "Resource Management"]
+  },
+  "Palo Alto": {
+    expertise: "You are a Palo Alto Networks Certified Security Engineer (PCNSE) with expertise in next-generation firewalls, PAN-OS, App-ID, User-ID, Content-ID, WildFire, GlobalProtect VPN, and Prisma Cloud.",
+    examTips: "Palo Alto exams focus on firewall configuration, security policies, NAT, VPN, and threat prevention. Understand the packet flow, security profiles, and Panorama management.",
+    keyAreas: ["Security Policies", "NAT Configuration", "App-ID & User-ID", "Threat Prevention", "VPN (Site-to-Site, GlobalProtect)", "Panorama Management"]
+  },
+  "Fortinet": {
+    expertise: "You are Fortinet NSE certified with expertise in FortiGate firewalls, FortiOS, FortiManager, FortiAnalyzer, SD-WAN, and the Fortinet Security Fabric. You understand UTM features and network security.",
+    examTips: "Fortinet NSE exams cover firewall policies, VPN, SD-WAN, UTM features, and FortiManager. Focus on policy configuration, routing, and the Fortinet Security Fabric integration.",
+    keyAreas: ["Firewall Policies", "VPN Configuration", "SD-WAN", "UTM Features", "FortiManager", "High Availability"]
+  },
+  "Juniper": {
+    expertise: "You are Juniper Networks Certified with expertise in Junos OS, SRX firewalls, MX/QFX routers/switches, Contrail, and Apstra. You understand Junos CLI, routing protocols, and network automation.",
+    examTips: "Juniper exams focus on Junos CLI commands, configuration hierarchy, and troubleshooting. Understand commit model, routing instances, and security policies.",
+    keyAreas: ["Junos CLI", "Routing Protocols", "Switching", "Security Policies", "Routing Instances", "Network Automation"]
+  },
+  "CISSP": {
+    expertise: "You are a CISSP-certified information security professional with expertise across all 8 domains: Security and Risk Management, Asset Security, Security Architecture, Communication and Network Security, IAM, Security Assessment, Security Operations, and Software Development Security.",
+    examTips: "CISSP is a management-level exam. Think like a risk advisor, not a technician. Focus on frameworks, policies, and making business-aligned security decisions. Questions often have multiple 'correct' answers - choose the BEST one.",
+    keyAreas: ["Risk Management", "Security Governance", "Access Control Models", "Cryptography", "Network Security", "Incident Response", "BCP/DRP", "Software Security"]
+  },
+  "Project Management": {
+    expertise: "You are a PMP-certified project manager with expertise in PMBOK Guide, Agile methodologies, Scrum, project lifecycle, stakeholder management, risk management, and earned value management.",
+    examTips: "PMP exam questions are situational. Understand the project manager's role, ITTO (Inputs, Tools, Techniques, Outputs), and process groups. Think about what a PM should do in each scenario.",
+    keyAreas: ["Process Groups", "Knowledge Areas", "Agile/Scrum", "Stakeholder Management", "Risk Management", "Schedule & Cost Control", "Quality Management"]
   }
-  
-  try {
-    const supabase = createClient(supabaseUrl, supabaseServiceKey);
-    
-    // Use the can_access_document RPC function
-    const { data, error } = await supabase.rpc('can_access_document', { 
-      doc_id: documentId,
-      user_id: userId 
-    });
-    
-    if (error) {
-      console.warn('[RBAC] Document access check failed:', error.message);
-      return false;
-    }
-    
-    return !!data;
-  } catch (err) {
-    console.error('[RBAC] Error checking document access:', err);
-    return false;
-  }
-}
-
-/**
- * RBAC: Permission matrix for actions
- * Maps actions to required roles
- */
-const ACTION_PERMISSIONS: Record<string, UserRole[]> = {
-  // Standard user actions (all roles)
-  'summarize': ['user', 'admin', 'vendor'],
-  'quiz': ['user', 'admin', 'vendor'],
-  'flashcards': ['user', 'admin', 'vendor'],
-  'studyGuide': ['user', 'admin', 'vendor'],
-  'explain': ['user', 'admin', 'vendor'],
-  'interview': ['user', 'admin', 'vendor'],
-  'chat': ['user', 'admin', 'vendor'],
-  'extract-text': ['user', 'admin', 'vendor'],
-  'lecture': ['user', 'admin', 'vendor'],
-  
-  // Admin-only actions
-  'admin-stats': ['admin'],
-  'admin-users': ['admin'],
-  'bulk-delete': ['admin'],
-  
-  // Vendor + Admin actions
-  'shared-analytics': ['admin', 'vendor'],
 };
 
-/**
- * RBAC: Check if role can perform action
- * 
- * @param role - User's current role
- * @param action - The action being attempted
- * @returns boolean - true if action allowed
- */
-function canPerformAction(role: UserRole, action: string): boolean {
-  const allowedRoles = ACTION_PERMISSIONS[action];
-  
-  // If action not in matrix, allow standard roles (backwards compatibility)
-  if (!allowedRoles) {
-    return ['user', 'admin', 'vendor'].includes(role);
-  }
-  
-  return allowedRoles.includes(role);
-}
-// ========== END RBAC Helpers ==========
+// ========== LLM ROUTER (OpenAI primary; optional Gemini fallback) ==========
+// This function name is historical. It now routes to the best configured provider
+// while keeping the same response shape expected by the mobile app.
 
-function enforceCors(req: Request) {
-  // If no origins configured, allow all (for development/Expo Go)
-  if (ALLOWED_ORIGINS.length === 0) {
-    return corsHeaders; // Uses "*" wildcard
+type LlmProvider = 'openai' | 'gemini' | 'anthropic';
+
+function normalizeProviderOrder(order: any): LlmProvider[] {
+  if (!Array.isArray(order)) return [];
+  const normalized: LlmProvider[] = [];
+  for (const raw of order) {
+    const v = String(raw || '').trim().toLowerCase();
+    if (v === 'openai' || v === 'gemini' || v === 'anthropic') normalized.push(v);
   }
-  
-  const origin = req.headers.get("Origin") || "";
-  
-  // Allow requests with no origin (mobile apps, Expo Go)
-  if (!origin) {
-    return corsHeaders;
-  }
-  
-  // Check allowed origins list
-  if (ALLOWED_ORIGINS.includes(origin)) {
-    return { ...corsHeaders, "Access-Control-Allow-Origin": origin };
-  }
-  
-  // Allow Expo Go and development origins
-  if (origin.includes("exp://") || origin.includes("localhost") || origin.includes("192.168.")) {
-    return { ...corsHeaders, "Access-Control-Allow-Origin": origin };
-  }
-  
-  throw new Error("Origin not allowed");
+  // de-dupe while preserving order
+  return Array.from(new Set(normalized)) as LlmProvider[];
 }
 
-function rateLimit(req: Request) {
-  const ip = req.headers.get("x-forwarded-for") || req.headers.get("cf-connecting-ip") || "unknown";
-  const now = Date.now();
-  const windowStart = now - 60_000;
-  const bucket = rateBuckets.get(ip) || { count: 0, windowStart: now };
-  if (bucket.windowStart < windowStart) {
-    bucket.count = 0;
-    bucket.windowStart = now;
-  }
-  bucket.count += 1;
-  rateBuckets.set(ip, bucket);
-  if (bucket.count > MAX_REQUESTS_PER_MIN) {
-    const err: any = new Error("Rate limit exceeded");
-    err.status = 429;
-    throw err;
-  }
+function intersectProviderOrder(order: LlmProvider[], allowed: LlmProvider[]): LlmProvider[] {
+  const allowedSet = new Set(allowed);
+  return order.filter((p) => allowedSet.has(p));
 }
 
-async function getAuthUser(req: Request) {
-  const authHeader = req.headers.get("Authorization") || "";
-  const token = authHeader.replace("Bearer ", "").trim();
-  
-  // Get Supabase config
-  const supabaseUrl = Deno.env.get("PROJECT_URL") || Deno.env.get("SUPABASE_URL");
-  const supabaseAnonKey = Deno.env.get("PROJECT_ANON_KEY") || Deno.env.get("SUPABASE_ANON_KEY");
-  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  
-  if (!supabaseUrl || !supabaseAnonKey) {
-    const err: any = new Error("Supabase config missing");
-    err.status = 500;
-    throw err;
-  }
-  
-  // If token is the anon key itself, allow anonymous access with a dummy user
-  // This handles cases where session hasn't loaded yet but anon key is valid
-  if (token === supabaseAnonKey) {
-    console.log("[Auth] Using anon key - allowing anonymous access");
-    return { id: "anonymous", email: "anonymous@app.local" };
-  }
-  
-  // No token at all
-  if (!token) {
-    const err: any = new Error("Missing auth token");
-    err.status = 401;
-    throw err;
-  }
+type LlmCallMeta = {
+  supabase: any;
+  userId: string;
+  requestType: string;
+  documentId?: string | null;
+};
 
-  // Try to verify the user token
-  const supabase = createClient(supabaseUrl, supabaseServiceKey || supabaseAnonKey, {
-    global: { headers: { Authorization: `Bearer ${token}` } },
-  });
+type LlmCallUsage = {
+  provider: LlmProvider;
+  model: string;
+  tokensInput: number;
+  tokensOutput: number;
+  estimatedCost: number;
+  latencyMs: number | null;
+  wasFallback: boolean;
+};
 
-  const { data, error } = await supabase.auth.getUser(token);
-  
-  // If token verification failed but we have a token, allow with limited access
-  // This handles edge cases with token refresh timing
-  if (error || !data?.user) {
-    console.warn("[Auth] Token verification failed:", error?.message || "no user");
-    // Allow with anonymous user ID for better UX
-    return { id: "anonymous-" + Date.now(), email: "guest@app.local" };
-  }
-  
-  return data.user;
+type LlmInternalResult = { text: string; usage: LlmCallUsage };
+
+function parseOptionalNumberEnv(name: string): number | null {
+  const raw = (Deno.env.get(name) || '').trim();
+  if (!raw) return null;
+  const num = Number(raw);
+  return Number.isFinite(num) ? num : null;
 }
 
-const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
-const GOOGLE_CLOUD_API_KEY = Deno.env.get("GOOGLE_CLOUD_API_KEY"); // For Document AI
-const GOOGLE_PROJECT_ID = Deno.env.get("GOOGLE_PROJECT_ID") || "mindsparkle-app";
-const GOOGLE_LOCATION = "us"; // Document AI processor location
-const ADMIN_EMAIL = Deno.env.get("ADMIN_EMAIL") || "admin@example.com";
-
-// ========== SMART PDF EXTRACTION ==========
-// Uses multiple methods for best quality:
-// 1. pdf-parse for text-based PDFs (fast, accurate)
-// 2. GPT-4o Vision for scanned/image PDFs (handles tables, equations, images)
-
-// Extract text using pdf-parse (works with most PDFs)
-async function extractWithPdfParse(base64Pdf: string): Promise<{ text: string; pages: { pageNum: number; text: string }[]; numPages: number }> {
-  // Import pdf-parse dynamically (works in Deno)
-  const pdfParse = (await import("https://esm.sh/pdf-parse@1.1.1")).default;
-  
-  // Convert base64 to Uint8Array
-  const binaryString = atob(base64Pdf);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  
-  // Parse PDF
-  const data = await pdfParse(bytes);
-  
-  // Extract pages if available
-  const pages: { pageNum: number; text: string }[] = [];
-  const fullText = data.text || "";
-  const numPages = data.numpages || 1;
-  
-  // Split text into pages (approximate by dividing evenly if page breaks not detected)
-  const avgCharsPerPage = Math.ceil(fullText.length / numPages);
-  let pos = 0;
-  for (let i = 0; i < numPages && pos < fullText.length; i++) {
-    // Try to find natural page breaks
-    let endPos = Math.min(pos + avgCharsPerPage, fullText.length);
-    
-    // Look for page break patterns
-    const pageBreakMatch = fullText.substring(pos, endPos + 500).match(/\n{3,}|\f/);
-    if (pageBreakMatch && pageBreakMatch.index) {
-      endPos = pos + pageBreakMatch.index + pageBreakMatch[0].length;
-    }
-    
-    const pageText = fullText.substring(pos, endPos).trim();
-    if (pageText.length > 0) {
-      pages.push({ pageNum: i + 1, text: pageText });
-    }
-    pos = endPos;
-  }
-  
-  // Ensure we have at least one page
-  if (pages.length === 0 && fullText.length > 0) {
-    pages.push({ pageNum: 1, text: fullText });
-  }
-  
-  return { text: fullText, pages, numPages };
+function parseOptionalBoolEnv(name: string): boolean {
+  const raw = (Deno.env.get(name) || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }
 
-// Check text quality to detect garbage extraction
-function checkTextQuality(text: string): { quality: 'good' | 'poor' | 'garbage'; score: number } {
-  if (!text || text.length < 50) return { quality: 'garbage', score: 0 };
-  
-  const sample = text.substring(0, 3000);
-  
-  // Count meaningful characters
-  let letters = 0, digits = 0, spaces = 0, symbols = 0;
-  const commonWords = ['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'has', 'have', 'been', 'this', 'that', 'with', 'from', 'they', 'will', 'would', 'there', 'their', 'what', 'about', 'which', 'when', 'make', 'like', 'time', 'just', 'know', 'take', 'people', 'into', 'year', 'your', 'good', 'some', 'could', 'them', 'other', 'than', 'then', 'now', 'look', 'only', 'come', 'its', 'over', 'think', 'also', 'back', 'after', 'use', 'two', 'how', 'work', 'first', 'well', 'way', 'even', 'new', 'want', 'because', 'any', 'these', 'give', 'day', 'most', 'network', 'data', 'system', 'device', 'router', 'switch', 'protocol', 'layer', 'packet', 'address', 'port', 'connection'];
-  
-  for (let i = 0; i < sample.length; i++) {
-    const c = sample[i];
-    const code = c.charCodeAt(0);
-    if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) letters++;
-    else if (code >= 48 && code <= 57) digits++;
-    else if (c === ' ' || c === '\n' || c === '\t') spaces++;
-    else if (code >= 33 && code <= 126) symbols++;
-  }
-  
-  const total = sample.length;
-  const letterRatio = letters / total;
-  const symbolRatio = symbols / total;
-  
-  // Check for common words
-  const lowerSample = sample.toLowerCase();
-  let commonWordCount = 0;
-  for (const word of commonWords) {
-    if (lowerSample.includes(word)) commonWordCount++;
-  }
-  
-  // Calculate score (0-100)
-  let score = 0;
-  score += letterRatio * 50; // Up to 50 points for letters
-  score += Math.min(commonWordCount / 10, 1) * 30; // Up to 30 points for common words
-  score -= symbolRatio * 30; // Penalty for too many symbols
-  score = Math.max(0, Math.min(100, score));
-  
-  if (score >= 40 && commonWordCount >= 5) return { quality: 'good', score };
-  if (score >= 20 && commonWordCount >= 2) return { quality: 'poor', score };
-  return { quality: 'garbage', score };
-}
-
-// GPT-4o Vision extraction for image-based PDFs
-async function extractWithGPTVision(imageUrls: string[], maxPages = 10): Promise<{ text: string; pages: { pageNum: number; text: string }[] }> {
-  const pages: { pageNum: number; text: string }[] = [];
-  
-  // Process images in batches of 4 (GPT-4o can handle multiple images)
-  const batchSize = 4;
-  for (let i = 0; i < Math.min(imageUrls.length, maxPages); i += batchSize) {
-    const batch = imageUrls.slice(i, i + batchSize);
-    
-    const imageContent = batch.map((url, idx) => ({
-      type: "image_url" as const,
-      image_url: { url, detail: "high" as const }
-    }));
-    
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [
-          {
-            role: "system",
-            content: `You are an expert document extractor. Extract ALL content from the PDF page images provided.
-
-For each page, extract:
-1. **All Text**: Every word, heading, paragraph, caption
-2. **Tables**: Format as markdown tables with | separators
-3. **Equations**: Format using LaTeX notation (e.g., $E = mc^2$)
-4. **Diagrams/Figures**: Describe in [Figure: description] format
-5. **Lists**: Preserve bullet points and numbering
-
-Output format for each page:
-=== PAGE X ===
-[content]
-
-Be thorough - extract EVERYTHING visible on each page.`
-          },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: `Extract all content from these ${batch.length} PDF page(s). Pages ${i + 1} to ${i + batch.length}.` },
-              ...imageContent
-            ]
-          }
-        ],
-        max_tokens: 4096,
-        temperature: 0.1,
-      }),
-    });
-    
-    if (!response.ok) {
-      const error = await response.text();
-      console.error("[GPTVision] Error:", error);
-      throw new Error(`GPT Vision failed: ${response.status}`);
-    }
-    
-    const result = await response.json();
-    const content = result.choices?.[0]?.message?.content || "";
-    
-    // Parse pages from response
-    const pageMatches = content.split(/===\s*PAGE\s*(\d+)\s*===/i);
-    for (let j = 1; j < pageMatches.length; j += 2) {
-      const pageNum = parseInt(pageMatches[j]) || (i + Math.ceil(j / 2));
-      const pageText = pageMatches[j + 1]?.trim() || "";
-      if (pageText.length > 10) {
-        pages.push({ pageNum, text: pageText });
-      }
-    }
-    
-    // If no page markers found, treat whole response as one page
-    if (pages.length === 0 && content.length > 10) {
-      pages.push({ pageNum: i + 1, text: content });
-    }
-  }
-  
-  const fullText = pages.map(p => p.text).join("\n\n");
-  return { text: fullText, pages };
-}
-
-// Google Document AI - Extract text from PDF (1000 pages FREE/month, then $0.001/page)
-// NOTE: Requires a Document AI processor to be created in Google Cloud Console
-async function extractWithGoogleDocumentAI(base64Pdf: string): Promise<{ text: string; pages: { pageNum: number; text: string }[] }> {
-  if (!GOOGLE_CLOUD_API_KEY) {
-    throw new Error("Google Cloud API key not configured");
-  }
-  
-  // Check if we have a processor ID configured
-  const PROCESSOR_ID = Deno.env.get("GOOGLE_DOCUMENT_AI_PROCESSOR_ID");
-  if (!PROCESSOR_ID) {
-    throw new Error("Document AI processor not configured. Set GOOGLE_DOCUMENT_AI_PROCESSOR_ID secret.");
-  }
-  
-  console.log("[DocumentAI] Starting extraction with processor:", PROCESSOR_ID);
-  
-  // Use the Document AI REST API with API key
-  const url = `https://documentai.googleapis.com/v1/projects/${GOOGLE_PROJECT_ID}/locations/${GOOGLE_LOCATION}/processors/${PROCESSOR_ID}:process?key=${GOOGLE_CLOUD_API_KEY}`;
-  
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      rawDocument: {
-        content: base64Pdf,
-        mimeType: "application/pdf",
-      },
-      skipHumanReview: true,
-    }),
-  });
-  
-  if (!response.ok) {
-    const error = await response.text();
-    console.error("[DocumentAI] Error:", error);
-    throw new Error(`Document AI failed: ${response.status}`);
-  }
-  
-  const result = await response.json();
-  
-  // Extract text from response
-  const document = result.document;
-  const fullText = document?.text || "";
-  
-  // Extract pages
-  const pages: { pageNum: number; text: string }[] = [];
-  if (document?.pages) {
-    for (let i = 0; i < document.pages.length; i++) {
-      const page = document.pages[i];
-      let pageText = "";
-      
-      // Get text from page layout
-      if (page.layout?.textAnchor?.textSegments) {
-        for (const segment of page.layout.textAnchor.textSegments) {
-          const start = parseInt(segment.startIndex || "0");
-          const end = parseInt(segment.endIndex || fullText.length.toString());
-          pageText += fullText.substring(start, end);
-        }
-      }
-      
-      // Fallback: extract from paragraphs
-      if (!pageText && page.paragraphs) {
-        for (const para of page.paragraphs) {
-          if (para.layout?.textAnchor?.textSegments) {
-            for (const segment of para.layout.textAnchor.textSegments) {
-              const start = parseInt(segment.startIndex || "0");
-              const end = parseInt(segment.endIndex || fullText.length.toString());
-              pageText += fullText.substring(start, end) + "\n";
-            }
-          }
-        }
-      }
-      
-      pages.push({
-        pageNum: i + 1,
-        text: pageText.trim() || `[Page ${i + 1}]`,
-      });
-    }
-  }
-  
-  // If no pages extracted, create one from full text
-  if (pages.length === 0 && fullText) {
-    pages.push({ pageNum: 1, text: fullText });
-  }
-  
-  console.log("[DocumentAI] Extracted", pages.length, "pages,", fullText.length, "chars");
-  
-  return { text: fullText, pages };
-}
-
-// Send email notification to admin when credits run out
-async function notifyAdminCreditExhausted(errorDetails: string) {
-  try {
-    // Use a free email service - Resend, SendGrid, or Supabase's built-in
-    // For now, log it and you can check Supabase logs
-    console.error("🚨 CRITICAL: OpenAI Credits Exhausted!");
-    console.error("Admin Email:", ADMIN_EMAIL);
-    console.error("Error:", errorDetails);
-    console.error("Action Required: Add credits at https://platform.openai.com/account/billing");
-    
-    // Try to send email via Resend (free tier: 100 emails/day)
-    // You can add RESEND_API_KEY to Supabase secrets if you want email notifications
-    const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
-    if (RESEND_API_KEY) {
-      await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${RESEND_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          from: "MindSparkle <notifications@resend.dev>",
-          to: ADMIN_EMAIL,
-          subject: "🚨 MindSparkle: OpenAI Credits Exhausted!",
-          html: `
-            <h2>⚠️ OpenAI API Credits Exhausted</h2>
-            <p>Your MindSparkle app's OpenAI credits have run out.</p>
-            <p><strong>Error:</strong> ${errorDetails}</p>
-            <p><strong>Action Required:</strong></p>
-            <ol>
-              <li>Go to <a href="https://platform.openai.com/account/billing">OpenAI Billing</a></li>
-              <li>Add credits to your account</li>
-              <li>Recommended: Add $10-20 for continued service</li>
-            </ol>
-            <p>Users are seeing "Service temporarily unavailable" message.</p>
-          `,
-        }),
-      });
-      console.log("Email notification sent to", ADMIN_EMAIL);
-    }
-  } catch (e) {
-    console.error("Failed to send notification:", e);
-  }
-}
-
-// Helper to detect and format OpenAI billing errors
-function formatOpenAIError(error: any, statusCode?: number): string {
-  const errorMessage = error?.message || error?.toString() || "Unknown error";
-  const errorLower = errorMessage.toLowerCase();
-  
-  // Check for quota/billing errors
-  if (
-    statusCode === 429 ||
-    statusCode === 402 ||
-    errorLower.includes("quota") ||
-    errorLower.includes("insufficient") ||
-    errorLower.includes("billing") ||
-    errorLower.includes("exceeded") ||
-    errorLower.includes("rate limit")
-  ) {
-    // Notify admin (you) about the credit issue
-    notifyAdminCreditExhausted(errorMessage);
-    
-    // Return generic message for users
-    return "QUOTA_EXCEEDED: Service temporarily unavailable. Please try again later.";
-  }
-  
-  return errorMessage;
-}
-
-// Retry helper for rate limits
-async function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// Detect if content is Cisco-related
-function detectCiscoContent(text: string): { isCisco: boolean; topics: string[] } {
-  const CISCO_KEYWORDS = [
-    'cisco', 'ios', 'ios-xe', 'nx-os', 'asa', 'firepower',
-    'ccna', 'ccnp', 'ccie', 'ccent', 'devnet',
-    'catalyst', 'nexus', 'meraki', 'webex',
-    'eigrp', 'ospf', 'bgp', 'hsrp', 'vrrp',
-    'vlan', 'stp', 'rstp', 'pvst', 'vxlan',
-    'router#', 'switch#', 'switch>', 'router>',
-    'configure terminal', 'show running-config',
-    'interface gigabitethernet', 'switchport'
-  ];
-  
-  const lowerText = text.toLowerCase();
-  const foundTopics: string[] = [];
-  
-  for (const keyword of CISCO_KEYWORDS) {
-    if (lowerText.includes(keyword.toLowerCase())) {
-      foundTopics.push(keyword);
-    }
-  }
-  
-  // Check for CLI patterns
-  const cliPatterns = [
-    /[A-Za-z0-9_-]+[#>]\s*.+/g,
-    /^\s*(config|interface|router|line|vlan)/gm,
-    /^\s*show\s+(ip|running|startup)/gm
-  ];
-  
-  let cliMatches = 0;
-  for (const pattern of cliPatterns) {
-    const matches = text.match(pattern);
-    if (matches) cliMatches += matches.length;
-  }
-  
-  if (cliMatches > 3) foundTopics.push('CLI Commands');
-  
+function sseHeaders() {
   return {
-    isCisco: foundTopics.length >= 2 || cliMatches > 5,
-    topics: [...new Set(foundTopics)].slice(0, 10)
+    ...corsHeaders,
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
   };
 }
 
-// Prompt builder: returns tuned system prompts for different actions and languages
-function buildSystemPrompt(action: string, opts: any = {}, language: string | undefined = 'en', style?: string, useAnimations?: boolean) {
-  const langPrefix = language && language !== 'en' ? `Respond in ${language}. ` : '';
-  
-  // Check if content is Cisco-related
-  const isCisco = opts.isCisco || false;
-  const ciscoTopics = opts.ciscoTopics || [];
+// ========== CHAT MIND MODE + MEMORY ==========
+type ChatMindMode = 'general' | 'study' | 'work' | 'health';
 
-  if (action === 'summarize') {
-    // CISCO/NETWORK-SPECIFIC PROMPT with enhanced visuals
-    if (isCisco) {
-      return langPrefix + `You are an expert Cisco networking instructor creating a VISUAL STUDY GUIDE with network diagrams.
-      
-      ⚠️ STRICT GROUNDING RULES:
-      1. ONLY use information from the document provided
-      2. DO NOT add external Cisco knowledge or commands not in the document
-      3. If information is missing, say "Not specified in the document"
-      4. Preserve ALL CLI commands EXACTLY as written
-      5. DO NOT guess or infer configurations
-      
-      CISCO TOPICS DETECTED: ${ciscoTopics.join(', ')}
-      
-      STRUCTURE YOUR RESPONSE WITH VISUALS:
-      
-      ## 🌐 Network Overview
-      Brief description of what this document covers.
-      
-      ![Network Topology](https://source.unsplash.com/800x400/?network,cisco,technology)
-      
-      ## 🖼️ Network Diagram
-      Create an ASCII network diagram showing the topology discussed:
-      \`\`\`
-      ┌─────────┐     ┌─────────┐     ┌─────────┐
-      │ Router  │────▶│ Switch  │────▶│  Host   │
-      └─────────┘     └─────────┘     └─────────┘
-      \`\`\`
-      (Adapt this to match the actual topology from the document)
-      
-      ## 💻 CLI Commands Reference
-      | Command | Purpose | Example |
-      |---------|---------|----------|
-      | cmd1 | description | usage |
-      
-      Include ALL CLI commands from the document in this table format.
-      
-      ## 📊 Configuration Tables
-      Present configurations as tables when applicable:
-      | Parameter | Value | Description |
-      |-----------|-------|-------------|
-      
-      ## 📋 Key Configurations
-      - Configuration steps mentioned
-      - Parameters and values shown
-      - Any verification commands
-      
-      ## 🔧 Technical Concepts
-      Explain networking concepts covered (VLAN, routing, etc.)
-      - Only concepts from the document
-      - Include page references if available
-      
-      ## ⚠️ Important Notes
-      - Security considerations mentioned
-      - Best practices from the document
-      - Common mistakes discussed
-      
-      ## 📝 Exam Topics Covered
-      - List exam-relevant topics
-      - Key points to remember
-      
-      ![Study Tips](https://source.unsplash.com/600x300/?study,exam,certification)
-      
-      Remember: If it's not in the document, don't include it.`;
-    }
-
-    if (opts.isCombine) {
-      return langPrefix + `You are an expert academic summarizer. Combine the provided section summaries into a single, exam-ready STUDY GUIDE. Output a clear hierarchical summary with: (1) Executive Overview (2-3 sentences), (2) Key Topics (bullet list), (3) Detailed Breakdown by topic with short explanations and page references, (4) Critical Terms table, (5) 7 Key Takeaways, and (6) a Quick Review checklist. Use concise, precise language suitable for students; prefer numbered lists and short paragraphs. Keep tone neutral and authoritative.`;
-    }
-
-    if (opts.chunkInfo) {
-      return langPrefix + `You are an expert educational writer. Summarize ${opts.chunkInfo} as a self-contained study section.
-      
-      Include:
-      - A short section title
-      - ONE relevant image at the start: ![Topic](https://source.unsplash.com/600x300/?[keyword]) where [keyword] is 1-2 words describing the main topic
-      - 3–6 bullet key points
-      - 2 brief examples or clarifying sentences
-      - Any page references present
-      
-      Keep the summary concise but complete.`;
-    }
-
-    // PROFESSIONAL WHOLE DOCUMENT SUMMARY WITH IMAGES, TABLES, AND DIAGRAMS
-    return langPrefix + `You are an expert academic summarizer creating a PROFESSIONAL STUDY GUIDE with visual aids, tables, and diagrams.
-    
-    YOUR GOAL: Create a comprehensive, SMART summary of the ENTIRE document, not just the beginning.
-    
-    CONTENT DETECTION - Adapt your summary style based on content type:
-    - **Technical/Engineering**: Include diagrams, specifications tables, formulas
-    - **Network/IT**: Include network topology diagrams (ASCII art), command tables, protocol comparisons
-    - **Business**: Include process flows, comparison tables, key metrics
-    - **Science**: Include formulas (LaTeX), experiment tables, concept diagrams
-    - **General**: Include concept maps, key terms tables, visual aids
-    
-    STRUCTURE:
-    1. 🎯 **Executive Summary**: A professional 3-4 sentence overview of the whole document.
-       - After the executive summary, add an image: ![Topic Overview](https://source.unsplash.com/800x400/?[main-topic-keyword])
-    
-    2. 📖 **Detailed Analysis**: Break down the document into logical sections. For EACH section:
-       - **Title**: Clear section title.
-       - Add a relevant image at the start: ![Section Title](https://source.unsplash.com/600x300/?[section-keyword])
-       - **Core Concepts**: Explain the main ideas in depth (not just bullets).
-       - **Examples**: Include examples from the text.
-    
-    3. 📊 **Tables & Data** (when applicable):
-       Present any data, comparisons, or specifications as markdown tables:
-       | Column 1 | Column 2 | Column 3 |
-       |----------|----------|----------|
-       | data     | data     | data     |
-    
-    4. 🗺️ **Diagrams** (when applicable):
-       For technical/network content, include ASCII diagrams:
-       \`\`\`
-       ┌─────────┐     ┌─────────┐
-       │ Block A │────▶│ Block B │
-       └─────────┘     └─────────┘
-       \`\`\`
-    
-    5. 🔑 **Key Terminology**: A table of definitions.
-       | Term | Definition |
-       |------|------------|
-    
-    6. 🧠 **Critical Analysis**: Connect ideas and explain "Why this matters".
-    
-    7. ✅ **Exam Prep**: 5-7 key takeaways and a checklist.
-    
-    IMAGE RULES:
-    - Use Unsplash source URLs: https://source.unsplash.com/WIDTHxHEIGHT/?KEYWORD
-    - Replace [main-topic-keyword] and [section-keyword] with relevant search terms from the content
-    - Use only 1-2 keywords, separated by commas (e.g., biology,cell or computer,network)
-    - Add 3-5 images total throughout the summary (not too many)
-    - Choose keywords that match educational/academic imagery
-    
-    TONE: Professional, academic, yet accessible.
-    IMPORTANT: Be SMART about what the document contains. Detect technical content and format appropriately.
-    IMPORTANT: Ensure you cover the END of the document as thoroughly as the beginning.`;
-  }
-
-  if (action === 'studyGuide') {
-    return langPrefix + `Create a comprehensive JSON study guide that ONLY uses information from the document. Return valid JSON with keys: title, sections (each with title, pageRef, keyPoints array), keyTerms (term, definition, pageRef), reviewChecklist array. Be precise; include page refs where available; do not invent facts.`;
-  }
-
-  if (action === 'videoWithSlides') {
-    const animDirective = useAnimations === false ? 'Do not include animation directions.' : 'Include a `visualDirections` array for each section with concrete animation/visual cues for the AI Teacher and the Screen (e.g., "Teacher points to graph", "Screen shows equation X").';
-    const styleDirective = style ? `Use this narration style: ${style}. ` : '';
-    
-    return langPrefix + `You are an expert YouTube educational content creator. Create an ENGAGING video lesson script that TEACHES the content, not just summarizes it.
-    
-    TEACHING STYLE - Like the best educational YouTube channels:
-    - Start with a HOOK: An interesting question, surprising fact, or relatable scenario
-    - Use analogies and real-world examples to explain complex concepts
-    - Break down difficult topics step-by-step
-    - Ask rhetorical questions to keep viewers engaged ("But wait, why does this matter?")
-    - Include "aha moments" where concepts click together
-    - End sections with quick recap and transition
-    
-    OUTPUT FORMAT (JSON ONLY):
-    {
-      "introduction": "Engaging hook + what we'll learn today...",
-      "sections": [
-        {
-          "title": "Section Title",
-          "narration": "Engaging explanation with analogies, examples, and rhetorical questions. Explain like a great teacher, not like reading a textbook.",
-          "visualDirections": [
-            "Screen: Animated title appears",
-            "Teacher: Uses hand gestures while explaining",
-            "Screen: Diagram animates in step by step",
-            "Screen: Key term highlighted and defined",
-            "Teacher: Points to important detail"
-          ],
-          "keyPoints": ["Main takeaway 1", "Main takeaway 2"],
-          "teachingTip": "Real-world example or analogy for this concept",
-          "interactiveElement": "Think about: [question for viewer to consider]",
-          "pageRef": 1
-        }
-      ],
-      "conclusion": "Recap of key learnings + call to action (take quiz, review notes, etc.)"
-    }
-    
-    INSTRUCTIONS:
-    - The "narration" must be CONVERSATIONAL and ENGAGING (like talking to a friend)
-    - Use phrases like: "Here's the thing...", "Think of it this way...", "This is crucial..."
-    - Include mini-stories or scenarios when possible
-    - "visualDirections" should create a dynamic, animated learning experience
-    - "teachingTip" provides an analogy or real-world connection
-    - "interactiveElement" keeps viewers thinking
-    - Cover the WHOLE document but prioritize the most important concepts
-    - Make complex topics SIMPLE without losing accuracy
-    - ${styleDirective}
-    - ${animDirective}`;
-  }
-
-  // default fallback
-  return language && language !== 'en' ? `Respond in ${language}. Provide a clear, concise summary.` : 'Provide a clear, concise summary.';
+function normalizeChatMindMode(raw: any): ChatMindMode {
+  const v = String(raw || '').trim().toLowerCase();
+  if (v === 'study' || v === 'work' || v === 'health') return v;
+  return 'general';
 }
 
-// Generate image using DALL-E 3
-async function generateImage(prompt: string): Promise<string | null> {
+function modeGuidance(mode: ChatMindMode): string {
+  if (mode === 'study') {
+    return `\n\nMode: Study\n- Teach step-by-step when helpful.\n- Use short examples.\n- End with 1 quick check question when appropriate.`;
+  }
+  if (mode === 'work') {
+    return `\n\nMode: Work\n- Be direct and actionable.\n- Prefer bullets, templates, and next steps.\n- Highlight risks and assumptions.`;
+  }
+  if (mode === 'health') {
+    return `\n\nMode: Health\n- Be supportive and practical.\n- Include safety guidance: not a medical professional; encourage seeing a clinician for urgent/serious symptoms.\n- Ask a short clarifying question if needed.`;
+  }
+  return `\n\nMode: General\n- Be concise and clear by default. Expand if asked.`;
+}
+
+async function getChatMindMemorySummary(supabase: any, userId: string): Promise<string> {
   try {
-    const response = await fetch("https://api.openai.com/v1/images/generations", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "dall-e-3",
-        prompt: prompt.substring(0, 1000), // Limit prompt length
-        n: 1,
-        size: "1024x1024",
-        quality: "standard",
-        response_format: "url",
-      }),
-    });
-
-    const data = await response.json();
-    if (data.error) {
-      console.error("DALL-E error:", data.error);
-      return null;
-    }
-    return data.data?.[0]?.url || null;
-  } catch (e) {
-    console.error("Image generation failed:", e);
-    return null;
+    const { data, error } = await supabase
+      .from('chatmind_memory')
+      .select('summary')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) return '';
+    return String(data?.summary || '').trim();
+  } catch {
+    return '';
   }
 }
 
-async function callOpenAI(systemPrompt: string, userPrompt: string, maxTokens = 4096, temperature = 0.3, useGpt4o = false): Promise<string> {
-  // Model fallback chain: gpt-5-mini (fastest) -> gpt-4o-mini (backup)
-  const models = ["gpt-5-mini", "gpt-4o-mini"];
-  const safeMaxTokens = Math.min(maxTokens, 4096);
-  
-  for (const model of models) {
-    console.log(`[callOpenAI] Trying model: ${model}, prompt length: ${userPrompt.length}`);
-    const startTime = Date.now();
-    
-    try {
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-          max_tokens: safeMaxTokens,
-          temperature: temperature,
-        }),
-      });
+async function clearChatMindMemory(supabase: any, userId: string): Promise<void> {
+  try {
+    await supabase.from('chatmind_memory').delete().eq('user_id', userId);
+  } catch {
+    // ignore
+  }
+}
 
-      const data = await response.json();
-      const elapsed = Date.now() - startTime;
-      console.log(`[callOpenAI] Response from ${model} in ${elapsed}ms, status: ${response.status}`);
-      
-      if (data.error) {
-        console.warn(`[callOpenAI] ${model} failed: ${JSON.stringify(data.error)}`);
-        // If model not found or similar error, try next model
-        if (data.error.code === "model_not_found" || data.error.type === "invalid_request_error") {
-          console.log(`[callOpenAI] Falling back to next model...`);
+function shouldUpdateChatMindMemory(userMessage: string): boolean {
+  const t = String(userMessage || '').toLowerCase();
+  if (!t.trim()) return false;
+  // Conservative heuristic to avoid extra calls for most messages.
+  return (
+    t.includes('my name is') ||
+    t.includes('call me') ||
+    t.includes('i prefer') ||
+    t.includes("i'm") ||
+    t.includes('i am ') ||
+    t.includes('i work') ||
+    t.includes('i study') ||
+    t.includes('my goal') ||
+    t.includes('remember that') ||
+    t.includes("don't forget") ||
+    t.includes('تذكر') ||
+    t.includes('اسمي')
+  );
+}
+
+async function updateChatMindMemorySummary(params: {
+  supabase: any;
+  userId: string;
+  previousSummary: string;
+  userMessage: string;
+  assistantMessage: string;
+}): Promise<void> {
+  const prev = String(params.previousSummary || '').trim();
+  const userMsg = String(params.userMessage || '').trim();
+  const assistantMsg = String(params.assistantMessage || '').trim();
+  if (!userMsg || !assistantMsg) return;
+
+  // Best-effort + cheap: use a fast model if configured.
+  const model = (Deno.env.get('OPENAI_MEMORY_MODEL') || Deno.env.get('OPENAI_CHAT_MODEL_FAST') || Deno.env.get('OPENAI_CHAT_MODEL') || 'gpt-5.2').trim();
+  const system = `You maintain a short user memory summary for a chat assistant.\n\nRules:\n- ONLY store stable preferences, user identity details they explicitly shared, recurring goals, and important constraints.\n- NEVER store secrets, passwords, API keys, or payment details.\n- Keep it <= 600 characters.\n- Output ONLY the updated summary text (no JSON, no quotes).`;
+
+  const prompt = `Previous memory summary (may be empty):\n${prev || '(empty)'}\n\nNew conversation snippet:\nUser: ${userMsg}\nAssistant: ${assistantMsg.slice(0, 800)}\n\nUpdated memory summary:`;
+
+  try {
+    const next = await callOpenAI(
+      [
+        { role: 'system', content: system },
+        { role: 'user', content: prompt },
+      ],
+      250,
+      0.1,
+      model,
+    );
+
+    const cleaned = String(next || '').trim().replace(/^"|"$/g, '');
+    const clipped = cleaned.slice(0, 600);
+    if (!clipped) return;
+
+    await params.supabase
+      .from('chatmind_memory')
+      .upsert({ user_id: params.userId, summary: clipped }, { onConflict: 'user_id' });
+  } catch {
+    // ignore
+  }
+}
+
+type WebSource = { title: string; url: string; snippet?: string };
+
+// Simple in-memory cache (best-effort) to speed up repeated web searches.
+const WEB_SEARCH_CACHE = new Map<string, { at: number; results: WebSource[] }>();
+const WEB_SEARCH_TTL_MS = 10 * 60 * 1000;
+
+function serperConfigured(): boolean {
+  return Boolean((Deno.env.get('SERPER_API_KEY') || '').trim());
+}
+
+function tavilyConfigured(): boolean {
+  return Boolean((Deno.env.get('TAVILY_API_KEY') || '').trim());
+}
+
+async function webSearch(query: string, maxResults = 5): Promise<WebSource[]> {
+  const q = String(query || '').trim();
+  if (!q) return [];
+
+  const cacheKey = `${q.toLowerCase()}|${Math.max(1, Math.min(Number(maxResults) || 5, 8))}`;
+  const cached = WEB_SEARCH_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.at < WEB_SEARCH_TTL_MS) {
+    return cached.results;
+  }
+
+  const n = Math.max(1, Math.min(Number(maxResults) || 5, 8));
+
+  // Prefer Tavily if configured, else Serper.
+  if (tavilyConfigured()) {
+    const apiKey = (Deno.env.get('TAVILY_API_KEY') || '').trim();
+    const res = await fetchWithTimeout(
+      'https://api.tavily.com/search',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: apiKey, query: q, max_results: n, include_answer: false }),
+      },
+      20_000,
+    );
+
+    if (!res.ok) {
+      // Stateless logging: never log upstream bodies (may contain user query/content).
+      console.warn('[openai-proxy] Tavily search failed:', res.status);
+      return [];
+    }
+
+    const data = await res.json();
+    const results = Array.isArray(data?.results) ? data.results : [];
+    const mapped = results
+      .map((r: any) => ({
+        title: String(r?.title || '').trim(),
+        url: String(r?.url || '').trim(),
+        snippet: String(r?.content || r?.snippet || '').trim(),
+      }))
+      .filter((r: any) => r.title && r.url)
+      .slice(0, n);
+
+    WEB_SEARCH_CACHE.set(cacheKey, { at: Date.now(), results: mapped });
+    return mapped;
+  }
+
+  if (serperConfigured()) {
+    const apiKey = (Deno.env.get('SERPER_API_KEY') || '').trim();
+    const res = await fetchWithTimeout(
+      'https://google.serper.dev/search',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-KEY': apiKey },
+        body: JSON.stringify({ q, num: n }),
+      },
+      20_000,
+    );
+
+    if (!res.ok) {
+      // Stateless logging: never log upstream bodies (may contain user query/content).
+      console.warn('[openai-proxy] Serper search failed:', res.status);
+      return [];
+    }
+
+    const data = await res.json();
+    const organic = Array.isArray(data?.organic) ? data.organic : [];
+    const mapped = organic
+      .map((r: any) => ({
+        title: String(r?.title || '').trim(),
+        url: String(r?.link || '').trim(),
+        snippet: String(r?.snippet || '').trim(),
+      }))
+      .filter((r: any) => r.title && r.url)
+      .slice(0, n);
+
+    WEB_SEARCH_CACHE.set(cacheKey, { at: Date.now(), results: mapped });
+    return mapped;
+  }
+
+  return [];
+}
+
+async function callOpenAIInternalStream(
+  messages: any[],
+  maxTokens: number,
+  temperature: number,
+  model: string,
+): Promise<Response> {
+  const apiKey = Deno.env.get('OPENAI_API_KEY');
+  if (!apiKey) throw new Error('OPENAI_API_KEY not set');
+
+  const safeMaxTokens = Math.max(1, Math.min(maxTokens || 1, 16000));
+  const res = await fetchWithTimeout(
+    'https://api.openai.com/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages, max_tokens: safeMaxTokens, temperature, stream: true }),
+    },
+    OPENAI_TIMEOUT_MS,
+  );
+
+  if (!res.ok) {
+    const bodyText = await res.text();
+    const safeMsg = summarizeOpenAIError(res.status, bodyText);
+    throw new Error(`OpenAI error: ${res.status} ${safeMsg}`);
+  }
+
+  return res;
+}
+
+function chunkTextSse(text: string): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const t = String(text || '');
+  const chunkSize = 48;
+  let i = 0;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      function push() {
+        if (i >= t.length) {
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+          return;
+        }
+        const next = t.slice(i, i + chunkSize);
+        i += chunkSize;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: next })}\n\n`));
+        setTimeout(push, 0);
+      }
+      push();
+    },
+  });
+}
+
+function normalizeExportKind(raw: string): 'notes' | 'study_guide' | 'flashcards_csv' | 'quiz_json' | 'report' {
+  const k = String(raw || '').trim().toLowerCase();
+  if (k === 'study_guide' || k === 'studyguide') return 'study_guide';
+  if (k === 'flashcards' || k === 'flashcards_csv') return 'flashcards_csv';
+  if (k === 'quiz' || k === 'quiz_json') return 'quiz_json';
+  if (k === 'report' || k === 'reports' || k.endsWith('_report') || k.endsWith('report')) return 'report';
+  return 'notes';
+}
+
+async function generateExportContent(params: {
+  kind: 'notes' | 'study_guide' | 'flashcards_csv' | 'quiz_json' | 'report';
+  message?: string;
+  context: string;
+  history?: any[];
+  agentId?: string;
+  meta?: LlmCallMeta;
+}): Promise<{ filename: string; mimeType: string; content: string }> {
+  const kind = params.kind;
+  const extraMsg = String(params.message || '').trim();
+  const ctx = String(params.context || '').slice(0, 18000);
+  const history = Array.isArray(params.history) ? params.history.slice(-8) : [];
+
+  const system =
+    'You are an expert study assistant. Produce outputs that are accurate and grounded ONLY in the provided document context. ' +
+    'If info is missing, say it is not found in the document.';
+
+  if (kind === 'flashcards_csv') {
+    const user =
+      `Create flashcards as CSV with header: front,back\n` +
+      `Rules: 25-60 rows max, no quotes unless needed, no extra commentary.\n` +
+      (extraMsg ? `User request: ${extraMsg}\n` : '') +
+      `DOCUMENT CONTEXT:\n${ctx}`;
+    const text = await callOpenAI([
+      { role: 'system', content: system },
+      ...history,
+      { role: 'user', content: user },
+    ], 1800, 0.2, undefined, params.meta);
+    return { filename: 'flashcards.csv', mimeType: 'text/csv', content: String(text || '').trim() };
+  }
+
+  if (kind === 'quiz_json') {
+    const user =
+      `Create a quiz JSON array. Output ONLY valid JSON.\n` +
+      `Schema: [{"question": string, "choices": string[4], "answerIndex": 0|1|2|3, "explanation": string}]\n` +
+      `Rules: 10-20 questions, exam-style, grounded in context.\n` +
+      (extraMsg ? `User request: ${extraMsg}\n` : '') +
+      `DOCUMENT CONTEXT:\n${ctx}`;
+    const raw = await callOpenAI([
+      { role: 'system', content: system },
+      ...history,
+      { role: 'user', content: user },
+    ], 2200, 0.2, undefined, params.meta);
+
+    // Ensure valid JSON (best-effort).
+    let jsonText = String(raw || '').trim();
+    const match = jsonText.match(/\[[\s\S]*\]/);
+    if (match) jsonText = match[0];
+    try {
+      JSON.parse(jsonText);
+    } catch {
+      // If invalid, wrap as a single-question fallback.
+      jsonText = JSON.stringify([
+        {
+          question: 'Quiz generation failed to produce valid JSON.',
+          choices: ['Try again', 'Try again', 'Try again', 'Try again'],
+          answerIndex: 0,
+          explanation: 'The model output was not valid JSON.',
+        },
+      ]);
+    }
+    return { filename: 'quiz.json', mimeType: 'application/json', content: jsonText };
+  }
+
+  if (kind === 'study_guide') {
+    const user =
+      `Create a detailed study guide in Markdown.\n` +
+      `Include: title, table of contents, sections with headings, bullets, examples if present, and a short practice checklist.\n` +
+      (extraMsg ? `User request: ${extraMsg}\n` : '') +
+      `DOCUMENT CONTEXT:\n${ctx}`;
+    const text = await callOpenAI([
+      { role: 'system', content: system },
+      ...history,
+      { role: 'user', content: user },
+    ], 3200, 0.25, undefined, params.meta);
+    return { filename: 'study_guide.md', mimeType: 'text/markdown', content: String(text || '').trim() };
+  }
+
+  if (kind === 'report') {
+    const user =
+      `Create a professional report in Markdown.\n` +
+      `Include: Title, Executive Summary, Background, Methodology, Findings, Analysis, Recommendations, Risks/Limitations, Conclusion, Appendix (if relevant).\n` +
+      `Use clean headings, bullets, and concise paragraphs. Be formal and modern.\n` +
+      (extraMsg ? `Report focus/type: ${extraMsg}\n` : '') +
+      `DOCUMENT CONTEXT:\n${ctx}`;
+    const text = await callOpenAI([
+      { role: 'system', content: system },
+      ...history,
+      { role: 'user', content: user },
+    ], 3600, 0.25, undefined, params.meta);
+    return { filename: 'report.md', mimeType: 'text/markdown', content: String(text || '').trim() };
+  }
+
+  // notes
+  {
+    const user =
+      `Create clean study notes in Markdown.\n` +
+      `Format: headings + bullets, concise, no filler.\n` +
+      (extraMsg ? `User request: ${extraMsg}\n` : '') +
+      `DOCUMENT CONTEXT:\n${ctx}`;
+    const text = await callOpenAI([
+      { role: 'system', content: system },
+      ...history,
+      { role: 'user', content: user },
+    ], 2200, 0.2, undefined, params.meta);
+    return { filename: 'notes.md', mimeType: 'text/markdown', content: String(text || '').trim() };
+  }
+}
+
+function shouldUseWebSearchForChat(question: string): boolean {
+  // Only if enabled and we have a search provider key.
+  const enabled = parseOptionalBoolEnv('CHAT_ENABLE_WEB_SEARCH');
+  if (!enabled) return false;
+  if (!tavilyConfigured() && !serperConfigured()) return false;
+
+  const q = String(question || '').toLowerCase();
+  if (!q.trim()) return false;
+
+  // Chat Mind behavior: if web search is enabled, always attempt it.
+  // This keeps output consistently "ChatGPT-like" with citations.
+  return true;
+}
+
+function formatSourcesForPrompt(sources: WebSource[]): string {
+  const lines: string[] = [];
+  for (let i = 0; i < sources.length; i++) {
+    const s = sources[i];
+    lines.push(`[${i + 1}] ${s.title}\n${s.url}${s.snippet ? `\n${s.snippet}` : ''}`);
+  }
+  return lines.join('\n\n');
+}
+
+function formatSourcesForResponse(sources: WebSource[]): string {
+  const lines: string[] = [];
+  for (let i = 0; i < sources.length; i++) {
+    const s = sources[i];
+    lines.push(`[${i + 1}] ${s.title} — ${s.url}`);
+  }
+  return lines.join('\n');
+}
+
+function detectLanguageFromText(text: string): string {
+  const t = String(text || '');
+  if (!t.trim()) return 'en';
+
+  if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/.test(t)) return 'ar';
+  if (/[\u3040-\u309F\u30A0-\u30FF]/.test(t)) return 'ja';
+  if (/[\uAC00-\uD7AF]/.test(t)) return 'ko';
+  if (/[\u4E00-\u9FFF]/.test(t)) return 'zh';
+  if (/[\u0400-\u04FF]/.test(t)) return 'ru';
+
+  const lower = t.toLowerCase();
+  if (/[¿¡]/.test(t) || /\b(que|para|con|por|como|pero|porque|gracias|hola|usted|ustedes)\b/.test(lower)) return 'es';
+  if (/\b(le|la|les|des|pour|avec|merci|bonjour|vous|au|aux)\b/.test(lower)) return 'fr';
+  if (/\b(der|die|das|und|nicht|bitte|danke|haben|sein)\b/.test(lower)) return 'de';
+  if (/\b(não|voce|você|para|com|obrigado|obrigada|ola|olá)\b/.test(lower)) return 'pt';
+  if (/\b(che|per|con|grazie|ciao|voi|sei|una|uno)\b/.test(lower)) return 'it';
+
+  return 'en';
+}
+
+function languageInstruction(lang: string): string {
+  switch (lang) {
+    case 'ar': return '\nLanguage: Respond in Arabic.';
+    case 'zh': return '\nLanguage: Respond in Chinese.';
+    case 'ja': return '\nLanguage: Respond in Japanese.';
+    case 'ko': return '\nLanguage: Respond in Korean.';
+    case 'ru': return '\nLanguage: Respond in Russian.';
+    case 'es': return '\nLanguage: Respond in Spanish.';
+    case 'fr': return '\nLanguage: Respond in French.';
+    case 'de': return '\nLanguage: Respond in German.';
+    case 'pt': return '\nLanguage: Respond in Portuguese.';
+    case 'it': return '\nLanguage: Respond in Italian.';
+    default: return '';
+  }
+}
+
+function estimateCostFromEnv(tokensInput: number, tokensOutput: number): number {
+  // Optional: set these env vars if you want cost estimation in DB.
+  // Example values are provider/model-specific; do not hardcode them here.
+  const inPer1k = parseOptionalNumberEnv('AI_COST_INPUT_PER_1K_TOKENS');
+  const outPer1k = parseOptionalNumberEnv('AI_COST_OUTPUT_PER_1K_TOKENS');
+  if (!inPer1k && !outPer1k) return 0;
+  const inCost = inPer1k ? (tokensInput / 1000) * inPer1k : 0;
+  const outCost = outPer1k ? (tokensOutput / 1000) * outPer1k : 0;
+  const cost = inCost + outCost;
+  return Number.isFinite(cost) ? cost : 0;
+}
+
+async function tryLogAiUsage(meta: LlmCallMeta | undefined, usage: LlmCallUsage, success: boolean, errorMessage?: string) {
+  if (!meta?.supabase || !meta?.userId) return;
+  try {
+    await meta.supabase.rpc('log_ai_usage', {
+      p_user_id: meta.userId,
+      p_provider: usage.provider,
+      p_model: usage.model,
+      p_tokens_input: usage.tokensInput || 0,
+      p_tokens_output: usage.tokensOutput || 0,
+      p_estimated_cost: usage.estimatedCost || 0,
+      p_request_type: meta.requestType,
+      p_document_id: meta.documentId || null,
+      p_success: Boolean(success),
+      p_error_message: success ? null : String(errorMessage || 'unknown error').slice(0, 500),
+      p_latency_ms: usage.latencyMs ?? null,
+      p_was_fallback: Boolean(usage.wasFallback),
+    });
+  } catch (e: any) {
+    console.warn('[openai-proxy] Failed to log_ai_usage:', String(e?.message || e).slice(0, 200));
+  }
+}
+
+// Lightweight burst limiter (best-effort, per edge instance).
+const burstLimiterState: Map<string, number[]> = new Map();
+const guestDailyUsage: Map<string, { date: string; count: number }> = new Map();
+
+function checkBurstLimit(userId: string): { ok: true } | { ok: false; retryAfterSec: number } {
+  const limit = parseOptionalNumberEnv('AI_BURST_REQUESTS_PER_MINUTE');
+  if (!limit || limit <= 0) return { ok: true };
+
+  const now = Date.now();
+  const windowMs = 60_000;
+  const timestamps = burstLimiterState.get(userId) || [];
+  const pruned = timestamps.filter((t) => now - t < windowMs);
+
+  if (pruned.length >= limit) {
+    const oldest = pruned[0];
+    const retryAfterMs = Math.max(0, windowMs - (now - oldest));
+    burstLimiterState.set(userId, pruned);
+    return { ok: false, retryAfterSec: Math.max(1, Math.ceil(retryAfterMs / 1000)) };
+  }
+
+  pruned.push(now);
+  burstLimiterState.set(userId, pruned);
+  return { ok: true };
+}
+
+function checkGuestDailyLimit(guestKey: string, limit: number): { ok: true } | { ok: false } {
+  if (!limit || limit <= 0) return { ok: true };
+  const today = new Date().toISOString().slice(0, 10);
+  const existing = guestDailyUsage.get(guestKey);
+  if (!existing || existing.date !== today) {
+    guestDailyUsage.set(guestKey, { date: today, count: 1 });
+    return { ok: true };
+  }
+  if (existing.count >= limit) return { ok: false };
+  existing.count += 1;
+  guestDailyUsage.set(guestKey, existing);
+  return { ok: true };
+}
+
+function parseProviderOrder(): LlmProvider[] {
+  const raw = (Deno.env.get('LLM_PROVIDER_ORDER') || 'openai').trim();
+  const parts = raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const allowed: LlmProvider[] = [];
+  for (const p of parts) {
+    if (p === 'openai' || p === 'gemini' || p === 'anthropic') allowed.push(p as LlmProvider);
+  }
+  return allowed.length ? allowed : ['openai'];
+}
+
+function openAiConfigured(): boolean {
+  return Boolean(Deno.env.get('OPENAI_API_KEY'));
+}
+
+function geminiConfigured(): boolean {
+  return Boolean(Deno.env.get('GEMINI_API_KEY'));
+}
+
+async function isPremiumUser(supabase: any, userId: string): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from('user_subscriptions')
+      .select('is_active,tier,expires_at')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error || !data) return false;
+    const isActive = Boolean((data as any).is_active);
+    const tier = String((data as any).tier || 'free');
+    const expiresAt = (data as any).expires_at ? new Date((data as any).expires_at) : null;
+    const notExpired = !expiresAt || expiresAt.getTime() > Date.now();
+    return isActive && notExpired && (tier === 'pro' || tier === 'enterprise');
+  } catch {
+    return false;
+  }
+}
+
+function anthropicConfigured(): boolean {
+  return Boolean(Deno.env.get('ANTHROPIC_API_KEY'));
+}
+
+function summarizeAnthropicError(status: number, bodyText: string): string {
+  try {
+    const parsed = JSON.parse(bodyText || '{}');
+    const msg = parsed?.error?.message || parsed?.message;
+    if (msg) return redactSecrets(String(msg));
+  } catch {
+    // ignore
+  }
+  if (status === 401) return 'Anthropic authentication failed (server misconfigured).';
+  if (status === 403) return 'Anthropic access denied (server misconfigured).';
+  if (status === 429) return 'Anthropic rate limited. Please retry.';
+  if (status >= 500) return 'Anthropic service error. Please retry.';
+  return 'Anthropic request failed.';
+}
+
+function openAiMessagesToAnthropic(messages: any[]): { system: string; messages: any[] } {
+  const sys: string[] = [];
+  const out: any[] = [];
+
+  for (const m of (messages || [])) {
+    const role = String(m?.role || 'user').trim().toLowerCase();
+    const content = (typeof m?.content === 'string') ? m.content : JSON.stringify(m?.content ?? '');
+    if (role === 'system') {
+      sys.push(content);
+      continue;
+    }
+    // Anthropic messages support only user/assistant roles
+    out.push({ role: role === 'assistant' ? 'assistant' : 'user', content: [{ type: 'text', text: content }] });
+  }
+
+  return { system: sys.join('\n\n').trim(), messages: out };
+}
+
+async function callAnthropicInternal(
+  messages: any[],
+  maxTokens: number,
+  temperature: number,
+  model: string,
+): Promise<LlmInternalResult> {
+  const apiKey = (Deno.env.get('ANTHROPIC_API_KEY') || '').trim();
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
+
+  const startedAt = Date.now();
+  const safeMaxTokens = Math.max(1, Math.min(maxTokens || 1, 8000));
+  const modelToUse = model || Deno.env.get('ANTHROPIC_TEXT_MODEL') || 'claude-3-5-sonnet-latest';
+  const { system, messages: anthMessages } = openAiMessagesToAnthropic(messages);
+
+  let lastErr: any;
+  for (let attempt = 0; attempt <= OPENAI_MAX_RETRIES; attempt++) {
+    try {
+      const res = await fetchWithTimeout(
+        'https://api.anthropic.com/v1/messages',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: modelToUse,
+            max_tokens: safeMaxTokens,
+            temperature,
+            system: system || undefined,
+            messages: anthMessages,
+          }),
+        },
+        OPENAI_TIMEOUT_MS,
+      );
+
+      if (!res.ok) {
+        const bodyText = await res.text();
+        const safeMsg = summarizeAnthropicError(res.status, bodyText);
+        const err: any = new Error(`Anthropic error: ${res.status} ${safeMsg}`);
+        err.status = res.status;
+        // Stateless logging: never log upstream bodies (may contain user content).
+        console.error('[openai-proxy] Anthropic error:', res.status);
+        if ((res.status === 429 || res.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
+          await sleep(500 * Math.pow(2, attempt));
           continue;
         }
-        // For other errors (rate limit, etc), throw immediately
-        throw new Error(formatOpenAIError(data.error, response.status));
+        throw err;
       }
-      
-      const result = data.choices?.[0]?.message?.content || "";
-      console.log(`[callOpenAI] Success with ${model}, result length: ${result.length} chars`);
-      return result;
-    } catch (fetchError: any) {
-      console.error(`[callOpenAI] Fetch error with ${model}:`, fetchError.message);
-      // If it's a network error, try next model
-      if (model !== models[models.length - 1]) {
+
+      const data = await res.json();
+      const blocks = Array.isArray(data?.content) ? data.content : [];
+      const text = blocks
+        .filter((b: any) => b?.type === 'text')
+        .map((b: any) => String(b?.text || ''))
+        .join('')
+        .trim();
+
+      const inTok = Number(data?.usage?.input_tokens) || 0;
+      const outTok = Number(data?.usage?.output_tokens) || 0;
+
+      return {
+        text,
+        usage: {
+          provider: 'anthropic',
+          model: String(modelToUse),
+          tokensInput: inTok,
+          tokensOutput: outTok,
+          estimatedCost: estimateCostFromEnv(inTok, outTok),
+          latencyMs: Date.now() - startedAt,
+          wasFallback: false,
+        },
+      };
+    } catch (e: any) {
+      lastErr = e;
+      const msg = (e?.message || '').toLowerCase();
+      const isTimeout = msg.includes('aborted') || msg.includes('timeout');
+      if ((isTimeout || e?.status === 429 || e?.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
+        await sleep(500 * Math.pow(2, attempt));
         continue;
       }
-      throw fetchError;
+      break;
     }
   }
-  
-  throw new Error("All models failed");
+
+  throw lastErr || new Error('Anthropic request failed');
 }
 
-/**
- * Call OpenAI Vision API for image-based tasks (OCR, image analysis)
- */
-async function callOpenAIVision(systemPrompt: string, imageUrls: string[], userPrompt: string, maxTokens = 4096): Promise<string> {
-  const model = "gpt-4o"; // Vision requires gpt-4o or gpt-4o-mini
-  const safeMaxTokens = Math.min(maxTokens, 4096);
-  
-  console.log(`[callOpenAIVision] Processing ${imageUrls.length} images, prompt length: ${userPrompt.length}`);
-  const startTime = Date.now();
-  
+function summarizeGeminiError(status: number, bodyText: string): string {
   try {
-    // Build content array with text and images
-    const content: Array<{type: string; text?: string; image_url?: {url: string}}> = [
-      { type: "text", text: userPrompt }
-    ];
-    
-    // Add images (limit to first 10 to avoid token limits)
-    const limitedImages = imageUrls.slice(0, 10);
-    for (const imageUrl of limitedImages) {
-      content.push({
-        type: "image_url",
-        image_url: { url: imageUrl }
-      });
+    const parsed = JSON.parse(bodyText || '{}');
+    const msg = parsed?.error?.message || parsed?.message;
+    if (msg) return redactSecrets(String(msg));
+  } catch {
+    // ignore
+  }
+  if (status === 401) return 'Gemini authentication failed (server misconfigured).';
+  if (status === 403) return 'Gemini access denied (server misconfigured).';
+  if (status === 429) return 'Gemini rate limited. Please retry.';
+  if (status >= 500) return 'Gemini service error. Please retry.';
+  return 'Gemini request failed.';
+}
+
+function openAiMessagesToGeminiText(messages: any[]): string {
+  // Minimal, robust conversion that preserves role context.
+  // Gemini supports multi-turn, but we keep it simple and stable.
+  return (messages || []).map((m: any) => {
+    const role = String(m?.role || 'user').toUpperCase();
+    const content = (typeof m?.content === 'string') ? m.content : JSON.stringify(m?.content ?? '');
+    return `${role}: ${content}`;
+  }).join('\n\n');
+}
+
+async function callOpenAIInternal(
+  messages: any[],
+  maxTokens: number,
+  temperature: number,
+  model: string,
+): Promise<LlmInternalResult> {
+  const apiKey = Deno.env.get("OPENAI_API_KEY");
+  if (!apiKey) throw new Error("OPENAI_API_KEY not set");
+
+  const safeMaxTokens = Math.max(1, Math.min(maxTokens || 1, 16000));
+
+  const fallbackModel = Deno.env.get('OPENAI_FALLBACK_MODEL') || 'gpt-4o-mini';
+  let modelToUse = model;
+  let usedFallback = false;
+
+  let lastErr: any;
+  for (let attempt = 0; attempt <= OPENAI_MAX_RETRIES; attempt++) {
+    try {
+      const startedAt = Date.now();
+      const res = await fetchWithTimeout(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+          body: JSON.stringify({ model: modelToUse, messages, max_tokens: safeMaxTokens, temperature }),
+        },
+        OPENAI_TIMEOUT_MS
+      );
+
+      if (!res.ok) {
+        const bodyText = await res.text();
+        const safeMsg = summarizeOpenAIError(res.status, bodyText);
+
+        // If the requested model isn't available, retry once with a safe fallback model.
+        if (!usedFallback && fallbackModel && modelToUse !== fallbackModel && isLikelyModelError(res.status, bodyText)) {
+          console.warn(`[openai-proxy] Model not available (${modelToUse}). Falling back to ${fallbackModel}.`);
+          modelToUse = fallbackModel;
+          usedFallback = true;
+          continue;
+        }
+
+        const err: any = new Error(`OpenAI error: ${res.status} ${safeMsg}`);
+        err.status = res.status;
+        // Stateless logging: never log upstream bodies (may contain user content).
+        console.error('[openai-proxy] OpenAI error:', res.status);
+        // Retry on rate limits / transient errors
+        if ((res.status === 429 || res.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
+          await sleep(500 * Math.pow(2, attempt));
+          continue;
+        }
+        throw err;
+      }
+
+      const data = await res.json();
+      const text = data.choices?.[0]?.message?.content || "";
+
+      const tokensInput = Number(data?.usage?.prompt_tokens || 0);
+      const tokensOutput = Number(data?.usage?.completion_tokens || 0);
+      const usedModel = String(data?.model || modelToUse);
+      const latencyMs = Date.now() - startedAt;
+
+      return {
+        text,
+        usage: {
+          provider: 'openai',
+          model: usedModel,
+          tokensInput: Number.isFinite(tokensInput) ? tokensInput : 0,
+          tokensOutput: Number.isFinite(tokensOutput) ? tokensOutput : 0,
+          estimatedCost: estimateCostFromEnv(tokensInput, tokensOutput),
+          latencyMs: Number.isFinite(latencyMs) ? latencyMs : null,
+          wasFallback: Boolean(usedFallback),
+        },
+      };
+    } catch (e: any) {
+      lastErr = e;
+      const msg = (e?.message || '').toLowerCase();
+      const isTimeout = msg.includes('aborted') || msg.includes('timeout');
+      if (isTimeout && attempt < OPENAI_MAX_RETRIES) {
+        await sleep(500 * Math.pow(2, attempt));
+        continue;
+      }
+      break;
     }
-    
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
+  }
+
+  throw lastErr || new Error('OpenAI request failed');
+}
+
+async function callGeminiInternal(
+  messages: any[],
+  maxTokens: number,
+  temperature: number,
+  model: string,
+): Promise<LlmInternalResult> {
+  const apiKey = Deno.env.get('GEMINI_API_KEY');
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+
+  const safeMaxTokens = Math.max(1, Math.min(maxTokens || 1, 8192));
+  const promptText = openAiMessagesToGeminiText(messages);
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  let lastErr: any;
+  for (let attempt = 0; attempt <= OPENAI_MAX_RETRIES; attempt++) {
+    try {
+      const startedAt = Date.now();
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: promptText }] }],
+            generationConfig: {
+              temperature,
+              maxOutputTokens: safeMaxTokens,
+            },
+          }),
+        },
+        OPENAI_TIMEOUT_MS
+      );
+
+      if (!res.ok) {
+        const bodyText = await res.text();
+        const safeMsg = summarizeGeminiError(res.status, bodyText);
+        const err: any = new Error(`Gemini error: ${res.status} ${safeMsg}`);
+        err.status = res.status;
+        // Stateless logging: never log upstream bodies (may contain user content).
+        console.error('[openai-proxy] Gemini error:', res.status);
+        if ((res.status === 429 || res.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
+          await sleep(500 * Math.pow(2, attempt));
+          continue;
+        }
+        throw err;
+      }
+
+      const data = await res.json();
+      const parts = data?.candidates?.[0]?.content?.parts;
+      if (Array.isArray(parts)) {
+        const text = parts.map((p: any) => p?.text).filter(Boolean).join('');
+        return {
+          text: text || '',
+          usage: {
+            provider: 'gemini',
+            model: String(model || ''),
+            tokensInput: 0,
+            tokensOutput: 0,
+            estimatedCost: 0,
+            latencyMs: Date.now() - startedAt,
+            wasFallback: false,
+          },
+        };
+      }
+      return {
+        text: '',
+        usage: {
+          provider: 'gemini',
+          model: String(model || ''),
+          tokensInput: 0,
+          tokensOutput: 0,
+          estimatedCost: 0,
+          latencyMs: Date.now() - startedAt,
+          wasFallback: false,
+        },
+      };
+    } catch (e: any) {
+      lastErr = e;
+      const msg = (e?.message || '').toLowerCase();
+      const isTimeout = msg.includes('aborted') || msg.includes('timeout');
+      if (isTimeout && attempt < OPENAI_MAX_RETRIES) {
+        await sleep(500 * Math.pow(2, attempt));
+        continue;
+      }
+      break;
+    }
+  }
+
+  throw lastErr || new Error('Gemini request failed');
+}
+
+async function callOpenAI(
+  messages: any[],
+  maxTokens = 16000,
+  temperature = 0.3,
+  model?: string,
+  meta?: LlmCallMeta,
+  providersOverride?: LlmProvider[],
+  modelOverrides?: Partial<Record<LlmProvider, string>>,
+): Promise<string> {
+  // Prefer the same model as chat (OPENAI_CHAT_MODEL) when no explicit model is provided.
+  // This avoids breaking non-chat endpoints when PRIMARY_TEXT_MODEL is unset or uses an unavailable model.
+  const desiredModel = String(
+    modelOverrides?.openai ||
+      model ||
+      Deno.env.get('PRIMARY_TEXT_MODEL') ||
+      Deno.env.get('OPENAI_CHAT_MODEL') ||
+      'gpt-4o'
+  );
+  const configuredOrder = normalizeProviderOrder(parseProviderOrder());
+  const overrideOrder = normalizeProviderOrder(providersOverride);
+  const providers = overrideOrder.length > 0
+    ? intersectProviderOrder(overrideOrder, configuredOrder)
+    : configuredOrder;
+
+  let lastErr: any;
+  for (let idx = 0; idx < providers.length; idx++) {
+    const provider = providers[idx];
+    try {
+      if (provider === 'openai') {
+        if (!openAiConfigured()) throw new Error('OPENAI_API_KEY not set');
+        const res = await callOpenAIInternal(messages, maxTokens, temperature, desiredModel);
+        await tryLogAiUsage(meta, { ...res.usage, wasFallback: res.usage.wasFallback || idx > 0 }, true);
+        return res.text;
+      }
+      if (provider === 'gemini') {
+        if (!geminiConfigured()) throw new Error('GEMINI_API_KEY not set');
+        const geminiModel = String(modelOverrides?.gemini || Deno.env.get('GEMINI_TEXT_MODEL') || desiredModel);
+        const res = await callGeminiInternal(messages, maxTokens, temperature, geminiModel);
+        await tryLogAiUsage(meta, { ...res.usage, model: geminiModel, wasFallback: idx > 0 }, true);
+        return res.text;
+      }
+      if (provider === 'anthropic') {
+        if (!anthropicConfigured()) throw new Error('ANTHROPIC_API_KEY not set');
+        const anthropicModel = String(modelOverrides?.anthropic || Deno.env.get('ANTHROPIC_TEXT_MODEL') || 'claude-3-5-sonnet-latest');
+        const res = await callAnthropicInternal(messages, maxTokens, temperature, anthropicModel);
+        await tryLogAiUsage(meta, { ...res.usage, model: anthropicModel, wasFallback: idx > 0 }, true);
+        return res.text;
+      }
+    } catch (e: any) {
+      lastErr = e;
+      console.warn(`[openai-proxy] Provider ${provider} failed: ${String(e?.message || e).slice(0, 200)}`);
+      continue;
+    }
+  }
+
+  await tryLogAiUsage(
+    meta,
+    {
+      provider: 'openai',
+      model: desiredModel,
+      tokensInput: 0,
+      tokensOutput: 0,
+      estimatedCost: 0,
+      latencyMs: null,
+      wasFallback: true,
+    },
+    false,
+    String(lastErr?.message || lastErr || 'No LLM provider configured'),
+  );
+
+  throw lastErr || new Error('No LLM provider configured');
+}
+
+function chooseChatProviderOrder(params: { question: string; context: string; history?: any[] }): LlmProvider[] {
+  // Preserve admin-configured provider list; only reorder.
+  const configuredOrder = normalizeProviderOrder(parseProviderOrder());
+  if (configuredOrder.length <= 1) return configuredOrder;
+
+  const q = String(params?.question || '').toLowerCase();
+  const context = String(params?.context || '');
+  const ctxLen = context.length;
+
+  const hasCodeSignals =
+    q.includes('```') ||
+    q.includes('stack trace') ||
+    q.includes('exception') ||
+    q.includes('traceback') ||
+    q.includes('typescript') ||
+    q.includes('javascript') ||
+    q.includes('react') ||
+    q.includes('swift') ||
+    q.includes('kotlin') ||
+    q.includes('python') ||
+    q.includes('sql') ||
+    q.includes('bug') ||
+    q.includes('error');
+
+  const wantsSummarizeOrExtract =
+    q.includes('summarize') ||
+    q.includes('summary') ||
+    q.includes('tl;dr') ||
+    q.includes('extract') ||
+    q.includes('key points') ||
+    q.includes('main points') ||
+    q.includes('outline');
+
+  const wantsTranslate = q.includes('translate') || q.includes('ترجم') || q.includes('ترجمة');
+
+  // Heuristics:
+  // - Long-context summarization/translation tends to do well on Gemini.
+  // - Code/debugging tends to do well on OpenAI.
+  // - Otherwise: prefer OpenAI, then Claude, then Gemini (if configured).
+  if ((ctxLen > 12000 && wantsSummarizeOrExtract) || (ctxLen > 8000 && wantsTranslate)) {
+    return intersectProviderOrder(['gemini', 'anthropic', 'openai'], configuredOrder);
+  }
+  if (hasCodeSignals) {
+    return intersectProviderOrder(['openai', 'anthropic', 'gemini'], configuredOrder);
+  }
+
+  return intersectProviderOrder(['openai', 'anthropic', 'gemini'], configuredOrder);
+}
+
+// Strict JSON helper: asks the best configured provider to return a single JSON object.
+async function callOpenAIJson(
+  messages: any[],
+  maxTokens = 4096,
+  temperature = 0.2,
+  model?: string,
+): Promise<any> {
+    // Prefer the same model as chat (OPENAI_CHAT_MODEL) when no explicit JSON model is set.
+    // Many projects configure chat only; using gpt-4o defaults can break quiz/studyPlan if unavailable.
+    const desiredModel =
+      model ||
+      Deno.env.get('PRIMARY_JSON_MODEL') ||
+      Deno.env.get('PRIMARY_TEXT_MODEL') ||
+      Deno.env.get('OPENAI_CHAT_MODEL') ||
+      'gpt-4o';
+    const providers = parseProviderOrder();
+
+    // Helper that keeps the old OpenAI strict-JSON behavior.
+    async function callOpenAIJsonInternal(modelToUse: string): Promise<any> {
+      const apiKey = Deno.env.get("OPENAI_API_KEY");
+      if (!apiKey) throw new Error("OPENAI_API_KEY not set");
+
+      const safeMaxTokens = Math.max(1, Math.min(maxTokens || 1, 8000));
+
+      const fallbackModel =
+        Deno.env.get('OPENAI_FALLBACK_MODEL') ||
+        Deno.env.get('OPENAI_CHAT_MODEL') ||
+        'gpt-4o-mini';
+      let usedModel = modelToUse;
+      let usedFallback = false;
+
+      let lastErr: any;
+      for (let attempt = 0; attempt <= OPENAI_MAX_RETRIES; attempt++) {
+        try {
+          const res = await fetchWithTimeout(
+            "https://api.openai.com/v1/chat/completions",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+              body: JSON.stringify({
+                model: usedModel,
+                messages,
+                max_tokens: safeMaxTokens,
+                temperature,
+                response_format: { type: "json_object" },
+              }),
+            },
+            OPENAI_TIMEOUT_MS
+          );
+
+          if (!res.ok) {
+            const bodyText = await res.text();
+            const safeMsg = summarizeOpenAIError(res.status, bodyText);
+
+            if (!usedFallback && fallbackModel && usedModel !== fallbackModel && isLikelyModelError(res.status, bodyText)) {
+              console.warn(`[openai-proxy] Model not available (${usedModel}). Falling back to ${fallbackModel}.`);
+              usedModel = fallbackModel;
+              usedFallback = true;
+              continue;
+            }
+
+            const err: any = new Error(`OpenAI error: ${res.status} ${safeMsg}`);
+            err.status = res.status;
+            // Stateless logging: never log upstream bodies (may contain user content).
+            console.error('[openai-proxy] OpenAI error:', res.status);
+            if ((res.status === 429 || res.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
+              await sleep(500 * Math.pow(2, attempt));
+              continue;
+            }
+            throw err;
+          }
+
+          const data = await res.json();
+          const text = data.choices?.[0]?.message?.content || "";
+          try {
+            return JSON.parse(text);
+          } catch {
+            const err: any = new Error('Model returned invalid JSON');
+            err.status = 502;
+            throw err;
+          }
+        } catch (e: any) {
+          lastErr = e;
+          const msg = (e?.message || '').toLowerCase();
+          const isTimeout = msg.includes('aborted') || msg.includes('timeout');
+          if (isTimeout && attempt < OPENAI_MAX_RETRIES) {
+            await sleep(500 * Math.pow(2, attempt));
+            continue;
+          }
+          break;
+        }
+      }
+
+      throw lastErr || new Error('OpenAI request failed');
+    }
+
+    async function callGeminiJsonInternal(): Promise<any> {
+      const geminiModel = Deno.env.get('GEMINI_JSON_MODEL') || Deno.env.get('GEMINI_TEXT_MODEL') || desiredModel;
+      // Force a JSON-only response via instruction, then best-effort parse.
+      const jsonGuard = { role: 'system', content: 'Return ONLY a single valid JSON object. Do not wrap in markdown. Do not add commentary.' };
+      const { text } = await callGeminiInternal([jsonGuard, ...(messages || [])], maxTokens, temperature, geminiModel);
+
+      // Best-effort JSON extraction.
+      const raw = String(text || '').trim();
+      const match = raw.match(/\{[\s\S]*\}/);
+      const jsonText = match ? match[0] : raw;
+      try {
+        return JSON.parse(jsonText);
+      } catch {
+        const err: any = new Error('Model returned invalid JSON');
+        err.status = 502;
+        throw err;
+      }
+    }
+
+    let lastErr: any;
+    for (const provider of providers) {
+      try {
+        if (provider === 'openai') {
+          if (!openAiConfigured()) throw new Error('OPENAI_API_KEY not set');
+          return await callOpenAIJsonInternal(desiredModel);
+        }
+        if (provider === 'gemini') {
+          if (!geminiConfigured()) throw new Error('GEMINI_API_KEY not set');
+          return await callGeminiJsonInternal();
+        }
+      } catch (e: any) {
+        lastErr = e;
+        console.warn(`[openai-proxy] Provider ${provider} JSON failed: ${String(e?.message || e).slice(0, 200)}`);
+        continue;
+      }
+    }
+
+    throw lastErr || new Error('No LLM provider configured');
+}
+
+// OpenAI Image helper: returns a data URL (data:image/png;base64,...)
+async function callOpenAIImageDataUrl(prompt: string, preferredModel: 'dall-e-3' | 'gpt-image-1'): Promise<string> {
+  const apiKey = Deno.env.get("OPENAI_API_KEY");
+  if (!apiKey) throw new Error("OPENAI_API_KEY not set");
+
+  let lastErr: any;
+  for (let attempt = 0; attempt <= OPENAI_MAX_RETRIES; attempt++) {
+    try {
+      let res = await fetchWithTimeout(
+        "https://api.openai.com/v1/images/generations",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model: preferredModel,
+            prompt,
+            size: "1024x1024",
+            n: 1,
+          }),
+        },
+        OPENAI_IMAGE_TIMEOUT_MS
+      );
+
+      // Some OpenAI accounts/keys may not have access to a given image model.
+      // Fall back to DALL·E 3 for access issues.
+      if (res.status === 403 || res.status === 404) {
+        res = await fetchWithTimeout(
+          "https://api.openai.com/v1/images/generations",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+            body: JSON.stringify({
+              model: "dall-e-3",
+              prompt,
+              size: "1024x1024",
+              n: 1,
+            }),
+          },
+          OPENAI_IMAGE_TIMEOUT_MS
+        );
+      }
+
+      if (!res.ok) {
+        const bodyText = await res.text();
+        const safeMsg = summarizeOpenAIError(res.status, bodyText);
+        const err: any = new Error(`OpenAI image error: ${res.status} ${safeMsg}`);
+        err.status = res.status;
+        // Stateless logging: never log upstream bodies (may contain user content).
+        console.error('[openai-proxy] OpenAI image error:', res.status);
+        if ((res.status === 429 || res.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
+          await sleep(500 * Math.pow(2, attempt));
+          continue;
+        }
+        throw err;
+      }
+
+      const data = await res.json();
+
+      const first = data?.data?.[0];
+      const b64 = first?.b64_json;
+      if (b64 && typeof b64 === 'string') {
+        return `data:image/png;base64,${b64}`;
+      }
+
+      const url = first?.url;
+      if (url && typeof url === 'string') {
+        const imgRes = await fetchWithTimeout(url, { method: 'GET' }, OPENAI_IMAGE_TIMEOUT_MS);
+        if (!imgRes.ok) {
+          const bodyText = await imgRes.text();
+          const err: any = new Error(`OpenAI image download error: ${imgRes.status} ${summarizeOpenAIError(imgRes.status, bodyText)}`);
+          err.status = imgRes.status;
+          throw err;
+        }
+        const buf = await imgRes.arrayBuffer();
+        const base64 = arrayBufferToBase64(buf);
+        return `data:image/png;base64,${base64}`;
+      }
+
+      throw new Error('OPENAI_IMAGE_NO_DATA');
+    } catch (e: any) {
+      lastErr = e;
+      const msg = (e?.message || '').toLowerCase();
+      const isTimeout = msg.includes('aborted') || msg.includes('timeout');
+      if ((isTimeout || e?.status === 429 || e?.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
+        await sleep(500 * Math.pow(2, attempt));
+        continue;
+      }
+      break;
+    }
+  }
+
+  throw lastErr || new Error('OpenAI image request failed');
+}
+
+function midjourneyConfigured(): boolean {
+  const key = (Deno.env.get('MIDJOURNEY_API_KEY') || '').trim();
+  const url = (Deno.env.get('MIDJOURNEY_API_URL') || '').trim();
+  return Boolean(key && url);
+}
+
+function stabilityConfigured(): boolean {
+  const key = (Deno.env.get('STABILITY_API_KEY') || '').trim();
+  return Boolean(key);
+}
+
+function normalizeImageProviderOrder(order: any): Array<'openai' | 'stability' | 'midjourney'> {
+  if (!Array.isArray(order)) return [];
+  const normalized: Array<'openai' | 'stability' | 'midjourney'> = [];
+  for (const raw of order) {
+    const v = String(raw || '').trim().toLowerCase();
+    if (v === 'openai' || v === 'stability' || v === 'midjourney') normalized.push(v as any);
+  }
+  return Array.from(new Set(normalized));
+}
+
+function parseImageProviderOrder(): Array<'openai' | 'stability' | 'midjourney'> {
+  const raw = (Deno.env.get('IMAGE_PROVIDER_ORDER') || 'openai,stability,midjourney').trim();
+  const parts = raw.split(/[\s,]+/).filter(Boolean);
+  return normalizeImageProviderOrder(parts);
+}
+
+function chooseImageProviderOrder(mode: string): Array<'openai' | 'stability' | 'midjourney'> {
+  const configured = parseImageProviderOrder();
+  if (configured.length <= 1) return configured;
+
+  if (mode === 'premium') {
+    return ['midjourney', 'openai', 'stability'].filter(p => configured.includes(p as any)) as any;
+  }
+  if (mode === 'realism') {
+    return ['openai', 'stability', 'midjourney'].filter(p => configured.includes(p as any)) as any;
+  }
+  if (mode === 'fast') {
+    return ['openai', 'stability', 'midjourney'].filter(p => configured.includes(p as any)) as any;
+  }
+
+  return ['openai', 'stability', 'midjourney'].filter(p => configured.includes(p as any)) as any;
+}
+
+async function callMidjourneyImageDataUrl(prompt: string): Promise<string> {
+  const apiKey = (Deno.env.get('MIDJOURNEY_API_KEY') || '').trim();
+  const apiUrl = (Deno.env.get('MIDJOURNEY_API_URL') || '').trim();
+  if (!apiKey || !apiUrl) throw new Error('MIDJOURNEY not configured');
+
+  const res = await fetchWithTimeout(
+    apiUrl,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({ prompt }),
+    },
+    OPENAI_IMAGE_TIMEOUT_MS
+  );
+
+  if (!res.ok) {
+    const bodyText = await res.text();
+    const err: any = new Error(`Midjourney image error: ${res.status} ${bodyText.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
+
+  const data = await res.json();
+  const b64 = data?.b64 || data?.base64 || data?.image_base64;
+  if (typeof b64 === 'string' && b64.trim()) {
+    return `data:image/png;base64,${b64.trim()}`;
+  }
+
+  const url = data?.url || data?.image_url;
+  if (typeof url === 'string' && url.trim()) {
+    const imgRes = await fetchWithTimeout(url.trim(), { method: 'GET' }, OPENAI_IMAGE_TIMEOUT_MS);
+    if (!imgRes.ok) {
+      const bodyText = await imgRes.text();
+      const err: any = new Error(`Midjourney image download error: ${imgRes.status} ${bodyText.slice(0, 200)}`);
+      err.status = imgRes.status;
+      throw err;
+    }
+    const buf = await imgRes.arrayBuffer();
+    const base64 = arrayBufferToBase64(buf);
+    return `data:image/png;base64,${base64}`;
+  }
+
+  throw new Error('MIDJOURNEY_IMAGE_NO_DATA');
+}
+
+async function callStabilityImageDataUrl(prompt: string): Promise<string> {
+  const apiKey = (Deno.env.get('STABILITY_API_KEY') || '').trim();
+  if (!apiKey) throw new Error('STABILITY_API_KEY not set');
+
+  const model = (Deno.env.get('STABILITY_IMAGE_MODEL') || 'stable-diffusion-xl-1024-v1-0').trim();
+  const apiUrl = (Deno.env.get('STABILITY_API_URL') || `https://api.stability.ai/v1/generation/${model}/text-to-image`).trim();
+
+  const res = await fetchWithTimeout(
+    apiUrl,
+    {
+      method: 'POST',
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: content },
-        ],
-        max_tokens: safeMaxTokens,
-        temperature: 0.2,
+        text_prompts: [{ text: prompt }],
+        cfg_scale: 7,
+        height: 1024,
+        width: 1024,
+        samples: 1,
+        steps: 30,
       }),
-    });
+    },
+    OPENAI_IMAGE_TIMEOUT_MS
+  );
 
-    const data = await response.json();
-    const elapsed = Date.now() - startTime;
-    console.log(`[callOpenAIVision] Response in ${elapsed}ms, status: ${response.status}`);
-    
-    if (data.error) {
-      console.error(`[callOpenAIVision] API error:`, data.error);
-      throw new Error(formatOpenAIError(data.error, response.status));
-    }
-    
-    const result = data.choices?.[0]?.message?.content || "";
-    console.log(`[callOpenAIVision] Success, result length: ${result.length} chars`);
-    return result;
-  } catch (error: any) {
-    console.error(`[callOpenAIVision] Error:`, error.message);
-    throw error;
+  if (!res.ok) {
+    const bodyText = await res.text();
+    const err: any = new Error(`Stability image error: ${res.status} ${bodyText.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
   }
+
+  const data = await res.json();
+  const b64 = data?.artifacts?.[0]?.base64;
+  if (typeof b64 === 'string' && b64.trim()) {
+    return `data:image/png;base64,${b64.trim()}`;
+  }
+
+  throw new Error('STABILITY_IMAGE_NO_DATA');
 }
 
-Deno.serve(async (req) => {
-  let cors = corsHeaders;
+async function generateModuleImageDataUrl(params: { title: string; bullets?: string[]; language?: string }): Promise<string> {
+  const title = String(params?.title || 'Study module').slice(0, 140);
+  const bullets = Array.isArray(params?.bullets) ? params.bullets.slice(0, 8).map((b) => String(b).trim()).filter(Boolean) : [];
+
+  const focus = bullets.length > 0 ? bullets.join(' | ') : '';
+  const prompt = `Create a clean educational illustration representing the topic: "${title}".
+
+Focus concepts (for guidance): ${focus || 'general key concepts'}.
+
+Rules:
+- No text, no letters, no words, no numbers.
+- No logos, no watermarks.
+- Simple, clear visual style suitable for study material.
+- High contrast shapes/icons; avoid clutter.
+`;
+
+  // Educational illustrations use the realism model by default (best effort).
+  return await callOpenAIImageDataUrl(prompt, 'gpt-image-1');
+}
+
+async function generateImageDataUrl(prompt: string, imageMode?: string): Promise<string> {
+  const p = String(prompt || '').trim();
+  if (!p) {
+    const err: any = new Error('Missing image prompt. Example: /image a neon brain studying');
+    err.status = 400;
+    throw err;
+  }
+
+  const rawMode = String(imageMode || 'default').trim().toLowerCase();
+  const mode =
+    rawMode === 'mj' || rawMode === 'midjourney'
+      ? 'premium'
+      : rawMode === 'nb' || rawMode === 'nano' || rawMode === 'banana'
+        ? 'realism'
+        : rawMode === 'fast' || rawMode === 'speed'
+          ? 'fast'
+          : rawMode;
+
+  const clipped = p.slice(0, 1200);
+  const enhancedPrompt = `${clipped}\n\nStyle: professional, high-quality, clean lighting, sharp focus, modern, no text, no watermark.`;
+
+  const providers = chooseImageProviderOrder(mode);
+  let lastErr: any;
+
+  for (const provider of providers) {
+    try {
+      if (provider === 'midjourney') {
+        if (!midjourneyConfigured()) throw new Error('MIDJOURNEY not configured');
+        return await callMidjourneyImageDataUrl(enhancedPrompt);
+      }
+      if (provider === 'stability') {
+        if (!stabilityConfigured()) throw new Error('STABILITY_API_KEY not set');
+        return await callStabilityImageDataUrl(enhancedPrompt);
+      }
+      if (provider === 'openai') {
+        const preferredModel =
+          mode === 'premium'
+            ? 'dall-e-3'
+            : mode === 'realism'
+              ? 'gpt-image-1'
+              : mode === 'fast'
+                ? 'gpt-image-1'
+                : 'gpt-image-1';
+        return await callOpenAIImageDataUrl(enhancedPrompt, preferredModel);
+      }
+    } catch (e: any) {
+      lastErr = e;
+      console.warn('[openai-proxy] Image provider failed:', provider, String(e?.message || e).slice(0, 200));
+      continue;
+    }
+  }
+
+  const err: any = lastErr || new Error('No image provider configured');
+  err.status = err.status || 503;
+  throw err;
+}
+
+// ========== AI-BASED VENDOR DETECTION ==========
+async function detectVendorAI(content: string, meta?: LlmCallMeta): Promise<{ vendor: string; category: string; certifications: string[]; confidence: string }> {
+  const sample = content.slice(0, 15000);
+  
+  const vendorList = Object.keys(VENDOR_KNOWLEDGE).join(", ");
+  
+  const prompt = `Analyze this document and identify:
+1. The technology vendor or domain. Choose from: ${vendorList}, or other if not in list
+2. The category (e.g., Networking, Cloud Computing, Security, Programming, Database, etc.)
+3. Any specific certifications mentioned (e.g., CCNA, AWS SAA, OSCP, CISSP, etc.)
+4. Confidence level (high, medium, low)
+
+Return ONLY valid JSON:
+{"vendor": "...", "category": "...", "certifications": ["..."], "confidence": "high|medium|low"}
+
+Document content:
+${sample}`;
 
   try {
-    cors = enforceCors(req);
-
-    if (req.method === 'OPTIONS') {
-      return new Response('ok', { headers: cors });
-    }
-
-    rateLimit(req);
-    const user = await getAuthUser(req);
-
-    const { action, content, language, isCombine, chunkInfo, includeImages, imageUrls, questionCount, totalPages, pageCount, style, useAnimations, documentId, ...body } = await req.json();
-
-    // ========== RBAC: Role Validation ==========
-    /**
-     * RBAC: Validate user role and permissions before processing
-     * 
-     * 1. Fetch user's role from database
-     * 2. Check if action is allowed for this role
-     * 3. If documentId provided, verify document access
-     * 
-     * This provides server-side enforcement in addition to RLS policies
-     */
-    const userRole = await getUserRole(user.id);
-    console.log(`[RBAC] User ${user.id} has role: ${userRole}, action: ${action}`);
+    const result = await callOpenAI([
+      { role: "system", content: "You are an expert at identifying IT certifications, vendors, and technical domains. Be precise in vendor identification." },
+      { role: "user", content: prompt }
+    ], 500, 0.1, undefined, meta);
     
-    // Check if action is allowed for user's role
-    if (!canPerformAction(userRole, action)) {
-      console.warn(`[RBAC] Action denied: ${action} not allowed for role ${userRole}`);
-      return new Response(JSON.stringify({ 
-        error: 'Permission denied: Your role does not allow this action',
-        code: 'RBAC_ACTION_DENIED',
-        role: userRole,
-        action: action
-      }), {
-        status: 403,
-        headers: { ...cors, "Content-Type": "application/json" },
-      });
+    const match = result.match(/\{[\s\S]*\}/);
+    if (match) {
+      return JSON.parse(match[0]);
     }
-    
-    // If documentId is provided, verify access to that specific document
-    if (documentId) {
-      const hasDocumentAccess = await canAccessDocument(user.id, documentId);
-      if (!hasDocumentAccess) {
-        console.warn(`[RBAC] Document access denied: User ${user.id} cannot access document ${documentId}`);
-        return new Response(JSON.stringify({ 
-          error: 'Permission denied: You do not have access to this document',
-          code: 'RBAC_DOCUMENT_DENIED',
-          documentId: documentId
-        }), {
-          status: 403,
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-    }
-    // ========== END RBAC Validation ==========
-
-    if (content && typeof content === 'string' && content.length > MAX_CONTENT_LENGTH) {
-      return new Response(JSON.stringify({ error: 'Content too large' }), {
-        status: 413,
-        headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-
-    let result;
-    let systemPrompt;
-    const hasImages = imageUrls && imageUrls.length > 0;
-    const hasContent = content && content.length > 0;
-
-    switch (action) {
-      case 'summarize': {
-        // VALIDATION: Check if content is sufficient
-        if (!hasContent && !hasImages) {
-          console.warn('[summarize] No content or images provided');
-          return new Response(JSON.stringify({ 
-            summary: 'Unable to generate summary: No content found in the document. Please ensure the document has extractable text.',
-            userId: user.id 
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        // Detect if content is Cisco-related for specialized handling
-        const ciscoDetection = detectCiscoContent(content || '');
-        console.log('[summarize] Cisco detection:', ciscoDetection.isCisco, 'Topics:', ciscoDetection.topics.join(', '));
+  } catch (e) {
+    // Stateless logging: never include document content.
+    console.error("Vendor detection error:", String((e as any)?.message || e).slice(0, 200));
+  }
   
-        // Build a tuned system prompt using prompt builder (Cisco-aware)
-        systemPrompt = buildSystemPrompt('summarize', { 
-          isCombine, 
-          chunkInfo,
-          isCisco: ciscoDetection.isCisco,
-          ciscoTopics: ciscoDetection.topics
-        }, language);
-        
-        // If images are available and either text is small or includeImages explicitly requested,
-        // use the vision-capable endpoint to produce a multimodal summary that references images.
-        if (hasImages && (includeImages || !hasContent || content.length < 800)) {
-          console.log('[summarize] Using Vision API for multimodal summarization');
-          const visionPrompt = `Create a comprehensive STUDY SUMMARY using both the text and the images. Include references to images where relevant (e.g., "see image on page X"), and produce the same structured study-friendly format as the system prompt. Respond in ${language || 'English'}.`;
-          result = await callOpenAIVision(systemPrompt, imageUrls, `Summarize this content and images:\n\n${content}\n\nInstructions: ${visionPrompt}`, 8192);
-        } else {
-          // Add language directive if requested
-          const langPrefix = language && language !== 'en' ? `Respond in ${language}. ` : '';
-          result = await callOpenAI(systemPrompt, `${langPrefix}Create a comprehensive, study-friendly summary of this content (${content.length} characters):\n\n${content}`, 8192, 0.3);
-        }
-        
-        return new Response(JSON.stringify({ summary: result, userId: user.id }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
+  return { vendor: "General", category: "Technical Document", certifications: [], confidence: "low" };
+}
 
-      case "quiz": {
-        // VALIDATION: Check if content is sufficient
-        if (!hasContent || content.length < 100) {
-          console.warn('[quiz] Content too short:', content?.length || 0);
-          return new Response(JSON.stringify({ 
-            questions: [],
-            error: 'Unable to generate quiz: Document content is too short or empty.',
-            userId: user.id 
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        // Use let for quiz-specific prompt (don't redeclare with const)
-        const quizSystemPrompt = `Create ${questionCount || 10} quiz questions based ONLY on the document content provided.
-
-CRITICAL ACCURACY RULES:
-- Questions must be answerable ONLY from information in the document
-- Correct answers must be EXACTLY as stated in the document
-- DO NOT create questions requiring external knowledge
-- Wrong options should be plausible but clearly incorrect per the document
-- Include page references for where EACH answer can be verified
-
-Return ONLY valid JSON array: [{"question":"...","options":["A","B","C","D"],"correctAnswer":0,"explanation":"The document states on page X: '...'","pageRef":X}]
-
-Create questions from different parts of the document. Every question must be verifiable from the source text.`;
-        
-        result = await callOpenAI(quizSystemPrompt, `Create quiz questions using ONLY information from this document:\n\n${content}`, 4096, 0.3);
-        
-        try {
-          const match = result.match(/\[[\s\S]*\]/);
-          if (match) {
-            return new Response(JSON.stringify({ questions: JSON.parse(match[0]), userId: user.id }), {
-              headers: { ...cors, "Content-Type": "application/json" },
-            });
-          }
-        } catch {}
-        
-        return new Response(JSON.stringify({ questions: [], userId: user.id }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-
-      case "studyGuide": {
-        // VALIDATION: Check if content or images are available
-        if (!hasContent && !hasImages) {
-          console.warn('[studyGuide] No content or images provided');
-          return new Response(JSON.stringify({ 
-            studyGuide: null,
-            summary: 'Unable to generate study guide: No content found in the document.',
-            userId: user.id 
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        const studyGuidePrompt = `Create a comprehensive and ACCURATE study guide covering the ENTIRE document.
-
-CRITICAL ACCURACY RULES:
-- ONLY include terms, concepts, and facts that EXPLICITLY appear in the document
-- DO NOT add external information or general knowledge
-- Quote definitions exactly as they appear in the source
-- Use the same terminology as the document
-- Page refs must match where information actually appears
-
-Return ONLY valid JSON in this format:
-{
-  "title": "Study Guide: [Document Topic]",
-  "sections": [
-    {
-      "title": "Section Title (e.g., Chapter 1: Introduction)",
-      "pageRef": 1,
-      "keyPoints": [
-        {"point": "Key concept or term explained", "pageRef": 1},
-        {"point": "Another important point", "pageRef": 2}
-      ]
+// ========== GET VENDOR EXPERTISE ==========
+function getVendorExpertise(vendor: string): { expertise: string; examTips: string; keyAreas: string[] } | null {
+  // Try exact match first
+  if (VENDOR_KNOWLEDGE[vendor]) return VENDOR_KNOWLEDGE[vendor];
+  
+  // Try partial match
+  const vendorLower = vendor.toLowerCase();
+  for (const [key, value] of Object.entries(VENDOR_KNOWLEDGE)) {
+    if (key.toLowerCase().includes(vendorLower) || vendorLower.includes(key.toLowerCase())) {
+      return value;
     }
-  ],
-  "keyTerms": [
-    {"term": "Term Name", "definition": "Definition from document", "pageRef": 5}
-  ],
-  "reviewChecklist": [
-    {"item": "Understand concept X", "pageRef": 3},
-    {"item": "Know how to apply Y", "pageRef": 7}
+  }
+  
+  return null;
+}
+
+// ========== RICH SUMMARIZE ==========
+async function summarize(content: string, language = "en", meta?: LlmCallMeta): Promise<string> {
+  const truncated = content.slice(0, MAX_CONTENT_LENGTH);
+  
+  // First, detect vendor using AI
+  const vendorInfo = await detectVendorAI(truncated, meta);
+  const vendorExpertise = getVendorExpertise(vendorInfo.vendor);
+  
+  const vendorContext = vendorInfo.vendor !== "General" 
+    ? `This is a **${vendorInfo.vendor}** document in the **${vendorInfo.category}** domain.${vendorInfo.certifications.length > 0 ? ` Related certifications: ${vendorInfo.certifications.join(', ')}.` : ''}`
+    : `This is a **${vendorInfo.category}** document.`;
+  
+  const expertiseContext = vendorExpertise 
+    ? `\n\n**Key Areas to Focus On:** ${vendorExpertise.keyAreas.join(', ')}\n**Exam Tips:** ${vendorExpertise.examTips}`
+    : '';
+  
+  const langInstr = language !== 'en' ? `\n\n**IMPORTANT: Write the entire response in ${language === 'ar' ? 'Arabic' : language}.**` : '';
+  
+  const systemPrompt = vendorExpertise 
+    ? vendorExpertise.expertise + " Create comprehensive, detailed study guides with proper markdown formatting, tables, and visual organization. Make the content thorough and exam-focused."
+    : "You are an expert technical writer and exam preparation specialist. Create comprehensive, detailed study guides with proper markdown formatting, tables, and visual organization.";
+  
+  const prompt = `${vendorContext}${expertiseContext}
+
+Create a **comprehensive, detailed study guide** that is at least 2000 words. This should be thorough enough to help someone prepare for an exam.
+
+## Required Format:
+
+### 📚 Executive Overview
+A detailed introduction explaining what this document covers, its importance, and learning objectives (2-3 paragraphs).
+
+### 🎯 Key Concepts & Topics
+For EACH major topic in the document:
+- **Topic Name**: Detailed explanation
+- Sub-concepts with bullet points
+- Technical details and specifications
+- Why it matters for the exam
+
+### 📊 Comparison Tables
+Create comparison tables where relevant. Example format:
+| Feature | Description | Use Case | Exam Tip |
+|---------|-------------|----------|----------|
+| ... | ... | ... | ... |
+
+### 🔧 Technical Deep Dive
+- Detailed technical explanations
+- Command examples or code snippets (if applicable)
+- Architecture diagrams described in text
+- Step-by-step procedures
+
+### 📝 Important Definitions
+| Term | Definition | Example |
+|------|------------|---------|
+| ... | ... | ... |
+
+### ⚠️ Critical Exam Points
+- Must-know facts (bullet list)
+- Common exam traps to avoid
+- Key numbers, limits, or thresholds to memorize
+
+### 💡 Practical Applications
+- Real-world scenarios
+- Use cases with examples
+- Best practices
+
+### 🔗 Relationships & Dependencies  
+- How concepts connect to each other
+- Prerequisites and dependencies
+- Flow diagrams described in text
+
+### ✅ Quick Review Checklist
+A checklist of items to review before the exam.
+
+${langInstr}
+
+---
+
+**Document Content:**
+${truncated}`;
+
+  return await callOpenAI([
+    { role: "system", content: systemPrompt },
+    { role: "user", content: prompt }
+  ], 16000, 0.4, undefined, meta);
+}
+
+// ========== MODULE SUMMARIZE (STRICT JSON) ==========
+async function summarizeModuleJSON(params: {
+  title: string;
+  content: string;
+  language?: string;
+  source?: { pageStart?: number; pageEnd?: number; inputChars?: number };
+  meta?: LlmCallMeta;
+}): Promise<any> {
+  const title = (params.title || '').toString().slice(0, 200);
+  const language = params.language || 'en';
+  const moduleContent = (params.content || '').toString();
+
+  if (!moduleContent || moduleContent.trim().length < 50) {
+    return {
+      title,
+      moduleId: crypto.randomUUID(),
+      confidence: 'LOW',
+      content: {
+        executiveSummary: [],
+        textBlocks: ['Not enough content to summarize for this module.'],
+        tables: [],
+        diagrams: [],
+        equations: [],
+        visuals: [],
+      },
+    };
+  }
+
+  // Guardrail: do not silently truncate; force client to chunk modules if too large.
+  if (moduleContent.length > MAX_MODULE_CONTENT_LENGTH) {
+    const err: any = new Error(`MODULE_TOO_LARGE: ${moduleContent.length} chars (max ${MAX_MODULE_CONTENT_LENGTH}). Split into smaller modules.`);
+    err.status = 413;
+    throw err;
+  }
+
+  const langInstr = language !== 'en'
+    ? `Write the entire response in ${language === 'ar' ? 'Arabic' : language}.`
+    : 'Write the entire response in English.';
+
+  // Vendor/persona awareness (consistent with summarize/chat).
+  const vendorInfo = moduleContent.length > 200
+    ? await detectVendorAI(moduleContent.slice(0, 10000), params.meta)
+    : { vendor: "General", category: "General" };
+  const vendorExpertise = getVendorExpertise(vendorInfo.vendor || 'General');
+  const vendorContext = (vendorInfo?.vendor && vendorInfo.vendor !== 'General')
+    ? `\nVendor context: ${vendorInfo.vendor} (${vendorInfo.category || 'General'}).`
+    : `\nVendor context: General (${vendorInfo.category || 'General'}).`;
+  const expertiseContext = vendorExpertise
+    ? `\nFocus areas: ${vendorExpertise.keyAreas.join(', ')}\nExam tips: ${vendorExpertise.examTips}`
+    : '';
+
+  const system = `${vendorExpertise ? vendorExpertise.expertise + "\n" : ''}You are a careful technical summarizer.
+Rules:
+- Use ONLY the provided module content. Do NOT invent facts.
+- If information is missing, say "Not specified".
+- Be explicit when something is inferred.
+- Do NOT include document metadata (author names, filenames, timestamps, copyright/footer text).
+- Output MUST be valid JSON only (no markdown, no commentary, no code fences).
+- Write in a professional, exam-prep tone: crisp, structured, and actionable.
+- ${langInstr}${vendorContext}${expertiseContext}`;
+
+  const user = `Summarize this module as a standalone unit.
+
+Module title: ${title}
+Source pages: ${params.source?.pageStart ?? null} - ${params.source?.pageEnd ?? null}
+Input chars: ${moduleContent.length}
+
+Return STRICT JSON with this schema:
+{
+  "moduleId": "string",
+  "title": "string",
+  "confidence": "LOW"|"MEDIUM"|"HIGH",
+  "content": {
+    "executiveSummary": ["string", ...],
+    "textBlocks": ["string", ...],
+    "tables": [{"headers": ["string"], "rows": [["string"]]}],
+    "diagrams": [{"type": "mermaid", "code": "string"}],
+    "equations": ["string", ...],
+    "visuals": ["string", ...]
+  }
+}
+
+Requirements:
+- executiveSummary: 6-12 bullets (each bullet must be short, exam-focused, and specific).
+- textBlocks: 6-14 short blocks. Prefer: definitions, steps, pitfalls, commands, checks.
+- tables: ALWAYS include 1-2 tables derived from the content. If the module has no explicit table/comparison, create a summary table such as:
+  - "Concept | Meaning | How to recognize it | Exam tip" OR
+  - "Command/Term | Purpose | Key notes".
+  Use "Not specified" where needed. Do NOT invent facts.
+- diagrams: ALWAYS include at least 1 mermaid diagram derived from the content.
+  - If a process/flow exists: use flowchart.
+  - Otherwise: create a concept map (graph TD) connecting 6-12 key nodes mentioned in the module.
+- equations: include ONLY equations actually present/derivable from the module; otherwise [].
+- visuals: include 2-6 short suggestions for visuals to draw (diagrams, checklists, topology sketches) based on what the module discusses. If nothing is clear, use generic-but-safe study visuals like "Topology sketch" or "Checklist", still grounded in the module topic.
+- Do NOT include author names, filename, timestamps, page numbers, or copyright lines.
+
+Module content:
+${moduleContent}`;
+
+  let parsed: any;
+  try {
+    parsed = await callOpenAIJson(
+      [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      4096,
+      0.2,
+    );
+  } catch (e: any) {
+    const fallback = await callOpenAI(
+      [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      4096,
+      0.2,
+      undefined,
+      params.meta,
+    );
+    const match = String(fallback || '').match(/\{[\s\S]*\}/);
+    if (!match) {
+      return {
+        title,
+        moduleId: crypto.randomUUID(),
+        confidence: 'LOW',
+        content: {
+          executiveSummary: [],
+          textBlocks: [fallback || 'Unable to parse model output as JSON.'],
+          tables: [],
+          diagrams: [],
+          equations: [],
+          visuals: [],
+        },
+      };
+    }
+    parsed = JSON.parse(match[0]);
+  }
+  // Ensure basic fields exist
+  parsed.moduleId = parsed.moduleId || crypto.randomUUID();
+  parsed.title = parsed.title || title;
+  parsed.confidence = (parsed.confidence === 'HIGH' || parsed.confidence === 'MEDIUM' || parsed.confidence === 'LOW') ? parsed.confidence : 'MEDIUM';
+  parsed.content = parsed.content || {};
+  parsed.content.executiveSummary = Array.isArray(parsed.content.executiveSummary) ? parsed.content.executiveSummary : [];
+  parsed.content.textBlocks = Array.isArray(parsed.content.textBlocks) ? parsed.content.textBlocks : [];
+  parsed.content.tables = Array.isArray(parsed.content.tables) ? parsed.content.tables : [];
+  parsed.content.diagrams = Array.isArray(parsed.content.diagrams) ? parsed.content.diagrams : [];
+  parsed.content.equations = Array.isArray(parsed.content.equations) ? parsed.content.equations : [];
+  parsed.content.visuals = Array.isArray(parsed.content.visuals) ? parsed.content.visuals : [];
+  return parsed;
+}
+
+// ========== QUIZ GENERATION ==========
+async function generateQuiz(
+  content: string,
+  count = 10,
+  difficulty = "medium",
+  language = "en",
+  focusTopics?: string[],
+  meta?: LlmCallMeta,
+): Promise<any[]> {
+  const truncated = content.slice(0, MAX_CONTENT_LENGTH);
+  const vendorInfo = await detectVendorAI(truncated, meta);
+  const vendorExpertise = getVendorExpertise(vendorInfo.vendor);
+  
+  const vendorContext = vendorInfo.vendor !== "General" 
+    ? `This is ${vendorInfo.vendor} ${vendorInfo.category} exam material.${vendorInfo.certifications.length > 0 ? ` Target certifications: ${vendorInfo.certifications.join(', ')}.` : ''}`
+    : '';
+  
+  const examStyle = vendorExpertise 
+    ? `\n\nExam Style Tips: ${vendorExpertise.examTips}\nFocus Areas: ${vendorExpertise.keyAreas.join(', ')}`
+    : '';
+  
+  const systemPrompt = vendorExpertise
+    ? vendorExpertise.expertise + " Generate professional exam questions that match the real certification exam style."
+    : "Generate professional exam questions. Return ONLY valid JSON array.";
+  
+  const focusBlock = (Array.isArray(focusTopics) && focusTopics.length > 0)
+    ? `\n\nFOCUS TOPICS (ONLY generate questions from these topics):\n- ${focusTopics.map(t => String(t).trim()).filter(Boolean).slice(0, 20).join('\n- ')}`
+    : '';
+
+  const prompt = `${vendorContext}${examStyle}${focusBlock}
+
+Generate ${count} ${difficulty} difficulty multiple-choice questions in professional exam format.
+
+Requirements:
+- Questions should test understanding, not just memorization
+- Include scenario-based questions where appropriate
+- Explanations should be educational and detailed
+- Match the style of real certification exams
+
+Return JSON array: [{"question": "...", "options": ["A. ...", "B. ...", "C. ...", "D. ..."], "correctAnswer": 0, "explanation": "..."}]
+
+${language !== 'en' ? `Language: ${language === 'ar' ? 'Arabic' : language}` : ''}
+
+Content:
+${truncated}`;
+
+  const result = await callOpenAI([
+    { role: "system", content: systemPrompt },
+    { role: "user", content: prompt }
+  ], 8000, 0.3, undefined, meta);
+  
+  try {
+    const match = result.match(/\[[\s\S]*\]/);
+    return match ? JSON.parse(match[0]) : [];
+  } catch {
+    return [];
+  }
+}
+
+// ========== STUDY GUIDE ==========
+async function generateStudyGuide(content: string, language = "en", meta?: LlmCallMeta): Promise<string> {
+  const truncated = content.slice(0, MAX_CONTENT_LENGTH);
+  const vendorInfo = await detectVendorAI(truncated, meta);
+  const vendorExpertise = getVendorExpertise(vendorInfo.vendor);
+  
+  const vendorContext = vendorInfo.vendor !== "General"
+    ? `for **${vendorInfo.vendor} ${vendorInfo.category}**${vendorInfo.certifications.length > 0 ? ` (${vendorInfo.certifications.join(', ')})` : ''}`
+    : '';
+
+  const expertiseContext = vendorExpertise 
+    ? `\n\n**Focus Areas:** ${vendorExpertise.keyAreas.join(', ')}\n**Exam Approach:** ${vendorExpertise.examTips}`
+    : '';
+
+  const systemPrompt = vendorExpertise
+    ? vendorExpertise.expertise + " Create detailed study guides that match real certification exam requirements."
+    : "Create detailed study guides with markdown formatting, tables, and organized sections.";
+
+  const prompt = `Create a comprehensive study guide ${vendorContext}:${expertiseContext}
+
+## 📖 Study Guide Structure:
+
+### 1. Overview & Objectives
+- What this material covers
+- Learning objectives
+- Prerequisites
+
+### 2. Topic Breakdown
+For each major topic:
+| Topic | Key Points | Difficulty | Time to Master |
+|-------|------------|------------|----------------|
+
+### 3. Core Concepts (Detailed)
+- Each concept explained thoroughly
+- Examples and use cases
+- Common misconceptions
+
+### 4. Hands-On Practice Areas
+- Lab exercises suggestions
+- Practice scenarios
+- Self-assessment questions
+
+### 5. Exam Strategy
+- Topics by weight/importance
+- Time management tips
+- Question patterns to expect
+
+### 6. Quick Reference
+- Commands/syntax cheat sheet (if applicable)
+- Key formulas or procedures
+- Acronyms and definitions table
+
+${language !== 'en' ? `\n**Write in ${language === 'ar' ? 'Arabic' : language}.**` : ''}
+
+Content:
+${truncated}`;
+
+  return await callOpenAI([
+    { role: "system", content: systemPrompt },
+    { role: "user", content: prompt }
+  ], 12000, 0.4, undefined, meta);
+}
+
+// ========== STUDY PLAN (TABLE) ==========
+async function generateStudyPlan(content: string, language = 'en', meta?: LlmCallMeta): Promise<{ topic: string; hours: number }[]> {
+  const truncated = (content || '').slice(0, MAX_CONTENT_LENGTH);
+  const vendorInfo = truncated.length > 200 ? await detectVendorAI(truncated, meta) : { vendor: 'General', category: 'General' };
+  const vendorExpertise = getVendorExpertise(vendorInfo.vendor);
+
+  const systemPrompt = vendorExpertise
+    ? `${vendorExpertise.expertise}\nYou are an exam-prep coach. Create a concise study plan table.`
+    : 'You are an exam-prep coach. Create a concise study plan table.';
+
+  const langInstr = language !== 'en'
+    ? `Write topic names in ${language === 'ar' ? 'Arabic' : language}.`
+    : 'Write topic names in English.';
+
+  const prompt = `Create a study plan table for this document.
+
+Requirements:
+- Return ONLY valid JSON (no markdown).
+- 8 to 16 rows.
+- Each row has: topic (short), hours (number between 0.5 and 6).
+- Topics must be grounded in the provided content and reflect exam-important areas.
+- Total hours should be roughly 10 to 40.
+
+Return JSON with this schema:
+{
+  "plan": [
+    { "topic": "...", "hours": 2.5 },
+    { "topic": "...", "hours": 1 }
   ]
 }
 
-Create 5-10 sections covering ALL major topics with accurate page references.
-Include 10-20 key terms and 5-10 review checklist items.`;
-        
-        // If we have images but limited text, use vision API
-        if (hasImages && (!hasContent || content.length < 500)) {
-          console.log("Using Vision API for study guide with", imageUrls.length, "images");
-          
-          const visionPrompt = `Analyze these document pages and create a comprehensive study guide. Look at all the images carefully to extract the main topics, key concepts, and important information.
+Context: ${vendorInfo.vendor || 'General'} (${vendorInfo.category || 'General'}).
+${vendorExpertise ? `Focus areas: ${vendorExpertise.keyAreas.join(', ')}` : ''}
+${langInstr}
 
-Return ONLY valid JSON in this format:
-{
-  "title": "Study Guide: [Document Topic]",
-  "sections": [
-    {
-      "title": "Section Title",
-      "pageRef": 1,
-      "keyPoints": [
-        {"point": "Key concept explained", "pageRef": 1}
-      ]
+Document Content:
+${truncated}`;
+
+  const data = await callOpenAIJson(
+    [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: prompt },
+    ],
+    2000,
+    0.2,
+  );
+
+  const plan = Array.isArray((data as any)?.plan) ? (data as any).plan : [];
+  return plan
+    .map((r: any) => ({ topic: String(r?.topic || '').trim(), hours: Number(r?.hours || 0) }))
+    .filter((r: any) => r.topic && Number.isFinite(r.hours) && r.hours > 0);
+}
+
+// ========== FLASHCARDS ==========
+async function generateFlashcards(content: string, count = 20, language = "en", meta?: LlmCallMeta): Promise<any[]> {
+  const truncated = content.slice(0, MAX_CONTENT_LENGTH);
+  const vendorInfo = await detectVendorAI(truncated, meta);
+  const vendorExpertise = getVendorExpertise(vendorInfo.vendor);
+  
+  const systemPrompt = vendorExpertise
+    ? vendorExpertise.expertise + " Create flashcards that focus on exam-relevant content."
+    : "Create educational flashcards. Return ONLY valid JSON array.";
+  
+  const focusAreas = vendorExpertise 
+    ? `\nKey areas to cover: ${vendorExpertise.keyAreas.join(', ')}`
+    : '';
+
+  const prompt = `Create ${count} high-quality flashcards${vendorInfo.vendor !== "General" ? ` for ${vendorInfo.vendor} ${vendorInfo.category} exam preparation` : ''}.${focusAreas}
+
+Requirements:
+- Mix of definition cards, concept cards, and scenario cards
+- Front should be clear and specific
+- Back should be concise but complete
+
+Return JSON array: [{"front": "Question or term", "back": "Answer or definition", "category": "concept|definition|scenario"}]
+
+${language !== 'en' ? `Language: ${language === 'ar' ? 'Arabic' : language}` : ''}
+
+Content:
+${truncated}`;
+
+  const result = await callOpenAI([
+    { role: "system", content: systemPrompt },
+    { role: "user", content: prompt }
+  ], 6000, 0.3, undefined, meta);
+  
+  try {
+    const match = result.match(/\[[\s\S]*\]/);
+    return match ? JSON.parse(match[0]) : [];
+  } catch {
+    return [];
+  }
+}
+
+// ========== CHAT ==========
+async function chat(
+  content: string,
+  question: string,
+  history: any[] = [],
+  meta?: LlmCallMeta,
+  agentId?: string,
+  opts?: { chatMindMode?: ChatMindMode; chatMindMemorySummary?: string; chatMindMemoryEnabled?: boolean }
+): Promise<string> {
+  // Handle undefined content gracefully
+  if (!content || typeof content !== 'string') {
+    content = '';
+  }
+  
+  // Keep chat fast: avoid extra vendor-detection AI call and keep context small.
+  const truncated = content.slice(0, 25000);
+
+  const selectedAgent = typeof agentId === 'string' ? agentId.trim() : '';
+  const agentExpertise = selectedAgent ? getVendorExpertise(selectedAgent) : null;
+
+  const systemPrompt = agentExpertise
+    ? `${agentExpertise.expertise}
+You are the MindSparkle ${selectedAgent} Agent.
+Be concise and clear by default. If the user asks for detail, expand.
+Use exam tips when helpful. Focus areas: ${agentExpertise.keyAreas.join(', ')}.
+If context is missing, ask 1 short clarifying question.
+Accuracy first: do not guess. If unsure, say you are not sure and suggest a next step.
+Prefer structured answers: short summary, then bullets/steps when useful.`
+    : "You are a helpful AI study assistant. Be concise and clear by default. If the user asks for detail, expand. If context is missing, ask 1 short clarifying question. Accuracy first: do not guess. If unsure, say you are not sure and suggest a next step. Prefer structured answers: short summary, then bullets/steps when useful.";
+
+  const isChatMindRequest = String(meta?.requestType || '') === 'chatMind' || String(meta?.requestType || '') === 'chatMindStream';
+  const mode = isChatMindRequest ? normalizeChatMindMode(opts?.chatMindMode) : 'general';
+  const memorySummary = isChatMindRequest && opts?.chatMindMemoryEnabled ? String(opts?.chatMindMemorySummary || '').trim() : '';
+  const memoryBlock = memorySummary ? `\n\nUser memory (opt-in; may be empty/partial):\n- ${memorySummary}` : '';
+
+  const identityGuidance = `
+Identity:
+- If the user asks "who developed you / who made you / who built you", answer: "MindSparkle was developed by Ahmed Nabhan. This assistant is powered by GPT-5.2 and may use multiple AI providers depending on the request." Keep it to 1–2 sentences.
+- Do not claim Ahmed Nabhan trained the underlying foundation model.
+- If the user asks what model you are using, say GPT-5.2.`;
+
+  const capabilityGuidance = `
+Capabilities:
+- If the user asks you to create a document, produce a well-structured output (Markdown by default) with a title, sections, and bullets.
+- If the user asks you to create a presentation, produce slide-by-slide content with slide titles and bullet points.
+- If the user asks for links, do NOT invent specific URLs you are unsure about. Prefer official documentation homepages and safe search queries.
+- If the user asks for an image, provide a short image prompt suggestion (no extra commentary).`;
+
+  const detectedLang = detectLanguageFromText(question || '');
+  const languageGuidance = languageInstruction(detectedLang);
+
+  // Web sources (best-effort). If available, we will include them and require citations.
+  // If enabled but unavailable, we will still add a Sources section explaining that.
+  let sources: WebSource[] = [];
+  const wantsSources = shouldUseWebSearchForChat(question);
+  if (wantsSources) {
+    try {
+      sources = await webSearch(question, 5);
+    } catch (e: any) {
+      console.warn('[openai-proxy] Web search failed; continuing without sources:', String(e?.message || e).slice(0, 200));
+      sources = [];
     }
-  ],
-  "keyTerms": [
-    {"term": "Term", "definition": "Definition", "pageRef": 1}
-  ],
-  "reviewChecklist": [
-    {"item": "Understand concept", "pageRef": 1}
-  ]
-}`;
-          
-          result = await callOpenAIVision(studyGuidePrompt, imageUrls, visionPrompt, 4096);
-        } else {
-          // Respect language and vision options for study guides
-          if (hasImages && (!hasContent || content.length < 500)) {
-            console.log("Using Vision API for study guide with", imageUrls.length, "images");
-            const visionPrompt = `Analyze these document pages and create a comprehensive study guide. Return ONLY valid JSON in the specified study guide format. Respond in ${language || 'English'}.`;
-            result = await callOpenAIVision(studyGuidePrompt, imageUrls, visionPrompt, 4096);
-          } else {
-            // Use tuned prompt builder for studyGuide
-            const studyGuidePromptBuilt = buildSystemPrompt('studyGuide', {}, language);
-            const langPrefix = language && language !== 'en' ? `Respond in ${language}. ` : '';
-            result = await callOpenAI(studyGuidePromptBuilt, `${langPrefix}Create a structured study guide with page references using ONLY information from this document:\n\n${content}`, 4096, 0.2);
-          }
-        }
-        
-        try {
-          const match = result.match(/\{[\s\S]*\}/);
-          if (match) {
-            const studyGuide = JSON.parse(match[0]);
-            return new Response(JSON.stringify({ studyGuide, summary: result, userId: user.id }), {
-              headers: { ...cors, "Content-Type": "application/json" },
-            });
-          }
-        } catch (e) {
-          console.error("Study guide JSON parse error:", e);
-        }
-        
-        return new Response(JSON.stringify({ summary: result, userId: user.id }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
+  }
 
-      case "videoWithSlides": {
-        const docInfo = totalPages ? `${totalPages} page document` : (pageCount ? `${pageCount} page document` : 'document');
-        
-        // Use tuned prompt builder for video scripts
-        systemPrompt = buildSystemPrompt('videoWithSlides', {}, language, style, useAnimations);
-        // Use gpt-4o-mini for speed
-        result = await callOpenAI(systemPrompt, `Create an engaging, comprehensive video lesson covering this entire ${docInfo}. Make it professional, educational, and memorable:\n\n${content}`, 4096, 0.25, false);
-        
-        try {
-          const match = result.match(/\{[\s\S]*\}/);
-          if (match) {
-            const videoScript = JSON.parse(match[0]);
-            return new Response(JSON.stringify({ videoScript, userId: user.id }), {
-              headers: { ...cors, "Content-Type": "application/json" },
-            });
-          }
-        } catch (e) {
-          console.error("JSON parse error:", e);
-        }
-        
-        return new Response(JSON.stringify({ 
-          videoScript: { 
-            introduction: "Welcome to this lesson.", 
-            sections: [], 
-            conclusion: "Thank you for learning!" 
-          },
-          userId: user.id,
-        }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
+  const citationGuidance = sources.length > 0
+    ? `\n\nCitations:\n- You MUST cite sources using bracket numbers like [1], [2] inline.\n- After the answer, include a "Sources" section listing each source exactly once.\n- Do NOT invent URLs; only cite provided sources.`
+    : '';
 
-      // New: Process video chunks in parallel for large documents
-      case "videoChunk": {
-        const chunkInfo = body.chunkInfo || 'document section';
-        const animDirective = useAnimations === false ? '' : 'Include visualDirections array with animation cues.';
-        
-        const chunkPrompt = `You are creating video lesson sections. Return ONLY valid JSON array of sections for ${chunkInfo}:
+  const messages = [
+    { role: "system", content: systemPrompt + (isChatMindRequest ? (modeGuidance(mode) + memoryBlock) : '') + identityGuidance + capabilityGuidance + languageGuidance + citationGuidance },
+    ...(truncated.trim().length > 0
+      ? [{ role: "user", content: `DOCUMENT CONTEXT (may be partial):\n${truncated.slice(0, 12000)}` }]
+      : []),
+    ...(sources.length > 0
+      ? [{ role: 'user', content: `SOURCES (use for citations):\n\n${formatSourcesForPrompt(sources)}` }]
+      : []),
+    ...(Array.isArray(history) ? history.slice(-8) : []),
+    { role: "user", content: question || "Hello" }
+  ];
+
+  // Requirement: AI Chat uses GPT-5.2 (edge function will fall back if unavailable).
+  const providerOrder = chooseChatProviderOrder({ question, context: truncated, history });
+
+  // Model selection is configurable via env vars. These defaults keep current behavior.
+  const baseOpenAiModel = (Deno.env.get('OPENAI_CHAT_MODEL') || 'gpt-5.2').trim();
+  const baseGeminiModel = (Deno.env.get('GEMINI_CHAT_MODEL') || Deno.env.get('GEMINI_TEXT_MODEL') || '').trim();
+  const baseAnthropicModel = (Deno.env.get('ANTHROPIC_CHAT_MODEL') || Deno.env.get('ANTHROPIC_TEXT_MODEL') || 'claude-3-5-sonnet-latest').trim();
+
+  // Pick specialized models when requested.
+  const qLower = String(question || '').toLowerCase();
+  const ctxLen = String(truncated || '').length;
+
+  const hasCodeSignals =
+    qLower.includes('```') ||
+    qLower.includes('stack trace') ||
+    qLower.includes('exception') ||
+    qLower.includes('traceback') ||
+    qLower.includes('typescript') ||
+    qLower.includes('javascript') ||
+    qLower.includes('react') ||
+    qLower.includes('swift') ||
+    qLower.includes('kotlin') ||
+    qLower.includes('python') ||
+    qLower.includes('sql') ||
+    qLower.includes('bug') ||
+    qLower.includes('error');
+
+  const wantsSummarizeOrExtract =
+    qLower.includes('summarize') ||
+    qLower.includes('summary') ||
+    qLower.includes('tl;dr') ||
+    qLower.includes('extract') ||
+    qLower.includes('key points') ||
+    qLower.includes('main points') ||
+    qLower.includes('outline');
+
+  const wantsTranslate = qLower.includes('translate') || qLower.includes('ترجم') || qLower.includes('ترجمة');
+
+  const wantsCreative =
+    qLower.includes('write a story') ||
+    qLower.includes('poem') ||
+    qLower.includes('lyrics') ||
+    qLower.includes('creative') ||
+    qLower.includes('rewrite') ||
+    qLower.includes('make it sound') ||
+    qLower.includes('tone');
+
+  const modelOverrides: Partial<Record<LlmProvider, string>> = {
+    openai: baseOpenAiModel,
+    gemini: baseGeminiModel,
+    anthropic: baseAnthropicModel,
+  };
+
+  if (hasCodeSignals) {
+    modelOverrides.openai = (Deno.env.get('OPENAI_CHAT_MODEL_CODE') || modelOverrides.openai || '').trim();
+  }
+  if ((ctxLen > 12000 && wantsSummarizeOrExtract) || (ctxLen > 8000 && wantsTranslate)) {
+    modelOverrides.gemini = (Deno.env.get('GEMINI_CHAT_MODEL_LONG') || modelOverrides.gemini || '').trim();
+  }
+  if (wantsCreative) {
+    modelOverrides.anthropic = (Deno.env.get('ANTHROPIC_CHAT_MODEL_CREATIVE') || modelOverrides.anthropic || '').trim();
+  }
+
+  const answer = await callOpenAI(messages, 900, 0.35, modelOverrides.openai || "gpt-5.2", meta, providerOrder, modelOverrides);
+
+  // Optional verify pass (best-effort) to improve accuracy for general chat.
+  // Disabled by default; enable via env var to avoid doubling cost for all chats.
+  const enableVerify = parseOptionalBoolEnv('ENABLE_CHAT_VERIFY');
+  const verifyOnlyWithSources = parseOptionalBoolEnv('CHAT_VERIFY_ONLY_WITH_SOURCES');
+  const isGeneralChat = String(meta?.requestType || '') === 'chatMind' || String(meta?.requestType || '') === 'chat';
+  const looksFactual = (() => {
+    const q = String(question || '').toLowerCase();
+    if (!q) return false;
+    if (q.includes('latest') || q.includes('today') || q.includes('current') || q.includes('202') || q.includes('news')) return true;
+    if (q.startsWith('who ') || q.startsWith('what ') || q.startsWith('when ') || q.startsWith('where ') || q.startsWith('which ') || q.startsWith('how many ')) return true;
+    if (q.includes('price') || q.includes('cost') || q.includes('version') || q.includes('release') || q.includes('date')) return true;
+    return false;
+  })();
+
+  let verifiedAnswer = answer;
+  if (enableVerify && isGeneralChat && (wantsSources || looksFactual) && (!verifyOnlyWithSources || sources.length > 0)) {
+    try {
+      const verifierSystem = `You are a meticulous fact-checking editor.
+Rules:
+- If SOURCES are provided, ONLY make claims supported by SOURCES.
+- Keep existing citation markers like [1], [2] and do NOT invent new URLs.
+- If a claim is not supported, remove it or rewrite with uncertainty.
+- If the user question is ambiguous, ask 1 short clarifying question.
+- Be concise.`;
+
+      const verifierUser = `User question:\n${String(question || '').slice(0, 6000)}\n\nDraft answer:\n${String(answer || '').slice(0, 12000)}\n\nSOURCES (if any):\n${sources.length > 0 ? formatSourcesForPrompt(sources) : '(none)'}\n\nReturn an improved final answer (plain text).`;
+
+      const verifyMeta: LlmCallMeta | undefined = meta
+        ? { ...meta, requestType: `${String(meta.requestType)}_verify` }
+        : undefined;
+
+      verifiedAnswer = await callOpenAI(
+        [
+          { role: 'system', content: verifierSystem },
+          { role: 'user', content: verifierUser },
+        ],
+        900,
+        0.2,
+        modelOverrides.openai || 'gpt-5.2',
+        verifyMeta,
+        providerOrder,
+        modelOverrides,
+      );
+    } catch (e: any) {
+      console.warn('[openai-proxy] Verify pass failed; returning draft answer:', String(e?.message || e).slice(0, 200));
+      verifiedAnswer = answer;
+    }
+  }
+
+  // Ensure a sources section exists when sources are enabled.
+  if (wantsSources) {
+    const hasSourcesSection = /\n\s*sources\s*:?\s*\n/i.test(verifiedAnswer);
+    const sourcesText = sources.length > 0
+      ? formatSourcesForResponse(sources)
+      : `- (No web sources available for this answer)`;
+    return hasSourcesSection
+      ? verifiedAnswer
+      : `${verifiedAnswer.trim()}\n\nSources:\n${sourcesText}`;
+  }
+
+  return verifiedAnswer;
+}
+
+function listAgents(): { id: string; name: string; description?: string }[] {
+  const agents: { id: string; name: string; description?: string }[] = [];
+
+  agents.push({
+    id: 'general',
+    name: 'General Study Assistant',
+    description: 'General-purpose tutor for any topic.',
+  });
+
+  for (const [key, value] of Object.entries(VENDOR_KNOWLEDGE)) {
+    agents.push({
+      id: key,
+      name: key,
+      description: Array.isArray((value as any)?.keyAreas) && (value as any).keyAreas.length > 0
+        ? `Exam-focused coach. Key areas: ${(value as any).keyAreas.slice(0, 6).join(', ')}.`
+        : 'Exam-focused coach.',
+    });
+  }
+
+  return agents;
+}
+
+// ========== INTERVIEW QUESTIONS ==========
+async function generateInterview(content: string, count = 10, language = "en", meta?: LlmCallMeta): Promise<any[]> {
+  const truncated = (content || "").slice(0, MAX_CONTENT_LENGTH);
+  const vendorInfo = await detectVendorAI(truncated, meta);
+  const vendorExpertise = getVendorExpertise(vendorInfo.vendor);
+  
+  const systemPrompt = vendorExpertise
+    ? vendorExpertise.expertise + " You are also an expert interview coach. Generate interview questions that test practical knowledge and real-world understanding."
+    : "You are an expert interview coach helping candidates prepare for technical job interviews. Generate challenging but fair interview questions.";
+  
+  const focusAreas = vendorExpertise 
+    ? `\nKey areas to cover: ${vendorExpertise.keyAreas.join(', ')}`
+    : '';
+
+  const prompt = `Create ${count} interview questions${vendorInfo.vendor !== "General" ? ` for a ${vendorInfo.vendor} ${vendorInfo.category} position` : ''}.${focusAreas}
+
+Requirements:
+- Mix of technical questions, scenario-based questions, and behavioral questions
+- Include expected answer key points
+- Questions should range from entry-level to advanced
+- Focus on practical knowledge that employers value
+
+Return ONLY valid JSON array:
 [
   {
-    "title": "Section Title",
-    "narration": "Engaging explanation of the content...",
-    "keyPoints": ["Key point 1", "Key point 2"],
-    "visualDirections": ["Teacher: points to diagram", "Screen: shows formula"],
-    "pageRef": 1
+    "question": "The interview question",
+    "type": "technical|scenario|behavioral",
+    "difficulty": "easy|medium|hard",
+    "keyPoints": ["Point 1", "Point 2", "Point 3"],
+    "followUp": "A potential follow-up question"
   }
 ]
-Create 1-2 sections per page. ${animDirective} Be educational and engaging.${language !== 'en' ? ` Respond in ${language}.` : ''}`;
-        
-        result = await callOpenAI(chunkPrompt, `Create video sections for this content:\n\n${content}`, 2048, 0.25, false);
-        
-        try {
-          const match = result.match(/\[[\s\S]*\]/);
-          if (match) {
-            const sections = JSON.parse(match[0]);
-            return new Response(JSON.stringify({ sections, userId: user.id }), {
-              headers: { ...cors, "Content-Type": "application/json" },
-            });
-          }
-        } catch (e) {
-          console.error("Video chunk JSON parse error:", e);
-        }
-        
-        return new Response(JSON.stringify({ sections: [], userId: user.id }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
 
-      // New: Generate intro and conclusion for parallel-processed videos
-      case "videoIntroConclusion": {
-        const totalSections = body.totalSections || 1;
-        const introPrompt = `Create a video lesson introduction and conclusion. Return ONLY valid JSON:
-{
-  "introduction": "Welcome message introducing the topic (2-3 sentences, engaging)",
-  "conclusion": "Closing remarks summarizing the ${totalSections} sections covered (2-3 sentences)"
+${language !== 'en' ? `Language: ${language === 'ar' ? 'Arabic' : language}` : ''}
+
+Document Content:
+${truncated}`;
+
+  const result = await callOpenAI([
+    { role: "system", content: systemPrompt },
+    { role: "user", content: prompt }
+  ], 8000, 0.4, undefined, meta);
+  
+  try {
+    const match = result.match(/\[[\s\S]*\]/);
+    return match ? JSON.parse(match[0]) : [];
+  } catch {
+    return [];
+  }
 }
-${language !== 'en' ? `Respond in ${language}.` : ''}`;
-        
-        result = await callOpenAI(introPrompt, `Based on this content preview, create intro and conclusion:\n\n${content}`, 512, 0.3, false);
-        
-        try {
-          const match = result.match(/\{[\s\S]*\}/);
-          if (match) {
-            const parsed = JSON.parse(match[0]);
-            return new Response(JSON.stringify({ 
-              introduction: parsed.introduction || "Welcome to this lesson!",
-              conclusion: parsed.conclusion || "Thank you for learning!",
-              userId: user.id 
-            }), {
-              headers: { ...cors, "Content-Type": "application/json" },
-            });
-          }
-        } catch (e) {
-          console.error("Intro/conclusion JSON parse error:", e);
-        }
-        
-        return new Response(JSON.stringify({ 
-          introduction: "Welcome to this comprehensive lesson!",
-          conclusion: "Thank you for learning with me today!",
-          userId: user.id 
-        }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
 
-      case "video": {
-        // Legacy support - redirect to videoWithSlides
-        const systemPrompt = `Create a PROFESSIONAL, ENGAGING video lesson script. Return ONLY valid JSON:
-{
-  "introduction": "📚 Welcome! Today we'll master [topic]...",
-  "sections": [{"title": "📖 Topic", "narration": "Let me explain this fascinating concept... [detailed, engaging explanation]", "pageRef": 1, "keyPoints": ["🔑 point1", "💡 point2"]}],
-  "conclusion": "🎓 Great job! Let's recap: [comprehensive summary]..."
-}
-Make it engaging, educational, and memorable like a great TED talk!`;
-        
-        result = await callOpenAI(systemPrompt, `Create engaging video lesson:\n\n${content}`, 4096);
-        
-        try {
-          const match = result.match(/\{[\s\S]*\]/);
-          if (match) {
-            return new Response(JSON.stringify({ videoScript: JSON.parse(match[0]), userId: user.id }), {
-              headers: { ...cors, "Content-Type": "application/json" },
-            });
-          }
-        } catch {}
-        
-        return new Response(JSON.stringify({ 
-          videoScript: { introduction: "Welcome.", sections: [], conclusion: "Thank you!" },
-          userId: user.id,
-        }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-
-      case "interview": {
-        // content is already the full prompt for interview questions
-        const systemPrompt = `You are an expert interview coach helping candidates prepare for job interviews. Generate interview questions based on the provided document content.`;
-        
-        const temperature = body.temperature || 0.3;
-        result = await callOpenAI(systemPrompt, content, 4096, temperature);
-        
-        return new Response(JSON.stringify({ response: result, userId: user.id }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-
-      case "chat": {
-        const { message, context, history } = body;
-        
-        let systemPrompt = `You are a helpful AI study assistant. You help students understand documents and answer their questions clearly and accurately.`;
-        
-        if (context) {
-          systemPrompt += `\n\nDocument Context:\n${context.substring(0, 8000)}`;
-        }
-        
-        // Build messages array
-        const messages: { role: string; content: string }[] = [
-          { role: "system", content: systemPrompt }
-        ];
-        
-        // Add conversation history if provided
-        if (history && Array.isArray(history)) {
-          for (const msg of history.slice(-10)) {
-            messages.push({ role: msg.role, content: msg.content });
-          }
-        }
-        
-        // Add the current message
-        messages.push({ role: "user", content: message });
-        
-        // Try models with fallback
-        const chatModels = ["gpt-5-mini", "gpt-4o-mini"];
-        let chatResult = null;
-        
-        for (const model of chatModels) {
-          try {
-            console.log(`[chat] Trying model: ${model}`);
-            const response = await fetch("https://api.openai.com/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                model: model,
-                messages: messages,
-                max_tokens: 4096,
-                temperature: 0.7,
-              }),
-            });
-
-            const data = await response.json();
-            
-            if (data.error) {
-              console.warn(`[chat] ${model} failed:`, data.error);
-              if (data.error.code === "model_not_found" || data.error.type === "invalid_request_error") {
-                continue; // Try next model
-              }
-              throw new Error(data.error.message);
-            }
-            
-            chatResult = data.choices?.[0]?.message?.content || "I couldn't generate a response.";
-            console.log(`[chat] Success with ${model}`);
-            break;
-          } catch (e: any) {
-            console.error(`[chat] Error with ${model}:`, e.message);
-            if (model === chatModels[chatModels.length - 1]) throw e;
-          }
-        }
-        
-        return new Response(JSON.stringify({ 
-          response: chatResult || "I couldn't generate a response.",
-          userId: user.id,
-        }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-
-      case "flashcards": {
-        const systemPrompt = `You are an expert educator. Generate flashcards from the provided content.
-Each flashcard should have:
-
-// Example format for flashcards:
-// [
-//   {"term": "Photosynthesis", "definition": "The process by which plants convert light energy into chemical energy", "difficulty": "medium"},
-//   {"term": "What is the capital of France?", "definition": "Paris", "difficulty": "easy"}
-// ]
-// Generate 10-20 high-quality flashcards covering the most important concepts.`;
-        
-        result = await callOpenAI(systemPrompt, `Create flashcards from this content:\n\n${content}`, 4096);
-        
-        try {
-          const match = result.match(/\[[\s\S]*\]/);
-          if (match) {
-            const flashcards = JSON.parse(match[0]);
-            return new Response(JSON.stringify({ flashcards, userId: user.id }), {
-              headers: { ...cors, "Content-Type": "application/json" },
-            });
-          }
-        } catch {}
-        
-        return new Response(JSON.stringify({ flashcards: [], userId: user.id }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-
-      case "ocr": {
-        // OCR for scanned PDFs using GPT-4o Vision
-        if (!imageUrls || imageUrls.length === 0) {
-          return new Response(JSON.stringify({ 
-            text: "No image provided for OCR.",
-            error: "Missing imageUrls parameter" 
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        const ocrSystemPrompt = `You are an OCR (Optical Character Recognition) assistant. Your task is to extract ALL visible text from document images with high accuracy.
-
-Instructions:
-- Read and extract every piece of text visible in the image
-- Maintain the original reading order (top to bottom, left to right)
-- Preserve the document structure (paragraphs, headings, lists, etc.)
-- For tables, format them clearly with | separators
-- If text is partially obscured or unclear, indicate with [unclear] but still attempt to read it
-- Include numbers, dates, and special characters exactly as shown
-- Do NOT summarize or paraphrase - extract the actual text verbatim
-
-Your output should be the extracted text in a readable format.`;
-
-        const ocrUserPrompt = content || `Extract ALL text from this document image. Maintain the original structure and formatting. Output only the extracted text.`;
-        
-        try {
-          result = await callOpenAIVision(ocrSystemPrompt, imageUrls, ocrUserPrompt, 4096);
-          
-          return new Response(JSON.stringify({ 
-            text: result,
-            success: true,
-            userId: user.id,
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        } catch (ocrError) {
-          console.error("OCR error:", ocrError);
-          return new Response(JSON.stringify({ 
-            text: "",
-            error: String(ocrError),
-            success: false,
-            userId: user.id,
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-      }
-
-      case "extractPdf": {
-        // SMART PDF EXTRACTION - Multiple methods for best quality
-        // 1. pdf-parse for text-based PDFs
-        // 2. GPT-4o Vision for scanned/image PDFs
-        const { pdfBase64, imageUrls } = body;
-        
-        if (!pdfBase64 && (!imageUrls || imageUrls.length === 0)) {
-          return new Response(JSON.stringify({ 
-            error: "Missing pdfBase64 or imageUrls parameter",
-            text: "",
-            pages: [],
-            success: false,
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        let extractedText = "";
-        let extractedPages: { pageNum: number; text: string }[] = [];
-        let method = "none";
-        let numPages = 0;
-        
-        // METHOD 1: Try pdf-parse first (fast, works with text-based PDFs)
-        if (pdfBase64) {
-          try {
-            console.log("[extractPdf] Trying pdf-parse extraction...");
-            const parseResult = await extractWithPdfParse(pdfBase64);
-            
-            // Check extraction quality
-            const quality = checkTextQuality(parseResult.text);
-            console.log("[extractPdf] pdf-parse quality:", quality.quality, "score:", quality.score, "chars:", parseResult.text.length);
-            
-            if (quality.quality === 'good') {
-              extractedText = parseResult.text;
-              extractedPages = parseResult.pages;
-              numPages = parseResult.numPages;
-              method = "pdf-parse";
-              console.log("[extractPdf] pdf-parse SUCCESS:", numPages, "pages,", extractedText.length, "chars");
-            } else {
-              console.log("[extractPdf] pdf-parse quality too low, will try Vision...");
-            }
-          } catch (parseError: any) {
-            console.error("[extractPdf] pdf-parse error:", parseError.message);
-          }
-        }
-        
-        // METHOD 2: GPT-4o Vision for scanned PDFs or when pdf-parse fails
-        if (!extractedText && imageUrls && imageUrls.length > 0) {
-          try {
-            console.log("[extractPdf] Using GPT-4o Vision for", imageUrls.length, "page images...");
-            const visionResult = await extractWithGPTVision(imageUrls, 20); // Up to 20 pages
-            
-            if (visionResult.text && visionResult.text.length > 50) {
-              extractedText = visionResult.text;
-              extractedPages = visionResult.pages;
-              numPages = visionResult.pages.length;
-              method = "gpt-4o-vision";
-              console.log("[extractPdf] GPT-4o Vision SUCCESS:", numPages, "pages,", extractedText.length, "chars");
-            }
-          } catch (visionError: any) {
-            console.error("[extractPdf] GPT-4o Vision error:", visionError.message);
-          }
-        }
-        
-        // METHOD 3: If we have pdfBase64 but no images, send first page to Vision directly
-        if (!extractedText && pdfBase64 && (!imageUrls || imageUrls.length === 0)) {
-          try {
-            console.log("[extractPdf] Attempting direct PDF Vision (limited)...");
-            // Note: This is limited - GPT-4o can't directly read PDFs
-            // We need to convert to images on the client side for best results
-            const response = await fetch("https://api.openai.com/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${OPENAI_API_KEY}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                model: "gpt-4o-mini",
-                messages: [
-                  {
-                    role: "system",
-                    content: "The user tried to extract text from a PDF with custom fonts. Explain that they should convert the PDF to images or use Google Drive to convert it."
-                  },
-                  {
-                    role: "user",
-                    content: "PDF extraction failed due to custom font encoding."
-                  }
-                ],
-                max_tokens: 500,
-              }),
-            });
-            
-            if (response.ok) {
-              // Return helpful message
-              return new Response(JSON.stringify({ 
-                text: "",
-                pages: [],
-                pageCount: 0,
-                success: false,
-                needsImages: true,
-                method: "none",
-                message: "This PDF uses custom fonts and requires image conversion. Please upload page screenshots or use Google Drive to convert.",
-                userId: user.id,
-              }), {
-                headers: { ...cors, "Content-Type": "application/json" },
-              });
-            }
-          } catch (e) {
-            console.error("[extractPdf] Direct vision attempt failed:", e);
-          }
-        }
-        
-        // Return results
-        if (extractedText && extractedText.length > 50) {
-          return new Response(JSON.stringify({ 
-            text: extractedText,
-            pages: extractedPages,
-            pageCount: numPages,
-            success: true,
-            method: method,
-            userId: user.id,
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        // Final fallback: Return error with guidance
-        return new Response(JSON.stringify({ 
-          error: "PDF extraction failed. This PDF may have custom font encoding or be image-based.",
-          text: "",
-          pages: [],
-          pageCount: 0,
-          success: false,
-          needsImages: true,
-          suggestion: "For best results: 1) Upload page screenshots, or 2) Use Google Drive to convert the PDF to Google Docs format first.",
-          userId: user.id,
-        }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-
-      case "callOpenAIVision": {
-        // Direct Vision API access for image OCR
-        // NOTE: Only works with images (JPEG, PNG, GIF, WEBP), NOT PDFs!
-        const { imageUrl, prompt } = body;
-        
-        if (!imageUrl) {
-          return new Response(JSON.stringify({ 
-            error: "Missing imageUrl parameter. OpenAI Vision requires an image URL (not PDF).",
-            text: "",
-            success: false,
-          }), {
-            status: 400,
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        // Validate that it's an image, not a PDF
-        const isImage = imageUrl.startsWith('data:image/') || 
-                        imageUrl.includes('.jpg') || 
-                        imageUrl.includes('.jpeg') || 
-                        imageUrl.includes('.png') || 
-                        imageUrl.includes('.gif') || 
-                        imageUrl.includes('.webp');
-        
-        if (!isImage && imageUrl.includes('application/pdf')) {
-          return new Response(JSON.stringify({ 
-            error: "OpenAI Vision does not support PDF files directly. Please convert to image first, or use cloud extraction.",
-            text: "",
-            success: false,
-          }), {
-            status: 400,
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        const visionSystemPrompt = "You are an OCR assistant. Extract ALL text from the image accurately. Preserve formatting and structure.";
-        const visionUserPrompt = prompt || "Extract all text from this image. Output only the extracted text.";
-        
-        try {
-          const visionResult = await callOpenAIVision(visionSystemPrompt, [imageUrl], visionUserPrompt, 4096);
-          
-          return new Response(JSON.stringify({ 
-            text: visionResult,
-            content: visionResult,
-            success: true,
-            userId: user.id,
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        } catch (visionError: any) {
-          console.error("[callOpenAIVision] Error:", visionError.message);
-          return new Response(JSON.stringify({ 
-            error: visionError.message || "Vision API failed",
-            text: "",
-            success: false,
-          }), {
-            status: 500,
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-      }
-
-      case "youtube_search": {
-        // YouTube Data API v3 search for educational videos
-        const { query, language, maxResults } = body;
-        
-        if (!query) {
-          return new Response(JSON.stringify({ 
-            error: "Missing search query",
-            videos: [],
-          }), {
-            status: 400,
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        const YOUTUBE_API_KEY = Deno.env.get("YOUTUBE_API_KEY") || Deno.env.get("GOOGLE_API_KEY") || Deno.env.get("GOOGLE_CLOUD_API_KEY");
-        
-        if (!YOUTUBE_API_KEY) {
-          console.error("[youtube_search] No YouTube API key configured");
-          return new Response(JSON.stringify({ 
-            error: "YouTube search not configured",
-            videos: [],
-          }), {
-            status: 500,
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        try {
-          // Build search query - add "tutorial" or "lecture" for educational context
-          const educationalQuery = `${query} tutorial lecture educational`;
-          const relevanceLanguage = language || 'en';
-          const resultsCount = Math.min(maxResults || 10, 25);
-          
-          console.log(`[youtube_search] Searching: "${educationalQuery}" in ${relevanceLanguage}`);
-          
-          // Call YouTube Data API v3
-          const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
-          searchUrl.searchParams.set('part', 'snippet');
-          searchUrl.searchParams.set('q', educationalQuery);
-          searchUrl.searchParams.set('type', 'video');
-          searchUrl.searchParams.set('videoCaption', 'closedCaption'); // Only videos with captions
-          searchUrl.searchParams.set('relevanceLanguage', relevanceLanguage);
-          searchUrl.searchParams.set('maxResults', String(resultsCount));
-          searchUrl.searchParams.set('order', 'relevance');
-          searchUrl.searchParams.set('safeSearch', 'strict');
-          searchUrl.searchParams.set('videoEmbeddable', 'true'); // Only embeddable videos
-          searchUrl.searchParams.set('key', YOUTUBE_API_KEY);
-          
-          const searchResponse = await fetch(searchUrl.toString());
-          
-          if (!searchResponse.ok) {
-            const errorText = await searchResponse.text();
-            console.error('[youtube_search] API error:', errorText);
-            throw new Error('YouTube API request failed');
-          }
-          
-          const searchData = await searchResponse.json();
-          
-          // Map results to our format
-          const videos = (searchData.items || []).map((item: any) => ({
-            id: item.id?.videoId || '',
-            title: item.snippet?.title || 'Untitled',
-            description: (item.snippet?.description || '').substring(0, 200),
-            thumbnail: item.snippet?.thumbnails?.medium?.url || item.snippet?.thumbnails?.default?.url || '',
-            channelTitle: item.snippet?.channelTitle || 'Unknown',
-            publishedAt: item.snippet?.publishedAt || '',
-          })).filter((v: any) => v.id);
-          
-          console.log(`[youtube_search] Found ${videos.length} videos`);
-          
-          return new Response(JSON.stringify({ 
-            videos,
-            query: query,
-            userId: user.id,
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-          
-        } catch (ytError: any) {
-          console.error('[youtube_search] Error:', ytError.message);
-          return new Response(JSON.stringify({ 
-            error: ytError.message || 'YouTube search failed',
-            videos: [],
-          }), {
-            status: 500,
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-      }
-
-      case "youtube_captions": {
-        // Get available caption tracks for a YouTube video
-        const { videoId, language } = body;
-        
-        if (!videoId) {
-          return new Response(JSON.stringify({ 
-            error: "Missing videoId",
-            available: [],
-          }), {
-            status: 400,
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        const YOUTUBE_API_KEY = Deno.env.get("YOUTUBE_API_KEY") || Deno.env.get("GOOGLE_API_KEY") || Deno.env.get("GOOGLE_CLOUD_API_KEY");
-        
-        if (!YOUTUBE_API_KEY) {
-          return new Response(JSON.stringify({ 
-            error: "YouTube API not configured",
-            available: [],
-          }), {
-            status: 500,
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-        
-        try {
-          // Get caption tracks for the video
-          const captionsUrl = new URL('https://www.googleapis.com/youtube/v3/captions');
-          captionsUrl.searchParams.set('part', 'snippet');
-          captionsUrl.searchParams.set('videoId', videoId);
-          captionsUrl.searchParams.set('key', YOUTUBE_API_KEY);
-          
-          const captionsResponse = await fetch(captionsUrl.toString());
-          
-          if (!captionsResponse.ok) {
-            console.error('[youtube_captions] API error for video:', videoId);
-            throw new Error('Could not fetch captions');
-          }
-          
-          const captionsData = await captionsResponse.json();
-          
-          // Map available caption tracks
-          const available = (captionsData.items || []).map((item: any) => ({
-            code: item.snippet?.language || 'unknown',
-            name: item.snippet?.name || item.snippet?.language || 'Unknown',
-            trackKind: item.snippet?.trackKind || 'standard',
-          }));
-          
-          console.log(`[youtube_captions] Video ${videoId} has ${available.length} caption tracks`);
-          
-          return new Response(JSON.stringify({ 
-            available,
-            videoId,
-            userId: user.id,
-          }), {
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-          
-        } catch (captionError: any) {
-          console.error('[youtube_captions] Error:', captionError.message);
-          return new Response(JSON.stringify({ 
-            error: captionError.message || 'Could not fetch captions',
-            available: [],
-          }), {
-            status: 500,
-            headers: { ...cors, "Content-Type": "application/json" },
-          });
-        }
-      }
-
-      default:
-        throw new Error(`Unknown action: ${action}`);
+// ========== MAIN HANDLER ==========
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+  
+  // Handle GET requests (browser access)
+  if (req.method === "GET") {
+    const info = {
+      name: "MindSparkle AI API",
+      version: "3.1",
+      status: "online",
+      description: "AI-powered exam preparation with vendor-specific expertise",
+      supportedVendors: Object.keys(VENDOR_KNOWLEDGE),
+      endpoints: {
+        summarize: "Generate comprehensive study summaries with tables",
+        quiz: "Create exam-style multiple choice questions",
+        studyGuide: "Generate detailed study guides",
+        flashcards: "Create learning flashcards",
+        chat: "Document Q&A with AI tutor",
+        detectVendor: "AI-based vendor/certification detection"
+      },
+      usage: "POST with JSON body: {action: 'test'} to verify connection"
+    };
+    return new Response(JSON.stringify(info, null, 2), { 
+      headers: { ...corsHeaders, "Content-Type": "application/json" } 
+    });
+  }
+  
+  try {
+    // Parse body first for test action
+    const body = await req.json();
+    const { action, content, language = "en", count, difficulty, question, history, title, source, bullets, focusTopics, agentId } = body;
+    // Backwards compatible aliases used by older clients
+    const rawContentCompat = (typeof content === 'string' ? content : (typeof body?.context === 'string' ? body.context : ''));
+    // Soft-truncate content to avoid 413s for large documents.
+    // Many endpoints (chat, quiz, study plan, etc) can safely operate on partial context.
+    if (typeof rawContentCompat === 'string' && rawContentCompat.length > HARD_CONTENT_LENGTH) {
+      return new Response(
+        JSON.stringify({ code: 413, message: "Content too large" }),
+        { status: 413, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
     }
-
-  } catch (error) {
-    console.error("Error:", error);
-
-    const status = (error as any)?.status || 500;
-    const errorMessage = String(error);
-    if (errorMessage.includes('QUOTA_EXCEEDED') || errorMessage.includes('insufficient') || errorMessage.includes('billing')) {
-      return new Response(JSON.stringify({ 
-        error: "AI service temporarily unavailable. Please try again in a few minutes.",
-      }), {
-        status: 429,
-        headers: { ...cors, "Content-Type": "application/json" },
-      });
+    const contentCompat = (typeof rawContentCompat === 'string')
+      ? rawContentCompat.slice(0, MAX_CONTENT_LENGTH)
+      : '';
+    const questionCompat = (typeof question === 'string' ? question : (typeof body?.message === 'string' ? body.message : ''));
+    
+    // Allow test without auth
+    if (action === "test") {
+      return new Response(
+        JSON.stringify({
+          status: "ok",
+          version: "3.1-vendor-expertise",
+          hasOpenAIKey: Boolean(Deno.env.get("OPENAI_API_KEY")),
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
     }
     
-    return new Response(JSON.stringify({ 
-      error: errorMessage,
-      details: "Please try again. If the problem persists, contact support."
-    }), {
-      status,
-      headers: { ...cors, "Content-Type": "application/json" },
-    });
+    const isChatMindAction = ['chatMind', 'chatMindStream'].includes(String(action));
+    const auth = req.headers.get("authorization");
+
+    // Verify JWT (if provided). Allow guest ChatMind if auth is missing/invalid.
+    const supabaseUrl = Deno.env.get("PROJECT_URL") || Deno.env.get("SUPABASE_URL");
+    const supabaseKey = Deno.env.get("SUPABASE_ANON_KEY") || Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+    let supabase: any = null;
+    let user: any = null;
+    let isGuest = false;
+    let guestId = '';
+
+    if (!auth) {
+      if (!isChatMindAction) {
+        return new Response(JSON.stringify({ code: 401, message: "Missing authorization header" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      isGuest = true;
+    } else {
+      if (!supabaseUrl || !supabaseKey) {
+        return new Response(JSON.stringify({ code: 500, message: "Server config error" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+
+      supabase = createClient(supabaseUrl, supabaseKey, { global: { headers: { Authorization: auth } } });
+      const { data: { user: authedUser }, error: authError } = await supabase.auth.getUser();
+      user = authedUser;
+
+      if (authError || !user) {
+        if (!isChatMindAction) {
+          return new Response(JSON.stringify({ code: 401, message: "Invalid JWT" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        }
+        isGuest = true;
+      }
+    }
+
+    if (isGuest) {
+      guestId = String(body?.guestId || body?.deviceId || '').trim();
+      if (!guestId) {
+        return new Response(JSON.stringify({ code: 401, message: "Guest ID required" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+    }
+
+    // Best-effort burst limiting (optional; set AI_BURST_REQUESTS_PER_MINUTE).
+    const burst = checkBurstLimit(isGuest ? `guest:${guestId}` : user.id);
+    if (!burst.ok) {
+      return new Response(
+        JSON.stringify({ code: 429, message: "Rate limited. Please retry." }),
+        {
+          status: 429,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+            "Retry-After": String(burst.retryAfterSec),
+          },
+        },
+      );
+    }
+
+    // Optional daily request cap (uses ai_provider_usage table).
+    if (!isGuest) {
+      const dailyLimit = parseOptionalNumberEnv('AI_DAILY_REQUEST_LIMIT');
+      if (dailyLimit && dailyLimit > 0) {
+        const today = new Date().toISOString().slice(0, 10);
+        const { count: usedToday } = await supabase
+          .from('ai_provider_usage')
+          .select('id', { count: 'exact', head: true })
+          .eq('user_id', user.id)
+          .eq('usage_date', today);
+
+        if ((usedToday || 0) >= dailyLimit) {
+          return new Response(
+            JSON.stringify({ code: 429, message: "Daily AI limit reached." }),
+            { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+      }
+    }
+
+    // Free-tier daily chat caps (server-side backstop).
+    // Client already enforces this, but server-side prevents bypass via reinstall/clearing storage.
+    if (isGuest) {
+      const guestLimit = parseOptionalNumberEnv('FREE_CHATMIND_DAILY_LIMIT_GUEST') || parseOptionalNumberEnv('FREE_CHATMIND_DAILY_LIMIT') || 30;
+      if (isChatMindAction) {
+        const ok = checkGuestDailyLimit(`guest:${guestId}`, guestLimit);
+        if (!ok.ok) {
+          return new Response(
+            JSON.stringify({ code: 429, message: 'Daily ChatMind limit reached. Please sign in for unlimited access.' }),
+            { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+          );
+        }
+      }
+    }
+
+    if (!isGuest) {
+      const premium = await isPremiumUser(supabase, user.id);
+      if (!premium) {
+        // ChatMind gets its own higher cap.
+        const freeChatMindDailyLimit = parseOptionalNumberEnv('FREE_CHATMIND_DAILY_LIMIT') || 30;
+        if (freeChatMindDailyLimit > 0) {
+          const chatMindActions = ['chatMind', 'chatMindStream'];
+          if (chatMindActions.includes(String(action))) {
+            const today = new Date().toISOString().slice(0, 10);
+            const { count: usedChatMindToday } = await supabase
+              .from('ai_provider_usage')
+              .select('id', { count: 'exact', head: true })
+              .eq('user_id', user.id)
+              .eq('usage_date', today)
+              .in('request_type', chatMindActions);
+
+            if ((usedChatMindToday || 0) >= freeChatMindDailyLimit) {
+              return new Response(
+                JSON.stringify({ code: 429, message: 'Daily ChatMind limit reached. Try again tomorrow.' }),
+                { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+              );
+            }
+          }
+        }
+
+        // General chat cap (excludes ChatMind).
+        const freeChatDailyLimit = parseOptionalNumberEnv('FREE_CHAT_DAILY_LIMIT') || 10;
+        if (freeChatDailyLimit > 0) {
+          const chatActions = ['chat', 'docChat', 'chatStream', 'docChatStream'];
+          const today = new Date().toISOString().slice(0, 10);
+          const { count: usedChatToday } = await supabase
+            .from('ai_provider_usage')
+            .select('id', { count: 'exact', head: true })
+            .eq('user_id', user.id)
+            .eq('usage_date', today)
+            .in('request_type', chatActions);
+
+          if ((usedChatToday || 0) >= freeChatDailyLimit) {
+            return new Response(
+              JSON.stringify({ code: 429, message: 'Daily chat limit reached.' }),
+              { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+            );
+          }
+        }
+      }
+    }
+
+    // Optional per-feature daily limits for free users (server-side backstop).
+    // Disabled by default unless you set the corresponding env vars.
+    if (!isGuest) {
+      const premiumForFeatureCaps = await isPremiumUser(supabase, user.id);
+      if (!premiumForFeatureCaps) {
+        const today = new Date().toISOString().slice(0, 10);
+        const actionToEnv: Record<string, { env: string; label: string }> = {
+          quiz: { env: 'FREE_QUIZ_DAILY_LIMIT', label: 'quiz' },
+          studyPlan: { env: 'FREE_STUDYPLAN_DAILY_LIMIT', label: 'study plan' },
+          interview: { env: 'FREE_INTERVIEW_DAILY_LIMIT', label: 'interview' },
+        };
+
+        const cfg = actionToEnv[String(action)];
+        if (cfg) {
+          const limit = parseOptionalNumberEnv(cfg.env);
+          if (limit && limit > 0) {
+            const { count: usedToday } = await supabase
+              .from('ai_provider_usage')
+              .select('id', { count: 'exact', head: true })
+              .eq('user_id', user.id)
+              .eq('usage_date', today)
+              .eq('request_type', String(action));
+
+            if ((usedToday || 0) >= limit) {
+              return new Response(
+                JSON.stringify({ code: 429, message: `Daily ${cfg.label} limit reached.` }),
+                { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+              );
+            }
+          }
+        }
+      }
+    }
+
+    // Input validation to prevent accidental huge payloads.
+    if (typeof action !== 'string' || !action.trim()) {
+      return new Response(JSON.stringify({ code: 400, message: "Missing action" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+    // NOTE: Content length is validated/truncated above (rawContentCompat -> contentCompat).
+    if (Array.isArray(history) && history.length > 50) {
+      return new Response(JSON.stringify({ code: 400, message: "Chat history too long" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const meta: LlmCallMeta | undefined = (!isGuest && user && supabase)
+      ? {
+          supabase,
+          userId: user.id,
+          requestType: String(action),
+          documentId: (typeof body?.documentId === 'string' ? body.documentId : null),
+        }
+      : undefined;
+    
+    let result: any;
+    
+    switch (action) {
+      case "listAgents":
+        result = { agents: listAgents() };
+        break;
+      case "chatMindMemory": {
+        const op = String(body?.op || '').trim().toLowerCase();
+        if (op === 'clear') {
+          await clearChatMindMemory(supabase, user.id);
+          result = { ok: true };
+        } else {
+          const summary = await getChatMindMemorySummary(supabase, user.id);
+          result = { summary };
+        }
+        break;
+      }
+      case "summarize":
+        result = { summary: await summarize(contentCompat, language, meta) };
+        break;
+      case "summarizeModule":
+        result = { module: await summarizeModuleJSON({ title: title || 'Module', content: contentCompat || '', language, source, meta }) };
+        break;
+      case "quiz":
+        result = { questions: await generateQuiz(contentCompat, count || 10, difficulty || "medium", language, focusTopics, meta) };
+        break;
+      case "studyPlan":
+        result = { plan: await generateStudyPlan(contentCompat, language, meta) };
+        break;
+      case "studyGuide":
+        result = { guide: await generateStudyGuide(contentCompat, language, meta) };
+        break;
+      case "flashcards":
+        result = { flashcards: await generateFlashcards(contentCompat, count || 20, language, meta) };
+        break;
+      case "chat":
+        result = { response: await chat(contentCompat, questionCompat, history || [], meta, agentId) };
+        break;
+
+      case "docChat":
+        // Explicit document chat action (isolated from Chat Mind)
+        result = { response: await chat(contentCompat, questionCompat, history || [], meta, agentId) };
+        break;
+
+      case "chatMind":
+        // Chat Mind should not receive document context.
+        {
+          const memoryEnabled = !isGuest && Boolean(body?.memory?.enabled);
+          const chatMode = normalizeChatMindMode(body?.chatMindMode);
+          if (!isGuest && Boolean(body?.memory?.forget)) {
+            await clearChatMindMemory(supabase, user.id);
+          }
+          const memorySummary = memoryEnabled ? await getChatMindMemorySummary(supabase, user.id) : '';
+
+          const responseText = await chat('', questionCompat, history || [], meta, agentId, {
+            chatMindMode: chatMode,
+            chatMindMemoryEnabled: memoryEnabled,
+            chatMindMemorySummary: memorySummary,
+          });
+
+          if (!isGuest && memoryEnabled && shouldUpdateChatMindMemory(questionCompat)) {
+            updateChatMindMemorySummary({
+              supabase,
+              userId: user.id,
+              previousSummary: memorySummary,
+              userMessage: questionCompat,
+              assistantMessage: responseText,
+            });
+          }
+
+          result = { response: responseText };
+        }
+        break;
+
+      case "chatStream":
+      case "docChatStream":
+      case "chatMindStream": {
+        // Stream tokens over SSE. Prefer OpenAI to enable real upstream streaming.
+        const selectedAgent = typeof agentId === 'string' ? agentId.trim() : '';
+        const agentExpertise = selectedAgent ? getVendorExpertise(selectedAgent) : null;
+
+        const systemPrompt = agentExpertise
+          ? `${agentExpertise.expertise}
+You are the MindSparkle ${selectedAgent} Agent.
+Be concise and clear by default. If the user asks for detail, expand.
+Use exam tips when helpful. Focus areas: ${agentExpertise.keyAreas.join(', ')}.
+If context is missing, ask 1 short clarifying question.
+Accuracy first: do not guess. If unsure, say you are not sure and suggest a next step.
+Prefer structured answers: short summary, then bullets/steps when useful.`
+          : "You are a helpful AI study assistant. Be concise and clear by default. If the user asks for detail, expand. If context is missing, ask 1 short clarifying question. Accuracy first: do not guess. If unsure, say you are not sure and suggest a next step. Prefer structured answers: short summary, then bullets/steps when useful.";
+
+        const identityGuidance = `
+Identity:
+- If the user asks "who developed you / who made you / who built you", answer: "MindSparkle was developed by Ahmed Nabhan. This assistant is powered by GPT-5.2 and may use multiple AI providers depending on the request." Keep it to 1–2 sentences.
+- Do not claim Ahmed Nabhan trained the underlying foundation model.
+- If the user asks what model you are using, say GPT-5.2.`;
+
+        const capabilityGuidance = `
+Capabilities:
+- If the user asks you to create a document, produce a well-structured output (Markdown by default) with a title, sections, and bullets.
+- If the user asks you to create a presentation, produce slide-by-slide content with slide titles and bullet points.
+- If the user asks for links, do NOT invent specific URLs you are unsure about. Prefer official documentation homepages and safe search queries.
+- If the user asks for an image, provide a short image prompt suggestion (no extra commentary).`;
+
+        const isChatMindStream = action === 'chatMindStream';
+        const includeDocContext = action !== 'chatMindStream';
+        const truncatedCtx = includeDocContext ? String(contentCompat || '').slice(0, 25000) : '';
+        const q = String(questionCompat || '').trim() || 'Hello';
+
+        const detectedLang = detectLanguageFromText(q);
+        const languageGuidance = languageInstruction(detectedLang);
+
+        const memoryEnabled = isChatMindStream && !isGuest ? Boolean(body?.memory?.enabled) : false;
+        const chatMode = isChatMindStream ? normalizeChatMindMode(body?.chatMindMode) : 'general';
+        if (isChatMindStream && !isGuest && Boolean(body?.memory?.forget)) {
+          await clearChatMindMemory(supabase, user.id);
+        }
+        const memorySummary = isChatMindStream && !isGuest && memoryEnabled ? await getChatMindMemorySummary(supabase, user.id) : '';
+        const memoryBlock = memorySummary ? `\n\nUser memory (opt-in; may be empty/partial):\n- ${memorySummary}` : '';
+
+        let sources: WebSource[] = [];
+        if (shouldUseWebSearchForChat(q)) {
+          try {
+            sources = await webSearch(q, 5);
+          } catch {
+            sources = [];
+          }
+        }
+
+        const citationGuidance = sources.length > 0
+          ? `
+
+Citations:
+- You MUST cite sources using bracket numbers like [1], [2] inline.
+- After the answer, include a "Sources" section listing each source exactly once.
+- Do NOT invent URLs; only cite provided sources.`
+          : '';
+
+        const messages = [
+          { role: 'system', content: systemPrompt + (isChatMindStream ? (modeGuidance(chatMode) + memoryBlock) : '') + identityGuidance + capabilityGuidance + languageGuidance + citationGuidance },
+          ...(truncatedCtx.trim().length > 0
+            ? [{ role: 'user', content: `DOCUMENT CONTEXT (may be partial):\n${truncatedCtx.slice(0, 12000)}` }]
+            : []),
+          ...(sources.length > 0
+            ? [{ role: 'user', content: `SOURCES (use for citations):\n\n${formatSourcesForPrompt(sources)}` }]
+            : []),
+          ...(Array.isArray(history) ? history.slice(-8) : []),
+          { role: 'user', content: q },
+        ];
+
+        const fastModel = (Deno.env.get('OPENAI_CHAT_MODEL_FAST') || '').trim();
+        const smartModel = (Deno.env.get('OPENAI_CHAT_MODEL') || 'gpt-5.2').trim();
+        const qLower = q.toLowerCase();
+        const isSimple = q.length > 0 && q.length < 220 && !qLower.includes('```') && !qLower.includes('error') && !qLower.includes('stack trace');
+        const openAiModel = fastModel && (isChatMindStream || isSimple) ? fastModel : smartModel;
+
+        const providerOrder = chooseChatProviderOrder({ question: q, context: truncatedCtx, history });
+        const primaryProvider = providerOrder[0] || 'openai';
+
+        if (primaryProvider !== 'openai') {
+          const txt = await callOpenAI(messages, 900, 0.35, undefined, meta, [primaryProvider]);
+          return new Response(chunkTextSse(txt), { headers: sseHeaders() });
+        }
+
+        try {
+          const upstream = await callOpenAIInternalStream(messages, 900, 0.35, openAiModel);
+          const encoder = new TextEncoder();
+          const decoder = new TextDecoder();
+
+          const stream = new ReadableStream<Uint8Array>({
+            async start(controller) {
+              try {
+                const reader = upstream.body?.getReader();
+                if (!reader) {
+                  controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                  controller.close();
+                  return;
+                }
+
+                let buffer = '';
+                let assistantAcc = '';
+                while (true) {
+                  const { value, done } = await reader.read();
+                  if (done) break;
+                  buffer += decoder.decode(value, { stream: true });
+
+                  // Parse SSE from OpenAI.
+                  let split;
+                  while ((split = buffer.indexOf('\n\n')) !== -1) {
+                    const frame = buffer.slice(0, split);
+                    buffer = buffer.slice(split + 2);
+                    const lines = frame.split(/\r?\n/);
+                    for (const line of lines) {
+                      const trimmed = line.trim();
+                      if (!trimmed.startsWith('data:')) continue;
+                      const payload = trimmed.replace(/^data:\s*/, '');
+                      if (!payload) continue;
+                      if (payload === '[DONE]') {
+                        if (isChatMindStream && memoryEnabled && assistantAcc.trim() && shouldUpdateChatMindMemory(q)) {
+                          updateChatMindMemorySummary({
+                            supabase,
+                            userId: user.id,
+                            previousSummary: memorySummary,
+                            userMessage: q,
+                            assistantMessage: assistantAcc,
+                          });
+                        }
+                        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                        controller.close();
+                        return;
+                      }
+                      try {
+                        const obj = JSON.parse(payload);
+                        const delta = obj?.choices?.[0]?.delta?.content;
+                        if (typeof delta === 'string' && delta.length > 0) {
+                          assistantAcc += delta;
+                          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: delta })}\n\n`));
+                        }
+                      } catch {
+                        // ignore malformed frames
+                      }
+                    }
+                  }
+                }
+
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                controller.close();
+              } catch {
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                controller.close();
+              }
+            },
+          });
+
+          return new Response(stream, { headers: sseHeaders() });
+        } catch (e: any) {
+          // Fallback: non-streaming answer chunked.
+          const txt = await chat(contentCompat, questionCompat, history || [], meta, agentId);
+          return new Response(chunkTextSse(txt), { headers: sseHeaders() });
+        }
+      }
+
+      case "generateModuleImage":
+        result = { imageDataUrl: await generateModuleImageDataUrl({ title: title || 'Module', bullets, language }) };
+        break;
+      case "generateImage":
+        result = { imageDataUrl: await generateImageDataUrl(String(body?.prompt || ''), String(body?.image_mode || body?.imageMode || '')) };
+        break;
+
+      case "exportFile": {
+        const kind = normalizeExportKind(String(body?.kind || 'notes'));
+        const message = typeof body?.message === 'string' ? body.message : '';
+        const ctx = typeof body?.content === 'string' ? body.content : contentCompat;
+        const hist = Array.isArray(body?.history) ? body.history : (Array.isArray(history) ? history : []);
+
+        const { filename, mimeType, content: fileText } = await generateExportContent({
+          kind,
+          message,
+          context: String(ctx || ''),
+          history: hist,
+          agentId,
+          meta,
+        });
+
+        // Upload to Storage using service role if available.
+        const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_SERVICE_KEY');
+        const storageClient = serviceKey ? createClient(supabaseUrl, serviceKey) : supabase;
+
+        const exportPath = `exports/${user.id}/${crypto.randomUUID()}/${filename}`;
+        const bytes = new TextEncoder().encode(fileText);
+        const { error: upErr } = await storageClient.storage
+          .from('doc_assets')
+          .upload(exportPath, bytes, { contentType: mimeType, upsert: true });
+
+        if (upErr) throw new Error(`Export upload failed: ${upErr.message}`);
+
+        const { data: signed, error: signErr } = await storageClient.storage
+          .from('doc_assets')
+          .createSignedUrl(exportPath, 1800);
+
+        if (signErr || !signed?.signedUrl) throw new Error(`Export link failed: ${signErr?.message || 'unknown'}`);
+
+        result = { url: signed.signedUrl, filename, mimeType };
+        break;
+      }
+      case "interview": {
+        // Support both old format (content=full prompt) and new format (content=document)
+        const isLegacyFormat = contentCompat && contentCompat.includes('Return a JSON array with this format');
+        if (isLegacyFormat) {
+          // Legacy format: content is already the full prompt
+          const interviewResult = await callOpenAI([
+            { role: "system", content: "You are an expert interview coach helping candidates prepare for technical job interviews." },
+            { role: "user", content: contentCompat }
+          ], 4096, 0.3, undefined, meta);
+          result = { response: interviewResult };
+        } else {
+          // New format: generate questions from document content
+          result = { questions: await generateInterview(contentCompat, count || 10, language, meta) };
+        }
+        break;
+      }
+      case "testVendor":
+        result = await detectVendorAI(content || "", meta);
+        break;
+      case "detectVendor":
+        result = await detectVendorAI(content, meta);
+        break;
+      default:
+        return new Response(JSON.stringify({ code: 400, message: `Unknown action: ${action}` }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+    
+    return new Response(JSON.stringify(result), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    
+  } catch (error) {
+    // Stateless logging: avoid printing raw error objects.
+    console.error("Error:", String((error as any)?.message || error).slice(0, 200));
+    const status = (error as any)?.status && Number((error as any).status) ? Number((error as any).status) : 500;
+    return new Response(JSON.stringify({ code: status, message: error.message || "Internal server error" }), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
   }
 });

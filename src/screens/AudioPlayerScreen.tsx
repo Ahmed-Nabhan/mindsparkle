@@ -6,11 +6,13 @@ import {
   TouchableOpacity,
   ScrollView,
   ActivityIndicator,
+  Alert,
 } from 'react-native';
 import { useRoute, useNavigation } from '@react-navigation/native';
 import Slider from '@react-native-community/slider';
 import { colors } from '../constants/colors';
 import audioService, { VoiceOption, AudioSettings } from '../services/audioService';
+import { getDocumentById } from '../services/storage';
 import { usePremiumContext } from '../context/PremiumContext';
 import ApiService from '../services/apiService';
 import type { MainDrawerScreenProps } from '../navigation/types';
@@ -28,6 +30,7 @@ export const AudioPlayerScreen: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [audioText, setAudioText] = useState('');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [settings, setSettings] = useState<AudioSettings>(audioService.getSettings());
   const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [selectedVoice, setSelectedVoice] = useState<string>('');
@@ -49,6 +52,7 @@ export const AudioPlayerScreen: React.FC = () => {
     }
 
     setIsLoading(true);
+    setErrorMessage(null);
     try {
       // Get available voices
       const availableVoices = await audioService.initialize();
@@ -67,17 +71,73 @@ export const AudioPlayerScreen: React.FC = () => {
       });
       audioService.setOnProgressChange(setProgress);
 
-      // Prepare text for audio
-      const cleanedText = audioService.cleanTextForSpeech(content);
+      // Prepare text for audio - use full content, not truncated
+      // Content may be truncated from navigation params; if it's too short, fetch full document from local storage
+      console.log('[Audio] Received content length:', content?.length || 0, 'chars');
+      let fullContent = content || '';
+      
+      // ALWAYS try to fetch from storage to get the most complete content
+      if (documentId) {
+        try {
+          const doc = await getDocumentById(documentId);
+          console.log('[Audio] Document from storage:', doc ? 'found' : 'not found');
+          
+          // Try extractedData pages first (most complete)
+          if (doc?.extractedData?.pages && doc.extractedData.pages.length > 0) {
+            const pagesText = doc.extractedData.pages.map((p: any) => p.text || '').join('\n\n');
+            if (pagesText.length > 0) {
+              console.log('[Audio] Using extractedData.pages:', pagesText.length, 'chars');
+              fullContent = pagesText;
+            }
+          }
+          
+          // Fallback to extractedData.text
+          if ((!fullContent || fullContent.length < 100) && doc?.extractedData?.text) {
+            console.log('[Audio] Using extractedData.text:', doc.extractedData.text.length, 'chars');
+            fullContent = doc.extractedData.text;
+          }
+          
+          // Fallback to content
+          if ((!fullContent || fullContent.length < 100) && doc?.content) {
+            console.log('[Audio] Using doc.content:', doc.content.length, 'chars');
+            fullContent = doc.content;
+          }
+          
+          // Fallback to chunks
+          if ((!fullContent || fullContent.length < 100) && doc?.chunks && doc.chunks.length > 0) {
+            console.log('[Audio] Using chunks:', doc.chunks.join('').length, 'chars');
+            fullContent = doc.chunks.join('\n\n');
+          }
+        } catch (err) {
+          console.error('[Audio] Failed to load document from storage:', err);
+        }
+      }
+      
+      if (!fullContent || fullContent.length < 50) {
+        throw new Error('No content available for audio playback. Please ensure the document has been processed.');
+      }
+
+      const cleanedText = audioService.cleanTextForSpeech(fullContent || '');
+      console.log('[Audio] Cleaned text length:', cleanedText.length, 'chars');
+      
+      if (!cleanedText || cleanedText.length < 10) {
+        throw new Error('Content too short for audio playback.');
+      }
+      
       setAudioText(cleanedText);
-    } catch (error) {
-      console.error('Error initializing audio:', error);
+    } catch (error: any) {
+      console.error('[Audio] Error initializing audio:', error);
+      setErrorMessage(error?.message || 'Failed to initialize audio. Please ensure the document has been processed.');
     } finally {
       setIsLoading(false);
     }
   };
 
   const handlePlay = async () => {
+    if (!audioText || audioText.trim().length < 10) {
+      Alert.alert('No Audio Content', 'Please wait for the audio text to load, then try again.');
+      return;
+    }
     if (isPaused) {
       await audioService.resume();
       setIsPaused(false);
@@ -128,6 +188,25 @@ export const AudioPlayerScreen: React.FC = () => {
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color={colors.primary} />
         <Text style={styles.loadingText}>Preparing audio...</Text>
+      </View>
+    );
+  }
+
+  if (errorMessage) {
+    return (
+      <View style={styles.loadingContainer}>
+        <Text style={[styles.loadingText, { color: colors.text, fontWeight: '700' }]}>Audio unavailable</Text>
+        <Text style={[styles.loadingText, { fontSize: 14, color: colors.textLight, textAlign: 'center' }]}>
+          {errorMessage}
+        </Text>
+        <View style={styles.errorButtonsRow}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.errorButton}>
+            <Text style={styles.errorButtonText}>Back</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={initializeAudio} style={[styles.errorButton, styles.errorButtonPrimary]}>
+            <Text style={[styles.errorButtonText, styles.errorButtonTextPrimary]}>Retry</Text>
+          </TouchableOpacity>
+        </View>
       </View>
     );
   }
@@ -259,12 +338,14 @@ export const AudioPlayerScreen: React.FC = () => {
           </View>
         )}
 
-        {/* Text Preview */}
+        {/* Full Document Text */}
         <View style={styles.textPreview}>
-          <Text style={styles.textPreviewTitle}>📝 Text Content</Text>
-          <Text style={styles.textPreviewContent} numberOfLines={10}>
-            {audioText}
-          </Text>
+          <Text style={styles.textPreviewTitle}>📝 Document Content</Text>
+          <ScrollView style={{ maxHeight: 400 }}>
+            <Text selectable style={styles.textPreviewContent}>
+              {audioText}
+            </Text>
+          </ScrollView>
         </View>
       </ScrollView>
     </View>
@@ -286,6 +367,30 @@ const styles = StyleSheet.create({
     marginTop: 16,
     fontSize: 16,
     color: colors.textLight,
+  },
+  errorButtonsRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 16,
+  },
+  errorButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surface,
+  },
+  errorButtonPrimary: {
+    borderColor: colors.primary,
+    backgroundColor: colors.primary,
+  },
+  errorButtonText: {
+    color: colors.text,
+    fontWeight: '600',
+  },
+  errorButtonTextPrimary: {
+    color: '#fff',
   },
   header: {
     flexDirection: 'row',
@@ -479,21 +584,26 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   textPreview: {
-    backgroundColor: colors.surface,
+    backgroundColor: '#ffffff',
     borderRadius: 16,
-    padding: 16,
+    padding: 20,
     marginBottom: 40,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 2,
   },
   textPreviewTitle: {
-    fontSize: 14,
-    fontWeight: '600',
+    fontSize: 18,
+    fontWeight: '700',
     color: colors.text,
-    marginBottom: 8,
+    marginBottom: 16,
   },
   textPreviewContent: {
-    fontSize: 14,
-    color: colors.textLight,
-    lineHeight: 22,
+    fontSize: 16,
+    color: '#000000',
+    lineHeight: 26,
   },
 });
 

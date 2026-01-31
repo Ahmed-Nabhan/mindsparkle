@@ -15,6 +15,7 @@ import { Button } from '../components/Button';
 import { DocumentSelector } from '../components/DocumentSelector';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { generateQuiz } from '../services/openai';
+import { supabase } from '../services/supabase';
 import type { MainDrawerScreenProps } from '../navigation/types';
 import type { Document } from '../types/document';
 
@@ -47,22 +48,105 @@ export const ExamsScreen: React.FC = () => {
   };
 
   const handleStartExam = async () => {
-    if (!selectedDocument?.content) {
-      Alert.alert('Error', 'Document content not available');
+    if (!selectedDocument) {
+      Alert.alert('Error', 'Please select a document first');
       return;
     }
 
     setIsLoading(true);
+    setLoadingMessage('Loading document content...');
+
+    // Helper to check if content is valid (not a placeholder or too short)
+    const isValidContent = (content: string | undefined | null): boolean => {
+      if (!content || content.length < 100) return false;
+      // Check for placeholder markers
+      if (content.includes('__CLOUD_PROCESSING__')) return false;
+      if (content.includes('[TRUNCATED]')) return false;
+      if (content.includes('Processing...')) return false;
+      return true;
+    };
+
+    // Try multiple sources for content
+    let contentToUse = selectedDocument.content || '';
+    console.log('[ExamsScreen] Initial content:', contentToUse.length, 'chars, valid:', isValidContent(contentToUse));
+    
+    // Fallback 1: Try extracted data pages
+    if (!isValidContent(contentToUse) && selectedDocument.extractedData?.pages) {
+      const pagesContent = selectedDocument.extractedData.pages
+        .map((p: any) => p.text || '')
+        .join('\n\n');
+      if (isValidContent(pagesContent)) {
+        contentToUse = pagesContent;
+        console.log('[ExamsScreen] Using extractedData.pages:', contentToUse.length, 'chars');
+      }
+    }
+    
+    // Fallback 2: Try extracted data text
+    if (!isValidContent(contentToUse) && selectedDocument.extractedData?.text) {
+      if (isValidContent(selectedDocument.extractedData.text)) {
+        contentToUse = selectedDocument.extractedData.text;
+        console.log('[ExamsScreen] Using extractedData.text:', contentToUse.length, 'chars');
+      }
+    }
+    
+    // Fallback 3: Try chunks
+    if (!isValidContent(contentToUse) && selectedDocument.chunks && selectedDocument.chunks.length > 0) {
+      const chunksContent = selectedDocument.chunks.join('\n\n');
+      if (isValidContent(chunksContent)) {
+        contentToUse = chunksContent;
+        console.log('[ExamsScreen] Using chunks:', contentToUse.length, 'chars');
+      }
+    }
+
+    // Fallback 4: ALWAYS try fetching from cloud if local content is not valid
+    if (!isValidContent(contentToUse)) {
+      try {
+        setLoadingMessage('Fetching content from cloud...');
+        console.log('[ExamsScreen] Local content invalid, fetching from cloud...');
+        const { data: cloudDoc, error } = await supabase
+          .from('documents')
+          .select('extracted_text, content')
+          .eq('id', selectedDocument.id)
+          .single();
+        
+        if (!error && cloudDoc) {
+          // Prefer extracted_text (from Document AI), fall back to content
+          const cloudContent = cloudDoc.extracted_text || cloudDoc.content;
+          console.log('[ExamsScreen] Cloud response - extracted_text:', cloudDoc.extracted_text?.length || 0, 'chars, content:', cloudDoc.content?.length || 0, 'chars');
+          if (cloudContent && isValidContent(cloudContent)) {
+            contentToUse = cloudContent;
+            console.log('[ExamsScreen] ✅ Using cloud content:', contentToUse.length, 'chars');
+          } else {
+            console.log('[ExamsScreen] ❌ Cloud content also invalid');
+          }
+        } else {
+          console.log('[ExamsScreen] Cloud fetch error:', error?.message);
+        }
+      } catch (cloudError) {
+        console.log('[ExamsScreen] Cloud fetch exception:', cloudError);
+      }
+    }
+
+    // Final validation before sending to API
+    if (!isValidContent(contentToUse)) {
+      setIsLoading(false);
+      console.log('[ExamsScreen] ❌ Final content validation failed:', contentToUse.length, 'chars');
+      Alert.alert('Error', 'Document content not available. Please wait for extraction to complete or try a different document.');
+      return;
+    }
+
+    console.log('[ExamsScreen] ✅ Sending', contentToUse.length, 'chars to quiz generator');
     setLoadingMessage('Generating exam questions...');
 
     try {
       const quiz = await generateQuiz(
-        selectedDocument.content,
+        contentToUse,
         selectedDocument.chunks,
         questionCount,
         (progress, message) => setLoadingMessage(message),
         selectedDocument.fileUri,
-        selectedDocument.fileType
+        selectedDocument.fileType,
+        selectedDocument.extractedData
       );
 
       if (quiz && quiz.length > 0) {

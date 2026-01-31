@@ -258,6 +258,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   const [currentDocument, setCurrentDocument] = useState<Document | null>(null);
   const [extractedContent, setExtractedContent] = useState<ExtractedContent | null>(null);
   const [teacherSettings, setTeacherSettings] = useState<TeacherSettings>(DEFAULT_TEACHER_SETTINGS);
+
+  // Guard against async race conditions when switching documents.
+  // We keep an immediate ref of the currently selected/subscribed document ID.
+  const activeDocumentIdRef = useRef<string | null>(null);
   
   // Processing state
   const [isProcessing, setIsProcessing] = useState(false);
@@ -436,61 +440,80 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     console.log('[DocumentContext] Setting up Supabase Realtime subscriptions');
 
-    // Create channel for global documents changes
-    // This channel listens to all document changes for the current user
-    documentsChannelRef.current = supabase
-      .channel('documents-changes')
-      .on(
-        'postgres_changes',
-        {
-          event: '*', // Listen to INSERT, UPDATE, DELETE
-          schema: 'public',
-          table: 'documents',
-        },
-        (payload: RealtimePostgresChangesPayload<{ [key: string]: any }>) => {
-          console.log('[DocumentContext] Realtime documents change:', payload.eventType);
-          
-          // Handle different event types
-          switch (payload.eventType) {
-            case 'INSERT':
-              // New document added - could trigger refresh of document list
-              console.log('[DocumentContext] New document inserted:', payload.new?.id);
-              break;
-              
-            case 'UPDATE':
-              // Document updated - check if it's the current document
-              const updatedDoc = payload.new;
-              if (currentDocument && updatedDoc?.id === currentDocument.id) {
-                console.log('[DocumentContext] Current document updated, refreshing...');
-                // Update current document with new data
-                setCurrentDocument(prev => prev ? {
-                  ...prev,
-                  title: updatedDoc.title || prev.title,
-                  summary: updatedDoc.summary || prev.summary,
-                  content: updatedDoc.content || prev.content,
-                  updatedAt: updatedDoc.updated_at ? new Date(updatedDoc.updated_at) : prev.updatedAt,
-                } : null);
-              }
-              break;
-              
-            case 'DELETE':
-              // Document deleted - clear if it's the current document
-              const deletedId = payload.old?.id;
-              if (currentDocument && deletedId === currentDocument.id) {
-                console.log('[DocumentContext] Current document deleted, clearing...');
-                clearDocument();
-              }
-              break;
+    let isActive = true;
+
+    const setup = async () => {
+      // Only subscribe when authenticated; also use a user_id filter to reduce noise and risk.
+      const { data: { session } } = await supabase.auth.getSession();
+      const userId = session?.user?.id;
+      if (!userId) {
+        console.log('[DocumentContext] No session user; skipping Realtime subscriptions');
+        setIsRealtimeConnected(false);
+        return;
+      }
+
+      if (!isActive) return;
+
+      // Create channel for global documents changes
+      // Filter by user_id to avoid cross-user noise and reduce risk if RLS is misconfigured.
+      documentsChannelRef.current = supabase
+        .channel('documents-changes')
+        .on(
+          'postgres_changes',
+          {
+            event: '*', // Listen to INSERT, UPDATE, DELETE
+            schema: 'public',
+            table: 'documents',
+            filter: `user_id=eq.${userId}`,
+          },
+          (payload: RealtimePostgresChangesPayload<{ [key: string]: any }>) => {
+            console.log('[DocumentContext] Realtime documents change:', payload.eventType);
+            
+            // Handle different event types
+            switch (payload.eventType) {
+              case 'INSERT':
+                // New document added - could trigger refresh of document list
+                console.log('[DocumentContext] New document inserted:', payload.new?.id);
+                break;
+                
+              case 'UPDATE':
+                // Document updated - check if it's the current document
+                const updatedDoc = payload.new;
+                if (currentDocument && updatedDoc?.id === currentDocument.id) {
+                  console.log('[DocumentContext] Current document updated, refreshing...');
+                  // Update current document with new data
+                  setCurrentDocument(prev => prev ? {
+                    ...prev,
+                    title: updatedDoc.title || prev.title,
+                    summary: updatedDoc.summary || prev.summary,
+                    content: updatedDoc.content || prev.content,
+                    updatedAt: updatedDoc.updated_at ? new Date(updatedDoc.updated_at) : prev.updatedAt,
+                  } : null);
+                }
+                break;
+                
+              case 'DELETE':
+                // Document deleted - clear if it's the current document
+                const deletedId = payload.old?.id;
+                if (currentDocument && deletedId === currentDocument.id) {
+                  console.log('[DocumentContext] Current document deleted, clearing...');
+                  clearDocument();
+                }
+                break;
+            }
           }
-        }
-      )
-      .subscribe((status) => {
-        console.log('[DocumentContext] Documents channel status:', status);
-        setIsRealtimeConnected(status === 'SUBSCRIBED');
-      });
+        )
+        .subscribe();
+
+      console.log('[DocumentContext] Documents channel subscribed');
+      setIsRealtimeConnected(true);
+    };
+
+    setup();
 
     // Cleanup function - CRITICAL for preventing memory leaks
     return () => {
+      isActive = false;
       console.log('[DocumentContext] Cleaning up Realtime subscriptions');
       if (documentsChannelRef.current) {
         supabase.removeChannel(documentsChannelRef.current);
@@ -510,11 +533,25 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
    */
   const subscribeToDocument = useCallback((documentId: string) => {
     console.log('[DocumentContext] Subscribing to document:', documentId);
+
+    // Update active ref immediately so any in-flight async loads for a previous doc
+    // can be ignored when they complete.
+    activeDocumentIdRef.current = documentId;
     
     // Unsubscribe from previous document if any
     if (documentSpecificChannelRef.current) {
       supabase.removeChannel(documentSpecificChannelRef.current);
     }
+
+    // IMPORTANT: Reset document-scoped AI state when switching documents.
+    // Otherwise, if the newly selected document has no stored analysis/summaries yet,
+    // the UI may continue showing the previous document's generated features.
+    setProcessingMessage('');
+    setIsProcessing(false);
+    setAiProcessingStatus(DEFAULT_AI_PROCESSING_STATUS);
+    setDocumentAnalysis(null);
+    setDocumentSummaries([]);
+    setDocumentKnowledgeGraph(null);
 
     setSubscribedDocumentId(documentId);
 
@@ -644,9 +681,9 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           }
         }
       )
-      .subscribe((status) => {
-        console.log(`[DocumentContext] Document ${documentId} channel status:`, status);
-      });
+      .subscribe();
+
+    console.log(`[DocumentContext] Document ${documentId} channel subscribed`);
   }, []);
 
   /**
@@ -656,6 +693,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
    */
   const unsubscribeFromDocument = useCallback(() => {
     console.log('[DocumentContext] Unsubscribing from document');
+
+    activeDocumentIdRef.current = null;
     
     if (documentSpecificChannelRef.current) {
       supabase.removeChannel(documentSpecificChannelRef.current);
@@ -680,6 +719,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       documentSpecificChannelRef.current = null;
     }
     setSubscribedDocumentId(null);
+
+    activeDocumentIdRef.current = null;
     
     // Clear all document state
     setCurrentDocument(null);
@@ -731,6 +772,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         userId,
         modes,
         language,
+        false,
         // Progress callback for custom handling (optional)
         (status) => {
           // Status updates come through the subscription
@@ -771,6 +813,13 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
    */
   const loadStoredAIData = useCallback(async (documentId: string): Promise<void> => {
     console.log('[DocumentContext] Loading stored AI data for:', documentId);
+
+    const expectedDocumentId = documentId;
+
+    // Reset first so UI doesn't show stale data while loading.
+    setDocumentAnalysis(null);
+    setDocumentSummaries([]);
+    setDocumentKnowledgeGraph(null);
     
     try {
       // Load all AI data in parallel
@@ -780,20 +829,20 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         getStoredKnowledgeGraph(documentId),
       ]);
 
-      if (analysis) {
-        setDocumentAnalysis(analysis);
-        console.log('[DocumentContext] Loaded analysis:', analysis.vendorName);
+      // If the user switched documents while we were loading, ignore this result.
+      if (activeDocumentIdRef.current !== expectedDocumentId) {
+        console.log('[DocumentContext] Ignoring stale AI load for:', expectedDocumentId);
+        return;
       }
 
-      if (summaries && summaries.length > 0) {
-        setDocumentSummaries(summaries);
-        console.log('[DocumentContext] Loaded summaries:', summaries.length);
-      }
+      // Overwrite state for this document (including empty results).
+      setDocumentAnalysis(analysis || null);
+      setDocumentSummaries(Array.isArray(summaries) ? summaries : []);
+      setDocumentKnowledgeGraph(graph || null);
 
-      if (graph) {
-        setDocumentKnowledgeGraph(graph);
-        console.log('[DocumentContext] Loaded knowledge graph:', graph.nodeCount, 'nodes');
-      }
+      if (analysis) console.log('[DocumentContext] Loaded analysis:', analysis.vendorName);
+      if (Array.isArray(summaries)) console.log('[DocumentContext] Loaded summaries:', summaries.length);
+      if (graph) console.log('[DocumentContext] Loaded knowledge graph:', graph.nodeCount, 'nodes');
     } catch (error) {
       console.error('[DocumentContext] Failed to load AI data:', error);
     }

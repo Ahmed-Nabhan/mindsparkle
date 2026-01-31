@@ -1,7 +1,7 @@
 /**
  * Sign JWT Edge Function
- * Signs a JWT with the Google service account private key
- * Used for client-side Google Docs OCR authentication
+ * Signs an unsigned JWT with the Google service account private key from env.
+ * Intended for INTERNAL server-to-server use only.
  */
 
 const corsHeaders = {
@@ -16,6 +16,23 @@ function b64url(str: string): string {
   return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 }
 
+function pemToPkcs8Der(privateKeyPem: string): Uint8Array {
+  const pemHeader = "-----BEGIN PRIVATE KEY-----";
+  const pemFooter = "-----END PRIVATE KEY-----";
+
+  const start = privateKeyPem.indexOf(pemHeader);
+  const end = privateKeyPem.indexOf(pemFooter);
+  if (start === -1 || end === -1) {
+    throw new Error("Invalid private key PEM format");
+  }
+
+  const base64 = privateKeyPem
+    .slice(start + pemHeader.length, end)
+    .replace(/\s+/g, '');
+
+  return Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+}
+
 Deno.serve(async (req: Request) => {
   // Handle CORS preflight
   if (req.method === "OPTIONS") {
@@ -23,24 +40,44 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { unsignedToken, privateKey } = await req.json();
-    
-    if (!unsignedToken || !privateKey) {
+    // Internal-only guard: must be called with the service role key.
+    const expected = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '';
+    const auth = req.headers.get('authorization') || '';
+    if (!expected || auth !== `Bearer ${expected}`) {
       return new Response(
-        JSON.stringify({ error: "Missing unsignedToken or privateKey" }),
+        JSON.stringify({ error: 'Unauthorized' }),
+        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      );
+    }
+
+    const { unsignedToken } = await req.json();
+    
+    if (!unsignedToken) {
+      return new Response(
+        JSON.stringify({ error: "Missing unsignedToken" }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
+    const serviceAccountJson = Deno.env.get("GOOGLE_SERVICE_ACCOUNT_JSON");
+    if (!serviceAccountJson) {
+      return new Response(
+        JSON.stringify({ error: 'Google service account not configured' }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      );
+    }
+
+    const credentials = JSON.parse(serviceAccountJson);
+    const privateKey = credentials?.private_key;
+    if (!privateKey) {
+      return new Response(
+        JSON.stringify({ error: 'Invalid Google service account JSON (missing private_key)' }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      );
+    }
+
     // Parse the private key
-    const pemHeader = "-----BEGIN PRIVATE KEY-----";
-    const pemFooter = "-----END PRIVATE KEY-----";
-    const pemContents = privateKey.replace(/\\n/g, '\n').substring(
-      privateKey.indexOf(pemHeader) + pemHeader.length,
-      privateKey.indexOf(pemFooter)
-    ).replace(/\s/g, '');
-    
-    const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
+    const binaryDer = pemToPkcs8Der(String(privateKey));
     
     // Import the private key
     const cryptoKey = await crypto.subtle.importKey(

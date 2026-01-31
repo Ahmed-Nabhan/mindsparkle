@@ -675,12 +675,17 @@ export async function requestAIProcessing(
     // Queue the processing task
     const { data: task, error } = await supabase
       .from('processing_queue')
-      .insert({
-        document_id: documentId,
-        task_type: mode,
-        priority: mode === 'summary' ? 10 : 5, // Summary has higher priority
-        status: 'pending',
-      })
+      .upsert(
+        {
+          document_id: documentId,
+          job_type: `ai_${mode}`,
+          status: 'queued',
+          next_run_at: new Date().toISOString(),
+          payload: { mode, options: options || {} },
+          idempotency_key: `ai:${documentId}:${mode}`,
+        },
+        { onConflict: 'idempotency_key' }
+      )
       .select('id')
       .single();
     

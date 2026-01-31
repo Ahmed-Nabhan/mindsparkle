@@ -4,12 +4,18 @@
   "main": "index.js",
   "scripts": {
     "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
+    "dev:client": "npx expo start",
+    "eas:build:ios": "npx eas build --profile development --platform ios --wait",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "web": "expo start --web",
+    "export:web": "expo export -p web",
+    "export:web:docs": "expo export -p web --output-dir docs/app && node scripts/fix_web_export_paths.js",
+    "test": "vitest run",
     "postinstall": "patch-package"
   },
   "dependencies": {
+    "@expo/metro-runtime": "~5.0.5",
     "@react-native-async-storage/async-storage": "2.1.2",
     "@react-native-community/slider": "^4.5.7",
     "@react-navigation/drawer": "^7.1.1",
@@ -21,7 +27,7 @@
     "expo": "^53.0.0",
     "expo-apple-authentication": "~7.2.4",
     "expo-asset": "~11.1.7",
-    "expo-build-properties": "^1.0.10",
+    "expo-build-properties": "0.14.8",
     "expo-clipboard": "~7.1.5",
     "expo-constants": "~17.1.8",
     "expo-crypto": "~14.1.5",
@@ -35,8 +41,10 @@
     "expo-secure-store": "~14.2.4",
     "expo-sharing": "~13.1.5",
     "expo-speech": "~13.1.7",
+    "expo-splash-screen": "~0.30.10",
     "expo-sqlite": "~15.2.14",
     "expo-status-bar": "~2.2.3",
+    "expo-updates": "~0.28.17",
     "jszip": "^3.10.1",
     "pako": "^2.1.0",
     "react": "19.0.0",
@@ -52,7 +60,9 @@
     "react-native-safe-area-context": "5.4.0",
     "react-native-screens": "~4.11.1",
     "react-native-url-polyfill": "^3.0.0",
-    "react-native-webview": "^13.16.0",
+    "react-native-web": "^0.20.0",
+    "react-native-web-webview": "^1.0.2",
+    "react-native-webview": "13.13.5",
     "react-native-youtube-iframe": "^2.4.1",
     "scheduler": "^0.25.0"
   },
@@ -64,7 +74,8 @@
     "eas-cli": "^16.28.0",
     "patch-package": "^8.0.0",
     "sharp": "^0.34.5",
-    "typescript": "~5.8.3"
+    "typescript": "~5.8.3",
+    "vitest": "^2.1.8"
   },
   "private": true,
   "overrides": {

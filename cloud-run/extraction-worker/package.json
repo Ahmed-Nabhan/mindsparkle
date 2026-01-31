@@ -1,0 +1,22 @@
+{
+  "name": "mindsparkle-extraction-worker",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "dist/worker.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/worker.js",
+    "dev": "ts-node src/worker.ts"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.69",
+    "@supabase/supabase-js": "^2.49.1",
+    "pdfjs-dist": "^4.10.38"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}

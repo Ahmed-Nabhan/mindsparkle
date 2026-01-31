@@ -17,6 +17,7 @@ import { DocumentSelector } from '../components/DocumentSelector';
 import { useDocument } from '../hooks/useDocument';
 import { usePerformance } from '../hooks/usePerformance';
 import { generateQuiz } from '../services/openai';
+import { supabase } from '../services/supabase';
 import { generateId } from '../utils/helpers';
 import type { MainDrawerScreenProps } from '../navigation/types';
 import type { Document } from '../types/document';
@@ -40,17 +41,19 @@ export const TestScreen: React.FC = () => {
   const [loadingMessage, setLoadingMessage] = useState('');
   const [mode, setMode] = useState<'select' | 'config' | 'test' | 'results'>('select');
   const [questionCount, setQuestionCount] = useState(5);
+  const focusTopics = (route.params as any)?.focusTopics as string[] | undefined;
 
   // Check if we came from DocumentActions with a documentId
   useEffect(() => {
-    if (route.params?.documentId) {
-      loadDocumentFromParams();
+    const docId = route.params?.documentId;
+    if (docId) {
+      loadDocumentFromParams(docId);
     }
   }, []);
 
-  const loadDocumentFromParams = async () => {
+  const loadDocumentFromParams = async (docId: string) => {
     setIsLoading(true);
-    const doc = await getDocument(route.params.documentId);
+    const doc = await getDocument(docId);
     if (doc) {
       setDocument(doc);
       setMode('config');
@@ -64,28 +67,101 @@ export const TestScreen: React.FC = () => {
   };
 
   const handleGenerateQuiz = async () => {
+    setIsGenerating(true);
+    setLoadingMessage('Loading document content...');
+    
+    console.log('[TestScreen] Starting quiz generation for document:', document?.id);
+    console.log('[TestScreen] Local content length:', document?.content?.length || 0);
+    
     // ENHANCED: Try multiple sources for content
     let contentToUse = document?.content || '';
     
     // Fallback 1: Try extracted data pages
-    if (!contentToUse && document?.extractedData?.pages) {
-      contentToUse = document.extractedData.pages
-        .map(p => p.text || '')
-        .join('\n\n');
+    if ((!contentToUse || contentToUse.length < 100) && document?.extractedData?.pages) {
+      const MAX_CONTEXT = 250000;
+      const MAX_PAGE_SNIPPET = 4000;
+      let acc = '';
+      for (const p of document.extractedData.pages as any[]) {
+        if (acc.length >= MAX_CONTEXT) break;
+        const t = String(p?.text || '').trim();
+        if (!t) continue;
+        acc += (acc ? '\n\n' : '') + t.slice(0, MAX_PAGE_SNIPPET);
+      }
+      contentToUse = acc;
+      console.log('[TestScreen] Using extractedData.pages:', contentToUse.length, 'chars');
     }
     
     // Fallback 2: Try extracted data text
-    if (!contentToUse && document?.extractedData?.text) {
+    if ((!contentToUse || contentToUse.length < 100) && document?.extractedData?.text) {
       contentToUse = document.extractedData.text;
+      console.log('[TestScreen] Using extractedData.text:', contentToUse.length, 'chars');
+    }
+
+    // Add structured context (tables / image captions) if available
+    if (document?.extractedData && contentToUse && contentToUse.length < 250000) {
+      try {
+        const tables = Array.isArray(document.extractedData.tables) ? document.extractedData.tables.slice(0, 15) : [];
+        const images = Array.isArray(document.extractedData.images) ? document.extractedData.images.slice(0, 20) : [];
+        const tableText = tables.length
+          ? '\n\nTABLES (extracted):\n' + tables.map((t: any) => {
+              const headers = Array.isArray(t.headers) ? t.headers.join(' | ') : '';
+              const rows = Array.isArray(t.rows) ? t.rows.slice(0, 10).map((r: any) => (Array.isArray(r) ? r.join(' | ') : String(r))).join('\n') : '';
+              return `- ${t.title || 'Table'} (p.${t.pageNumber || '?'})\n${headers}\n${rows}`;
+            }).join('\n\n')
+          : '';
+        const imageText = images.length
+          ? '\n\nIMAGES (captions):\n' + images.map((img: any) => `- (p.${img.pageNumber || '?'}) ${String(img.caption || '').trim()}`).filter(Boolean).join('\n')
+          : '';
+
+        const combined = `${contentToUse}${tableText}${imageText}`;
+        contentToUse = combined.slice(0, 300000);
+      } catch {
+        // ignore
+      }
     }
     
     // Fallback 3: Try chunks
-    if (!contentToUse && document?.chunks && document.chunks.length > 0) {
+    if ((!contentToUse || contentToUse.length < 100) && document?.chunks && document.chunks.length > 0) {
       contentToUse = document.chunks.join('\n\n');
+      console.log('[TestScreen] Using chunks:', contentToUse.length, 'chars');
     }
+    
+    console.log('[TestScreen] Content before cloud fetch:', contentToUse?.length || 0, 'chars');
+    
+    // Fallback 4: Try fetching from cloud if local content is truncated or missing
+    if (!contentToUse || contentToUse.length < 100 || contentToUse.includes('[TRUNCATED]')) {
+      try {
+        setLoadingMessage('Fetching content from cloud...');
+        console.log('[TestScreen] Fetching from cloud for document:', document?.id);
+        const { data: cloudDoc, error } = await supabase
+          .from('documents')
+          .select('extracted_text, content')
+          .eq('id', document?.id)
+          .single();
+        
+        console.log('[TestScreen] Cloud fetch result:', error ? 'ERROR' : 'SUCCESS', 
+          'extracted_text:', cloudDoc?.extracted_text?.length || 0,
+          'content:', cloudDoc?.content?.length || 0);
+        
+        if (!error && cloudDoc) {
+          const cloudContent = cloudDoc.extracted_text || cloudDoc.content;
+          if (cloudContent && cloudContent.length > (contentToUse?.length || 0)) {
+            contentToUse = cloudContent;
+            console.log('[TestScreen] Using cloud content:', contentToUse.length, 'chars');
+          }
+        } else if (error) {
+          console.log('[TestScreen] Cloud fetch error:', error);
+        }
+      } catch (cloudError) {
+        console.log('[TestScreen] Cloud fetch failed:', cloudError);
+      }
+    }
+    
+    console.log('[TestScreen] Final content length:', contentToUse?.length || 0, 'chars');
     
     // Final check
     if (!contentToUse || contentToUse.trim().length < 50) {
+      setIsGenerating(false);
       Alert.alert(
         'Content Not Available', 
         'Could not extract text from this document. It may be:\n\n• A scanned PDF (image-only)\n• Password protected\n• Corrupted\n\nTry uploading a text-based PDF or different document.'
@@ -93,7 +169,6 @@ export const TestScreen: React.FC = () => {
       return;
     }
 
-    setIsGenerating(true);
     setLoadingMessage('Generating quiz questions...');
 
     try {
@@ -103,7 +178,9 @@ export const TestScreen: React.FC = () => {
         questionCount,
         (progress, message) => setLoadingMessage(message),
         document?.fileUri,
-        document?.fileType
+        document?.fileType,
+        document?.extractedData,
+        focusTopics
       );
 
       if (quiz && quiz.length > 0) {

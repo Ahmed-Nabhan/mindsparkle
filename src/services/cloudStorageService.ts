@@ -35,12 +35,14 @@ import * as FileSystem from 'expo-file-system';
 import { 
   supabase, 
   getSupabaseUrl,
+  getSupabaseAnonKey,
   createDocument,
   updateDocument,
   getSignedUrl as getSupabaseSignedUrl,
 } from './supabase';
 import { decode as atob } from 'base-64';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import type { ExtractedData } from '../types/document';
 
 // ============================================
 // CONSTANTS
@@ -100,6 +102,9 @@ export interface CloudUploadResult {
   storagePath?: string;
   signedUrl?: string;
   publicUrl?: string;
+  extractedText?: string;
+  extractedData?: ExtractedData;
+  status?: CloudDocument['status'];
   error?: string;
 }
 
@@ -113,7 +118,7 @@ export interface CloudDocument {
   fileType: string;
   fileSize: number;
   storagePath: string;
-  status: 'uploading' | 'processing' | 'ready' | 'error';
+  status: 'uploading' | 'processing' | 'ready' | 'completed' | 'error';
   extractedText?: string;
   processingError?: string;
   createdAt: Date;
@@ -336,6 +341,7 @@ export const updateStorageLimit = async (userId: string, isPremium: boolean): Pr
  * @param fileType - MIME type (e.g., 'application/pdf')
  * @param fileSize - File size in bytes
  * @param onProgress - Optional callback for progress updates
+ * @param isPro - Whether user has Pro subscription (for premium OCR)
  * @returns Upload result with cloud document ID and URLs
  * 
  * @example
@@ -346,7 +352,8 @@ export const updateStorageLimit = async (userId: string, isPremium: boolean): Pr
  *   'document.pdf',
  *   'application/pdf',
  *   15000000,
- *   (progress, message) => console.log(`${progress}%: ${message}`)
+ *   (progress, message) => console.log(`${progress}%: ${message}`),
+ *   true // isPro
  * );
  */
 export const uploadLargeFile = async (
@@ -356,9 +363,17 @@ export const uploadLargeFile = async (
   fileName: string,
   fileType: string,
   fileSize: number,
-  onProgress?: (progress: number, message: string) => void
+  onProgress?: (progress: number, message: string) => void,
+  isPro: boolean = false,
+  abortSignal?: AbortSignal
 ): Promise<CloudUploadResult> => {
   try {
+    let extractedTextForReturn: string | undefined;
+    let extractedDataForReturn: ExtractedData | undefined;
+    let statusForReturn: CloudDocument['status'] | undefined;
+    if (abortSignal?.aborted) {
+      return { success: false, error: 'Upload cancelled' };
+    }
     // Calculate readable file sizes for messages
     const fileSizeMB = fileSize / (1024 * 1024);
     const fileSizeGB = fileSize / (1024 * 1024 * 1024);
@@ -436,6 +451,9 @@ export const uploadLargeFile = async (
     console.log(`[CloudStorage] Uploading ${fileSizeMB.toFixed(1)}MB file using streaming upload`);
 
     try {
+      if (abortSignal?.aborted) {
+        throw new Error('Upload cancelled');
+      }
       // Get auth session for authorization header
       const { data: { session } } = await supabase.auth.getSession();
       if (!session?.access_token) {
@@ -444,41 +462,57 @@ export const uploadLargeFile = async (
 
       // Construct upload URL
       const supabaseUrl = getSupabaseUrl();
+      const supabaseAnonKey = getSupabaseAnonKey();
       const uploadUrl = `${supabaseUrl}/storage/v1/object/${STORAGE_BUCKET}/${storagePath}`;
 
       onProgress?.(20, 'Uploading file...');
 
-      // Use FileSystem.uploadAsync for streaming
-      // This handles large files without loading into memory
-      const uploadResult = await FileSystem.uploadAsync(uploadUrl, fileUri, {
-        httpMethod: 'POST',
-        uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
-        headers: {
-          'Authorization': `Bearer ${session.access_token}`,
-          'Content-Type': fileType,
-          'x-upsert': 'true', // Replace if exists
-        },
-      });
+        // This Expo build does not support createUploadResumable reliably.
+        // Use uploadAsync to avoid crashing, with a size-based timeout.
+        const UPLOAD_TIMEOUT_MS = Math.min(
+          60 * 60 * 1000, // cap at 60 minutes
+          Math.max(10 * 60 * 1000, Math.round(fileSizeMB) * 20 * 1000) // 10m min, ~20s/MB
+        );
 
-      console.log('[CloudStorage] Upload response status:', uploadResult.status);
+        const uploadPromise = FileSystem.uploadAsync(uploadUrl, fileUri, {
+          httpMethod: 'POST',
+          uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+          headers: {
+            'Authorization': `Bearer ${session.access_token}`,
+            apikey: supabaseAnonKey,
+            'Content-Type': fileType,
+            'x-upsert': 'true',
+          },
+        });
 
-      // Check for upload errors
-      if (uploadResult.status !== 200 && uploadResult.status !== 201) {
-        let errorMessage = `Upload failed with status ${uploadResult.status}`;
-        
-        try {
-          const parsed = JSON.parse(uploadResult.body);
-          errorMessage = parsed.message || parsed.error || errorMessage;
-        } catch (e) {
-          if (uploadResult.body) {
-            errorMessage = uploadResult.body;
+        const timeoutPromise = new Promise<FileSystem.FileSystemUploadResult>((_, reject) => {
+          const id = setTimeout(() => {
+            clearTimeout(id);
+            reject(new Error('Upload timed out. Please try again on a stable connection.'));
+          }, UPLOAD_TIMEOUT_MS);
+        });
+
+        const uploadResult = await Promise.race([uploadPromise, timeoutPromise]);
+
+        console.log('[CloudStorage] Upload response status:', uploadResult.status);
+
+        // Check for upload errors
+        if (uploadResult.status !== 200 && uploadResult.status !== 201) {
+          let errorMessage = `Upload failed with status ${uploadResult.status}`;
+          
+          try {
+            const parsed = JSON.parse(uploadResult.body);
+            errorMessage = parsed.message || parsed.error || errorMessage;
+          } catch {
+            if (uploadResult.body) {
+              errorMessage = uploadResult.body;
+            }
           }
+          
+          throw new Error(errorMessage);
         }
-        
-        throw new Error(errorMessage);
-      }
 
-      onProgress?.(80, 'Upload complete, processing...');
+        onProgress?.(80, 'Upload complete, processing...');
 
     } catch (uploadErr: any) {
       console.error('[CloudStorage] Upload error:', uploadErr);
@@ -508,8 +542,13 @@ export const uploadLargeFile = async (
       return { success: false, error: errorMessage };
     }
 
+    if (abortSignal?.aborted) {
+      // Best-effort cancellation: upload already happened, but stop further processing.
+      return { success: false, error: 'Upload cancelled' };
+    }
+
     // ========================================
-    // STEP 6: Update status and trigger extraction
+    // STEP 6: Update status and call Document Intelligence
     // ========================================
     await supabase
       .from('cloud_documents')
@@ -518,25 +557,179 @@ export const uploadLargeFile = async (
 
     onProgress?.(85, 'Processing document...');
 
-    // Trigger text extraction via edge function (non-blocking)
+    // ALWAYS call Document Intelligence for extraction
+    // Python-based extraction: python-pptx, python-docx, Document AI for PDF
+    console.log(`[CloudStorage] Processing ${fileSizeMB.toFixed(1)}MB file with Document Intelligence...`);
+    onProgress?.(86, 'Processing with Document Intelligence...');
+    
     try {
-      const { data: extractResult, error: extractError } = await supabase.functions
-        .invoke('extract-text', {
-          body: {
-            cloudDocumentId,
-            storagePath,
-            fileType,
+      // Get a signed URL for the file
+      const { data: signedUrlData } = await supabase.storage
+        .from(STORAGE_BUCKET)
+        .createSignedUrl(storagePath, 1800); // 30 minute expiry
+      
+        if (!signedUrlData?.signedUrl) {
+          throw new Error('Failed to create signed URL for Document Intelligence');
+        }
+        
+        // Call NEW Document Intelligence service (replaces old OCR service)
+        const { Config } = await import('./config');
+        const docIntelUrl = Config.DOCUMENT_INTELLIGENCE_URL || 'https://mindsparkle-document-intelligence-900398462112.us-central1.run.app';
+        
+        console.log(`[CloudStorage] Calling Document Intelligence: ${docIntelUrl}/extract`);
+        onProgress?.(88, 'Extracting text with Document Intelligence...');
+        
+        // Send signed URL to Document Intelligence service (it will download the file)
+        console.log(`[CloudStorage] Sending file to Document Intelligence: ${fileName}, type: ${fileType}`);
+        
+        // Create abort controller with a size-based timeout.
+        // Large PDFs can take a long time to download+extract.
+        const abortController = new AbortController();
+        const docIntelTimeoutMs = Math.min(
+          30 * 60 * 1000, // cap at 30 minutes
+          Math.max(5 * 60 * 1000, Math.round(fileSizeMB) * 20 * 1000) // 5m min, ~20s/MB
+        );
+        const timeoutId = setTimeout(() => abortController.abort(), docIntelTimeoutMs);
+        
+        const ocrResponse = await fetch(`${docIntelUrl}/extract`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
           },
+          body: JSON.stringify({
+            signedUrl: signedUrlData.signedUrl,
+            fileName: fileName,
+            mimeType: fileType,
+          }),
+          signal: abortController.signal,
         });
+        
+        clearTimeout(timeoutId);
+        
+        const extractResult = await ocrResponse.json();
+        console.log(`[CloudStorage] Document Intelligence response:`, JSON.stringify(extractResult).substring(0, 500));
+        
+        // Document Intelligence returns: { success, canonical: { content: { full_text } } }
+        const extractedText = extractResult.canonical?.content?.full_text || 
+                             extractResult.document?.text || 
+                             extractResult.text || 
+                             '';
 
-      if (extractError) {
-        console.warn('[CloudStorage] Text extraction trigger error:', extractError);
-      } else {
-        console.log('[CloudStorage] Text extraction triggered:', extractResult);
-      }
-    } catch (extractErr) {
-      // Don't fail upload if extraction trigger fails
-      console.warn('[CloudStorage] Text extraction trigger failed:', extractErr);
+        // Build page-aware extracted data when available
+        const canonical = extractResult?.canonical;
+        const canonicalPageCount = canonical?.structure?.page_count;
+        const canonicalBlocks = canonical?.content?.text_blocks;
+        const canonicalImages = canonical?.structure?.images;
+        if (canonical && Array.isArray(canonicalBlocks)) {
+          const pagesText: Record<number, string[]> = {};
+          for (const block of canonicalBlocks) {
+            const pageNumber = Number(block?.page ?? block?.pageNumber ?? 1);
+            const text = String(block?.text ?? '').trim();
+            if (!text) continue;
+            if (!pagesText[pageNumber]) pagesText[pageNumber] = [];
+            pagesText[pageNumber].push(text);
+          }
+
+          // Optional: attach thumbnails for pages with no extracted text
+          const pageThumbs: Record<number, string> = {};
+          if (Array.isArray(canonicalImages)) {
+            for (const img of canonicalImages) {
+              const pageNumber = Number((img as any)?.page ?? (img as any)?.pageNumber ?? 0);
+              const type = String((img as any)?.type ?? '').toLowerCase();
+              const dataUrl = String((img as any)?.data_url ?? (img as any)?.dataUrl ?? '').trim();
+              if (!pageNumber || !Number.isFinite(pageNumber) || pageNumber <= 0) continue;
+              if (type !== 'page_thumbnail') continue;
+              if (!dataUrl.startsWith('data:image/')) continue;
+              if (!pageThumbs[pageNumber]) pageThumbs[pageNumber] = dataUrl;
+            }
+          }
+
+          const inferredMaxPage = Math.max(1, ...Object.keys(pagesText).map(k => Number(k)).filter(n => Number.isFinite(n) && n > 0));
+          const totalPages = (typeof canonicalPageCount === 'number' && canonicalPageCount > 0)
+            ? canonicalPageCount
+            : inferredMaxPage;
+
+          const pages = Array.from({ length: totalPages }, (_, idx) => {
+            const pageNumber = idx + 1;
+            const pageText = (pagesText[pageNumber] || []).join('\n\n');
+            const thumb = pageThumbs[pageNumber];
+            const images = thumb
+              ? [{
+                  id: `thumb-${pageNumber}`,
+                  url: thumb,
+                  caption: 'Page thumbnail (no text extracted)',
+                  pageNumber,
+                  type: 'figure' as const,
+                }]
+              : [];
+            return { pageNumber, text: pageText, images, tables: [] };
+          });
+
+          extractedDataForReturn = {
+            text: extractedText,
+            pages,
+            images: [],
+            tables: [],
+            equations: [],
+            totalPages,
+          };
+        }
+        
+        // Some legitimate documents are short (e.g., 1-page notes). Treat small-but-nonempty
+        // extraction as success rather than failing the whole document.
+        if (extractResult.success && extractedText && extractedText.length > 10) {
+          console.log(`[CloudStorage] Document Intelligence extracted ${extractedText.length} chars`);
+          extractedTextForReturn = extractedText;
+          statusForReturn = 'ready';
+
+          // Store a large preview in DB (avoid extreme row sizes), but keep much more
+          // than the previous 2MB cap so big textbooks don't lose most of their content.
+          const MAX_STORED_EXTRACTED_TEXT = 10 * 1024 * 1024; // 10MB
+          const storedExtractedText = extractedText.length > MAX_STORED_EXTRACTED_TEXT
+            ? extractedText.substring(0, MAX_STORED_EXTRACTED_TEXT) +
+              `\n\n[Note: Text truncated due to size limit. Full document is ${(extractedText.length / (1024 * 1024)).toFixed(1)}MB]`
+            : extractedText;
+          
+          // Update cloud_documents with extracted text
+          // IMPORTANT: status must be 'ready' to match waitForProcessing check
+          await supabase
+            .from('cloud_documents')
+            .update({
+              status: 'ready',
+              extracted_text: storedExtractedText,
+              processed_at: new Date().toISOString(),
+            })
+            .eq('id', cloudDocumentId);
+          
+          onProgress?.(92, 'Text extraction complete!');
+        } else {
+          console.warn('[CloudStorage] Document Intelligence returned no text:', extractResult.error || 'unknown error');
+          statusForReturn = 'error';
+          // Update status to error
+          await supabase
+            .from('cloud_documents')
+            .update({ status: 'error', processing_error: extractResult.error || 'No text extracted' })
+            .eq('id', cloudDocumentId);
+        }
+    } catch (docIntelErr: any) {
+      console.error('[CloudStorage] Document Intelligence failed:', docIntelErr.message);
+      console.error('[CloudStorage] Full error:', JSON.stringify(docIntelErr, null, 2));
+      
+      // For large files, extraction failure is not critical - document can still be accessed
+      const errorMessage = docIntelErr.name === 'AbortError' 
+        ? 'Text extraction timed out (file too large). You can still process the document manually.'
+        : docIntelErr.message;
+        
+      await supabase
+        .from('cloud_documents')
+        .update({ 
+          status: 'error', 
+          processing_error: errorMessage 
+        })
+        .eq('id', cloudDocumentId);
+
+      statusForReturn = 'error';
     }
 
     // ========================================
@@ -569,6 +762,9 @@ export const uploadLargeFile = async (
       cloudDocumentId,
       storagePath,
       signedUrl,
+      extractedText: extractedTextForReturn,
+      extractedData: extractedDataForReturn,
+      status: statusForReturn,
     };
   } catch (error: any) {
     console.error('[CloudStorage] uploadLargeFile error:', error);
@@ -681,19 +877,23 @@ export const getUserCloudDocuments = async (userId: string): Promise<CloudDocume
  */
 export const waitForProcessing = async (
   cloudDocumentId: string,
-  maxWaitMs: number = 60000,
-  pollIntervalMs: number = 2000
+  maxWaitMs: number = 180000, // Increased to 3 minutes for large PDFs
+  pollIntervalMs: number = 3000, // Poll every 3 seconds to reduce load
+  abortSignal?: AbortSignal
 ): Promise<CloudDocument | null> => {
   const startTime = Date.now();
   
   while (Date.now() - startTime < maxWaitMs) {
+    if (abortSignal?.aborted) {
+      throw new Error('Upload cancelled');
+    }
     const doc = await getCloudDocument(cloudDocumentId);
     
     if (!doc) return null;
     
-    // Check if processing is complete
-    if (doc.status === 'ready') {
-      console.log(`[CloudStorage] Processing complete in ${Date.now() - startTime}ms`);
+    // Check if processing is complete (accept both 'ready' and 'completed')
+    if (doc.status === 'ready' || doc.status === 'completed') {
+      console.log(`[CloudStorage] Processing complete in ${Date.now() - startTime}ms, status: ${doc.status}`);
       return doc;
     }
     

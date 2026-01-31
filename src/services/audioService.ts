@@ -27,6 +27,7 @@ class AudioService {
   private currentSettings: AudioSettings = DEFAULT_SETTINGS;
   private isSpeaking: boolean = false;
   private isPaused: boolean = false;
+  private stopRequested: boolean = false;
   private onPlayingChange?: (playing: boolean) => void;
   private onProgressChange?: (progress: number) => void;
   private availableVoices: VoiceOption[] = [];
@@ -121,17 +122,56 @@ class AudioService {
 
   // Speak with progress tracking (splits into sentences)
   async speakWithProgress(text: string): Promise<void> {
+    // Stop any current speech, then speak the full text in chunks.
+    // IMPORTANT: We must not use `this.isSpeaking` to decide if we should continue,
+    // because `Speech.speak()` sets onDone between chunks.
+    await this.stop();
+    this.stopRequested = false;
+
     const sentences = this.splitIntoSentences(text);
-    const totalSentences = sentences.length;
+    const totalSentences = Math.max(1, sentences.length);
+
+    this.isSpeaking = true;
+    this.isPaused = false;
+    this.onPlayingChange?.(true);
 
     for (let i = 0; i < sentences.length; i++) {
-      if (!this.isSpeaking && i > 0) break; // Stopped
-      
+      if (this.stopRequested) break;
       this.onProgressChange?.(((i + 1) / totalSentences) * 100);
-      await this.speak(sentences[i]);
+      await this.speakOnce(sentences[i]);
     }
 
+    this.isSpeaking = false;
+    this.onPlayingChange?.(false);
     this.onProgressChange?.(100);
+  }
+
+  // Speak a single chunk without stopping first.
+  // Used by speakWithProgress() to avoid canceling speech every sentence.
+  private async speakOnce(text: string): Promise<void> {
+    if (!text || text.trim().length === 0) return;
+
+    return new Promise((resolve, reject) => {
+      Speech.speak(text, {
+        rate: this.currentSettings.rate,
+        pitch: this.currentSettings.pitch,
+        language: this.currentSettings.language,
+        voice: this.currentSettings.voice,
+        onStart: () => {
+          this.isSpeaking = true;
+        },
+        onDone: () => {
+          resolve();
+        },
+        onStopped: () => {
+          resolve();
+        },
+        onError: (error) => {
+          console.error('Speech error:', error);
+          reject(error);
+        },
+      });
+    });
   }
 
   // Split text into sentences for better progress tracking
@@ -161,6 +201,7 @@ class AudioService {
 
   // Stop speech
   async stop(): Promise<void> {
+    this.stopRequested = true;
     await Speech.stop();
     this.isSpeaking = false;
     this.isPaused = false;

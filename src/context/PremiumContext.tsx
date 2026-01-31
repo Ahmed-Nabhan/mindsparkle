@@ -1,5 +1,6 @@
 import React, { createContext, useState, useContext, useEffect, ReactNode, useCallback } from 'react';
-import { Alert } from 'react-native';
+import { Alert, AppState } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import revenueCatService, { 
   ProductInfo, 
   SubscriptionInfo, 
@@ -8,26 +9,30 @@ import revenueCatService, {
 } from '../services/revenueCat';
 import { useAuth } from './AuthContext';
 import * as CloudStorage from '../services/cloudStorageService';
+import { supabase } from '../services/supabase';
 
 // Feature limits for free tier
 export const FREE_TIER_LIMITS = {
-  maxDocuments: 5,
-  maxQuizzesPerDay: 3,
-  maxFlashcardsPerDoc: 20,
-  maxChatMessages: 10,
-  canUseVideoGen: true, // Video is FREE for everyone!
-  canUseAdvancedAnalytics: false,
-  canUseCloudSync: false,
-  canExportPdf: false,
-  canUseAudioSummary: false,
-  canCreateFolders: false,
-  maxFolders: 0,
+  maxDocuments: 15,
+  // Free users can use all learning features, but only for up to 5 documents.
+  maxQuizzesPerDay: -1,
+  maxPresentationsPerDay: -1,
+  maxFlashcardsPerDoc: -1,
+  maxChatMessages: 30,
+  canUseVideoGen: true,
+  canUseAdvancedAnalytics: true,
+  canUseCloudSync: true,
+  canExportPdf: true,
+  canUseAudioSummary: true,
+  canCreateFolders: true,
+  maxFolders: -1,
 };
 
 // Unlimited for pro tier
 export const PRO_TIER_LIMITS = {
   maxDocuments: -1, // -1 means unlimited
   maxQuizzesPerDay: -1,
+  maxPresentationsPerDay: -1,
   maxFlashcardsPerDoc: -1,
   maxChatMessages: -1,
   canUseVideoGen: true,
@@ -42,6 +47,7 @@ export const PRO_TIER_LIMITS = {
 export interface PremiumFeatures {
   maxDocuments: number;
   maxQuizzesPerDay: number;
+  maxPresentationsPerDay: number;
   maxFlashcardsPerDoc: number;
   maxChatMessages: number;
   canUseVideoGen: boolean;
@@ -72,10 +78,14 @@ interface PremiumContextType {
   showPaywall: (feature: string) => void;
   
   // Daily usage tracking
+  dailyDocumentCount: number;
   dailyQuizCount: number;
   dailyChatCount: number;
+  dailyPresentationCount: number;
+  incrementDocumentCount: () => void;
   incrementQuizCount: () => void;
   incrementChatCount: () => void;
+  incrementPresentationCount: () => void;
   
   // Debug (development only)
   debugPremium: boolean;
@@ -98,9 +108,49 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
   const [debugPremium, setDebugPremium] = useState(false);
   
   // Daily usage counters (reset at midnight)
+  const [dailyDocumentCount, setDailyDocumentCount] = useState(0);
   const [dailyQuizCount, setDailyQuizCount] = useState(0);
   const [dailyChatCount, setDailyChatCount] = useState(0);
+  const [dailyPresentationCount, setDailyPresentationCount] = useState(0);
   const [lastResetDate, setLastResetDate] = useState<string>('');
+
+  const getTodayKey = () => new Date().toDateString();
+  const getDailyUsageStorageKey = useCallback(() => {
+    return `mindsparkle.dailyUsage.v2:${user?.id || 'anon'}`;
+  }, [user?.id]);
+
+  const persistDailyUsage = useCallback(async (next: {
+    date: string;
+    documents: number;
+    quiz: number;
+    chat: number;
+    presentation: number;
+  }) => {
+    try {
+      await AsyncStorage.setItem(getDailyUsageStorageKey(), JSON.stringify(next));
+    } catch {
+      // ignore
+    }
+  }, [getDailyUsageStorageKey]);
+
+  const resetDailyUsageIfNeeded = useCallback(() => {
+    const today = getTodayKey();
+    if (lastResetDate === today) return;
+
+    setDailyDocumentCount(0);
+    setDailyQuizCount(0);
+    setDailyChatCount(0);
+    setDailyPresentationCount(0);
+    setLastResetDate(today);
+
+    void persistDailyUsage({
+      date: today,
+      documents: 0,
+      quiz: 0,
+      chat: 0,
+      presentation: 0,
+    });
+  }, [lastResetDate, persistDailyUsage]);
 
   // Initialize RevenueCat
   useEffect(() => {
@@ -114,40 +164,102 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
     }
   }, [user?.id]);
 
-  // 👑 Check premium status when user email changes
-  // This ensures owner gets Pro access immediately after sign in
+  // Check subscription from database
   useEffect(() => {
-    const OWNER_EMAILS = [
-      'ahmedadel737374@icloud.com',
-      'jzggwd5ynj@privaterelay.appleid.com', // Apple private relay email
-    ];
-    const userEmail = user?.email?.toLowerCase();
-    const isOwner = OWNER_EMAILS.some(email => email.toLowerCase() === userEmail);
+    const checkDatabaseSubscription = async () => {
+      if (!user?.id) return;
+      
+      try {
+        const { data, error } = await supabase
+          .from('user_subscriptions')
+          .select('is_active, tier, expires_at')
+          .eq('user_id', user.id)
+          .single();
+        
+        if (!error && data && data.is_active) {
+          // Check if not expired
+          const notExpired = !data.expires_at || new Date(data.expires_at) > new Date();
+          if (notExpired && (data.tier === 'pro' || data.tier === 'enterprise')) {
+            console.log('[Premium] ✅ Database subscription found - granting Pro access!');
+            setIsPremium(true);
+            setFeatures(PRO_TIER_LIMITS);
+            setSubscription({
+              isActive: true,
+              willRenew: true,
+              periodType: 'normal',
+              expirationDate: data.expires_at,
+              productIdentifier: 'database_subscription',
+            });
+            return;
+          }
+        }
+        
+        // No valid database subscription - check RevenueCat
+        console.log('[Premium] No database subscription, checking RevenueCat...');
+      } catch (err) {
+        console.log('[Premium] Error checking database subscription:', err);
+      }
+    };
     
-    if (isOwner) {
-      console.log('[Premium] 👑 Owner email detected - auto-granting Pro!');
-      setIsPremium(true);
-      setFeatures(PRO_TIER_LIMITS);
-      setSubscription({
-        isActive: true,
-        willRenew: true,
-        periodType: 'normal',
-        expirationDate: null,
-        productIdentifier: 'owner_free_pro',
-      });
-    }
-  }, [user?.email]);
+    checkDatabaseSubscription();
+  }, [user?.id]);
 
-  // Reset daily counters at midnight - only runs once on mount
+  // Load persisted daily usage (and reset if it's a new day)
   useEffect(() => {
-    const today = new Date().toDateString();
-    if (lastResetDate !== today) {
-      setDailyQuizCount(0);
-      setDailyChatCount(0);
-      setLastResetDate(today);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Only run on mount, not when lastResetDate changes
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(getDailyUsageStorageKey());
+        const today = getTodayKey();
+
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          const storedDate = typeof parsed?.date === 'string' ? parsed.date : '';
+          const documents = typeof parsed?.documents === 'number' ? parsed.documents : 0;
+          const quiz = typeof parsed?.quiz === 'number' ? parsed.quiz : 0;
+          const chat = typeof parsed?.chat === 'number' ? parsed.chat : 0;
+          const presentation = typeof parsed?.presentation === 'number' ? parsed.presentation : 0;
+
+          if (storedDate === today) {
+            setDailyDocumentCount(documents);
+            setDailyQuizCount(quiz);
+            setDailyChatCount(chat);
+            setDailyPresentationCount(presentation);
+            setLastResetDate(today);
+            return;
+          }
+        }
+
+        // New day or missing data
+        setDailyDocumentCount(0);
+        setDailyQuizCount(0);
+        setDailyChatCount(0);
+        setDailyPresentationCount(0);
+        setLastResetDate(today);
+        await persistDailyUsage({ date: today, documents: 0, quiz: 0, chat: 0, presentation: 0 });
+      } catch {
+        const today = getTodayKey();
+        setLastResetDate(today);
+      }
+    })();
+  }, [getDailyUsageStorageKey, persistDailyUsage]);
+
+  // Ensure counters reset when day changes (even if app stays open)
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        resetDailyUsageIfNeeded();
+      }
+    });
+
+    const interval = setInterval(() => {
+      resetDailyUsageIfNeeded();
+    }, 60 * 1000);
+
+    return () => {
+      sub.remove();
+      clearInterval(interval);
+    };
+  }, [resetDailyUsageIfNeeded]);
 
   const initializeRevenueCat = async () => {
     try {
@@ -180,60 +292,74 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
     }
     const availableProducts = await revenueCatService.getProducts();
     setProducts(availableProducts);
+
+    // If we couldn't fetch any real products in production/TestFlight,
+    // disable purchases so the UI doesn't attempt failing purchases.
+    if (!__DEV__ && availableProducts.length === 0) {
+      console.warn('[Premium] No RevenueCat products returned; marking purchases unavailable');
+      setPurchasesAvailable(false);
+    }
   };
 
   const checkPremiumStatus = useCallback(async () => {
     try {
-      // 👑 OWNER GETS FREE PRO ACCESS!
-      // Only the app owner (ahmedadel737374@icloud.com) gets automatic Pro
-      const OWNER_EMAIL = 'ahmedadel737374@icloud.com';
-      const isOwner = user?.email?.toLowerCase() === OWNER_EMAIL.toLowerCase();
+      // First check database subscription
+      if (user?.id) {
+        const { data, error } = await supabase
+          .from('user_subscriptions')
+          .select('is_active, tier, expires_at')
+          .eq('user_id', user.id)
+          .single();
+        
+        if (!error && data && data.is_active) {
+          const notExpired = !data.expires_at || new Date(data.expires_at) > new Date();
+          if (notExpired && (data.tier === 'pro' || data.tier === 'enterprise')) {
+            console.log('[Premium] ✅ Database Pro subscription active!');
+            setSubscription({
+              isActive: true,
+              willRenew: true,
+              periodType: 'normal',
+              expirationDate: data.expires_at,
+              productIdentifier: 'database_subscription',
+            });
+            setIsPremium(true);
+            setFeatures(PRO_TIER_LIMITS);
+            CloudStorage.updateStorageLimit(user.id, true).catch(console.error);
+            return;
+          }
+        }
+      }
       
-      if (isOwner) {
-        console.log('[Premium] 👑 Owner account detected - granting Pro access automatically!');
-        setSubscription({
-          isActive: true,
-          willRenew: true,
-          periodType: 'normal',
-          expirationDate: null, // Never expires for owner
-          productIdentifier: 'owner_free_pro',
-        });
+      // Fall back to RevenueCat
+      if (!purchasesAvailable) {
+        console.log('[Premium] No database subscription and RevenueCat unavailable - free tier');
+        setIsPremium(false);
+        setFeatures(FREE_TIER_LIMITS);
+        return;
+      }
+      
+      const sub = await revenueCatService.checkSubscriptionStatus();
+      setSubscription(sub);
+      
+      if (sub.isActive) {
+        console.log('[Premium] RevenueCat subscription active!');
         setIsPremium(true);
         setFeatures(PRO_TIER_LIMITS);
-        
-        // Update cloud storage limit
         if (user?.id) {
           CloudStorage.updateStorageLimit(user.id, true).catch(console.error);
         }
-        return;
-      }
-      
-      // Regular RevenueCat check for other users
-      const status = await revenueCatService.checkSubscriptionStatus();
-      setSubscription(status);
-      setIsPremium(status.isActive);
-      setFeatures(status.isActive ? PRO_TIER_LIMITS : FREE_TIER_LIMITS);
-      
-      // Update cloud storage limit based on premium status
-      if (user?.id) {
-        CloudStorage.updateStorageLimit(user.id, status.isActive).catch(console.error);
+      } else {
+        console.log('[Premium] No active subscription - free tier');
+        setIsPremium(false);
+        setFeatures(FREE_TIER_LIMITS);
       }
     } catch (error) {
       console.error('Error checking premium status:', error);
-      
-      // Even on error, owner still gets Pro
-      const OWNER_EMAIL = 'ahmedadel737374@icloud.com';
-      if (user?.email?.toLowerCase() === OWNER_EMAIL.toLowerCase()) {
-        console.log('[Premium] 👑 Owner account (fallback) - granting Pro access!');
-        setIsPremium(true);
-        setFeatures(PRO_TIER_LIMITS);
-        return;
-      }
-      
+      // On error, default to free tier
       setIsPremium(false);
       setFeatures(FREE_TIER_LIMITS);
     }
-  }, [user?.id, user?.email]);
+  }, [user?.id, purchasesAvailable]);
 
   const purchaseProduct = async (productId: string): Promise<boolean> => {
     try {
@@ -320,15 +446,71 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
     );
   };
 
+  const incrementDocumentCount = () => {
+    if (!isPremium && !debugPremium) {
+      resetDailyUsageIfNeeded();
+      setDailyDocumentCount(prev => {
+        const next = prev + 1;
+        persistDailyUsage({
+          date: getTodayKey(),
+          documents: next,
+          quiz: dailyQuizCount,
+          chat: dailyChatCount,
+          presentation: dailyPresentationCount,
+        });
+        return next;
+      });
+    }
+  };
+
   const incrementQuizCount = () => {
     if (!isPremium) {
-      setDailyQuizCount(prev => prev + 1);
+      resetDailyUsageIfNeeded();
+      setDailyQuizCount(prev => {
+        const next = prev + 1;
+        persistDailyUsage({
+          date: getTodayKey(),
+          documents: dailyDocumentCount,
+          quiz: next,
+          chat: dailyChatCount,
+          presentation: dailyPresentationCount,
+        });
+        return next;
+      });
     }
   };
 
   const incrementChatCount = () => {
     if (!isPremium && !debugPremium) {
-      setDailyChatCount(prev => prev + 1);
+      resetDailyUsageIfNeeded();
+      setDailyChatCount(prev => {
+        const next = prev + 1;
+        persistDailyUsage({
+          date: getTodayKey(),
+          documents: dailyDocumentCount,
+          quiz: dailyQuizCount,
+          chat: next,
+          presentation: dailyPresentationCount,
+        });
+        return next;
+      });
+    }
+  };
+
+  const incrementPresentationCount = () => {
+    if (!isPremium && !debugPremium) {
+      resetDailyUsageIfNeeded();
+      setDailyPresentationCount(prev => {
+        const next = prev + 1;
+        persistDailyUsage({
+          date: getTodayKey(),
+          documents: dailyDocumentCount,
+          quiz: dailyQuizCount,
+          chat: dailyChatCount,
+          presentation: next,
+        });
+        return next;
+      });
     }
   };
 
@@ -372,10 +554,14 @@ export const PremiumProvider: React.FC<{ children: ReactNode }> = ({ children })
           return currentCount < limit;
         },
         showPaywall,
+        dailyDocumentCount,
         dailyQuizCount,
         dailyChatCount,
+        dailyPresentationCount,
+        incrementDocumentCount,
         incrementQuizCount,
         incrementChatCount,
+        incrementPresentationCount,
         debugPremium,
         toggleDebugPremium,
       }}

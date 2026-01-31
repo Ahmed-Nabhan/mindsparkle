@@ -2,37 +2,34 @@
   "expo": {
     "name": "MindSparkle",
     "slug": "mindsparkle",
-    "version": "1.0.0",
+    "version": "1.20.1",
     "scheme": "mindsparkle",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "splash": {
       "image": "./assets/splash.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#6C63FF"
+      "resizeMode": "cover",
+      "backgroundColor": "#1E3A8A"
     },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.ahmednabhan.mindsparkle",
-      "buildNumber": "1",
+      "buildNumber": "26",
       "usesAppleSignIn": true,
       "infoPlist": {
-        "NSMicrophoneUsageDescription": "MindSparkle needs microphone access for voice recording features.",
-        "NSSpeechRecognitionUsageDescription": "MindSparkle uses speech recognition for voice commands.",
         "ITSAppUsesNonExemptEncryption": false
-      }
+      },
+      "runtimeVersion": "1.0.0"
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#6C63FF"
+        "backgroundColor": "#FFFFFF"
       },
       "package": "com.ahmednabhan.mindsparkle",
       "versionCode": 1,
-      "permissions": [
-        "RECORD_AUDIO"
-      ]
+      "runtimeVersion": "1.0.0"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -64,8 +61,12 @@
       "supabaseUrl": "https://cszorvgzihzamgezlfjj.supabase.co",
       "supabaseAnonKey": "sb_publishable_n1tFW0G4BgN-bWZIg0HkGw_p3HTIPIq",
       "revenueCatIosKey": "appl_wcbcmHnxMHWXswtgYXDNZkVrjur",
-      "revenueCatAndroidKey": "CHANGE_ME_ANDROID_KEY"
+      "revenueCatAndroidKey": "goog_laHQSEjeSMJdQlLzeVPrAXoGdeN",
+      "simulatePurchases": false
     },
-    "owner": "ahmed_nabhan"
+    "owner": "ahmed_nabhan",
+    "updates": {
+      "url": "https://u.expo.dev/091c8366-02aa-4af6-a727-252b7b4338a8"
+    }
   }
 }

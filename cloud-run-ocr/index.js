@@ -167,7 +167,7 @@ async function processLargePdfWithDocumentAI(pdfBuffer) {
 }
 
 // Update document status in Supabase
-async function updateDocumentStatus(supabase, documentId, status, metadata = {}) {
+async function updateDocumentStatus(tesupabase, documentId, status, metadata = {}) {
   const updateData = {
     status,
     updated_at: new Date().toISOString(),
@@ -301,7 +301,7 @@ app.post('/ocr', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { signedUrl, fileSize, documentId } = req.body;
+    const { signedUrl, fileSize, documentId, pageStart, pageEnd } = req.body;
     
     if (!signedUrl) {
       return res.status(400).json({
@@ -320,9 +320,34 @@ app.post('/ocr', async (req, res) => {
       throw new Error(`Failed to download PDF: ${pdfResponse.status} ${pdfResponse.statusText}`);
     }
     
-    const pdfBuffer = Buffer.from(await pdfResponse.arrayBuffer());
+    let pdfBuffer = Buffer.from(await pdfResponse.arrayBuffer());
     const fileSizeMB = pdfBuffer.length / (1024 * 1024);
     console.log(`Downloaded ${fileSizeMB.toFixed(2)}MB`);
+
+    // Optional: OCR only a specific page range (1-based, inclusive).
+    // This prevents re-OCRing the full document when the caller batches pages.
+    const ps = Number(pageStart);
+    const pe = Number(pageEnd);
+    if (Number.isFinite(ps) && Number.isFinite(pe) && ps >= 1 && pe >= ps) {
+      try {
+        const full = await PDFDocument.load(pdfBuffer);
+        const total = full.getPageCount();
+        const start = Math.max(1, Math.min(total, Math.floor(ps)));
+        const end = Math.max(start, Math.min(total, Math.floor(pe)));
+
+        if (start !== 1 || end !== total) {
+          console.log(`Slicing PDF for OCR: pages ${start}-${end} of ${total}`);
+          const sliced = await PDFDocument.create();
+          const indices = Array.from({ length: end - start + 1 }, (_, i) => (start - 1) + i);
+          const pages = await sliced.copyPages(full, indices);
+          pages.forEach((p) => sliced.addPage(p));
+          const slicedBytes = await sliced.save();
+          pdfBuffer = Buffer.from(slicedBytes);
+        }
+      } catch (e) {
+        console.warn(`Failed to slice PDF for OCR; falling back to full document. Error: ${e.message}`);
+      }
+    }
     
     let extractedText = '';
     let ocrMethod = 'document_ai_chunked';

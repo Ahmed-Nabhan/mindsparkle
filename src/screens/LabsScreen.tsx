@@ -38,7 +38,7 @@ const LAB_PLATFORMS = {
     { id: 'huggingface', name: 'Hugging Face Spaces', description: 'ML demo hosting', url: 'https://huggingface.co/spaces', icon: '🤗', tags: ['AI', 'ML Models'], color: '#FFD21E' },
   ],
   database: [
-    { id: 'sqlfiddle', name: 'SQL Fiddle', description: 'Test SQL queries online', url: 'http://sqlfiddle.com', icon: '🗄️', tags: ['SQL', 'MySQL', 'PostgreSQL'], color: '#E48E00' },
+    { id: 'sqlfiddle', name: 'SQL Fiddle', description: 'Test SQL queries online', url: 'https://sqlfiddle.com', icon: '🗄️', tags: ['SQL', 'MySQL', 'PostgreSQL'], color: '#E48E00' },
     { id: 'mongoplayground', name: 'Mongo Playground', description: 'Test MongoDB queries', url: 'https://mongoplayground.net', icon: '🍃', tags: ['MongoDB', 'NoSQL'], color: '#00ED64' },
     { id: 'dbfiddle', name: 'DB Fiddle', description: 'Multi-database playground', url: 'https://www.db-fiddle.com', icon: '🎯', tags: ['MySQL', 'PostgreSQL', 'SQLite'], color: '#3E78B2' },
     { id: 'planetscale', name: 'PlanetScale', description: 'Serverless MySQL', url: 'https://planetscale.com', icon: '🪐', tags: ['MySQL', 'Serverless'], color: '#000000' },
@@ -53,8 +53,8 @@ const LAB_PLATFORMS = {
     { id: 'github', name: 'GitHub Codespaces', description: 'Dev containers in cloud', url: 'https://github.com/codespaces', icon: '🐙', tags: ['Git', 'VSCode'], color: '#181717' },
   ],
   cybersecurity: [
-    { id: 'tryhackme', name: 'TryHackMe', description: 'Learn cybersecurity hands-on', url: 'https://tryhackme.com', icon: '🎭', tags: ['Security', 'Hacking', 'CTF'], color: '#212C42' },
-    { id: 'hackthebox', name: 'Hack The Box', description: 'Cybersecurity training labs', url: 'https://www.hackthebox.com', icon: '📦', tags: ['Security', 'Pentesting'], color: '#9FEF00' },
+    { id: 'tryhackme', name: 'TryHackMe', description: 'Learn cybersecurity hands-on', url: 'https://tryhackme.com', icon: '🎭', tags: ['Security', 'Learning', 'CTF'], color: '#212C42' },
+    { id: 'hackthebox', name: 'Hack The Box', description: 'Cybersecurity training labs', url: 'https://www.hackthebox.com', icon: '📦', tags: ['Security', 'Training'], color: '#9FEF00' },
     { id: 'overthewire', name: 'OverTheWire', description: 'Security war games', url: 'https://overthewire.org/wargames/', icon: '⚔️', tags: ['Linux', 'Security'], color: '#4A4A4A' },
     { id: 'picoctf', name: 'picoCTF', description: 'Beginner CTF challenges', url: 'https://picoctf.org', icon: '🏴', tags: ['CTF', 'Beginner'], color: '#2C3E50' },
     { id: 'portswigger', name: 'PortSwigger Labs', description: 'Web security academy', url: 'https://portswigger.net/web-security', icon: '🔒', tags: ['Web Security', 'OWASP'], color: '#FF6633' },
@@ -114,7 +114,7 @@ export const LabsScreen: React.FC = () => {
   const route = useRoute<LabsScreenProps['route']>();
   const { getDocument } = useDocument();
   const [document, setDocument] = useState<Document | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingDoc, setIsLoadingDoc] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
 
@@ -124,10 +124,14 @@ export const LabsScreen: React.FC = () => {
 
   const loadDocument = async () => {
     if (route.params?.documentId) {
-      const doc = await getDocument(route.params.documentId);
-      setDocument(doc);
+      try {
+        setIsLoadingDoc(true);
+        const doc = await getDocument(route.params.documentId);
+        setDocument(doc);
+      } finally {
+        setIsLoadingDoc(false);
+      }
     }
-    setIsLoading(false);
   };
 
   const openLab = async (url: string, name: string) => {
@@ -158,17 +162,13 @@ export const LabsScreen: React.FC = () => {
     return platforms;
   };
 
-  if (isLoading) {
-    return <LoadingSpinner message="Loading labs..." />;
-  }
-
   const filteredPlatforms = getFilteredPlatforms();
 
   return (
     <View style={styles.container}>
       <Header 
         title="Interactive Labs" 
-        subtitle={document ? `For: ${document.title}` : 'Free online practice platforms'} 
+        subtitle={document ? `For: ${document.title}` : (isLoadingDoc ? 'Loading your document…' : 'Free online practice platforms')} 
       />
       
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>

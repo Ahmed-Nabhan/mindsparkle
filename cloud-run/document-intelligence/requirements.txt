@@ -1,0 +1,17 @@
+# Document extraction
+python-pptx>=0.6.21
+python-docx>=0.8.11
+PyMuPDF>=1.23.0
+Pillow>=10.0.0
+
+# Google Cloud
+google-cloud-documentai>=2.20.0
+google-cloud-vision>=3.4.0
+
+# Web framework
+Flask>=3.0.0
+flask-cors>=4.0.0
+gunicorn>=21.0.0
+
+# HTTP client
+requests>=2.31.0

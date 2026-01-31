@@ -41,6 +41,17 @@ import {
 } from '../services/supabase';
 import { cloudSyncService } from '../services/cloudSyncService';
 
+function withTimeout<T>(promise: PromiseLike<T>, ms: number, label: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`Timeout after ${ms}ms: ${label}`)), ms);
+  });
+
+  return Promise.race([Promise.resolve(promise), timeoutPromise]).finally(() => {
+    if (timeoutId) clearTimeout(timeoutId);
+  });
+}
+
 // ============================================
 // TYPE DEFINITIONS
 // ============================================
@@ -124,6 +135,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   // Error state for UI feedback
   const [authError, setAuthError] = useState<AuthError | null>(null);
 
+  // Fail-safe: never block app rendering indefinitely behind a loading screen.
+  useEffect(() => {
+    const id = setTimeout(() => {
+      setIsLoading(false);
+    }, 3000);
+    return () => clearTimeout(id);
+  }, []);
+
   // ============================================
   // HELPER FUNCTIONS
   // ============================================
@@ -162,8 +181,28 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const updateUserFromSession = useCallback(async (supabaseUser: any) => {
     if (supabaseUser) {
       try {
+        // Fast path: set a minimal authenticated user immediately.
+        // We enrich profile/role/subscription below (with timeouts).
+        const createdAtRaw = supabaseUser.created_at || supabaseUser.createdAt;
+        setUser({
+          id: supabaseUser.id,
+          email: supabaseUser.email || '',
+          name: supabaseUser.user_metadata?.full_name || supabaseUser.user_metadata?.name,
+          avatarUrl: supabaseUser.user_metadata?.avatar_url,
+          isPremium: false,
+          createdAt: createdAtRaw ? new Date(createdAtRaw) : new Date(),
+          lastLoginAt: new Date(),
+          role: 'user',
+          authProvider: 'unknown',
+        });
+        setIsAuthenticated(true);
+
         // Fetch or create user profile from database
-        const { data: profile } = await getOrCreateProfile(supabaseUser.id, supabaseUser.email);
+        const { data: profile } = await withTimeout(
+          getOrCreateProfile(supabaseUser.id, supabaseUser.email),
+          2000,
+          'getOrCreateProfile'
+        ).catch(() => ({ data: null } as any));
         
         // Detect auth provider from Supabase user identities
         // Apple users get automatic Pro access!
@@ -197,8 +236,11 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         try {
           // Call Supabase RPC to get user's role
           // This function handles the role lookup with expiration checking
-          const { data: roleData, error: roleError } = await supabase
-            .rpc('get_user_role', { check_user_id: supabaseUser.id });
+          const { data: roleData, error: roleError } = await withTimeout(
+            supabase.rpc('get_user_role', { check_user_id: supabaseUser.id }),
+            2000,
+            'rpc:get_user_role'
+          ).catch(() => ({ data: null, error: null } as any));
           
           if (!roleError && roleData) {
             userRole = roleData as UserRole;
@@ -206,11 +248,15 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           }
           
           // Also fetch role expiration if applicable
-          const { data: roleRecord } = await supabase
-            .from('user_roles')
-            .select('expires_at')
-            .eq('user_id', supabaseUser.id)
-            .single();
+          const { data: roleRecord } = await withTimeout(
+            supabase
+              .from('user_roles')
+              .select('expires_at')
+              .eq('user_id', supabaseUser.id)
+              .single(),
+            2000,
+            'select:user_roles.expires_at'
+          ).catch(() => ({ data: null } as any));
           
           if (roleRecord?.expires_at) {
             roleExpiresAt = new Date(roleRecord.expires_at);
@@ -221,14 +267,29 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           console.warn('[Auth] Role fetch failed, using default:', roleErr);
         }
         
-        // Owner email gets automatic premium status!
-        // Only the app owner (ahmedadel737374@icloud.com) gets free Pro
-        const OWNER_EMAIL = 'ahmedadel737374@icloud.com';
-        const isOwner = supabaseUser.email?.toLowerCase() === OWNER_EMAIL.toLowerCase();
-        const isPremiumUser = isOwner || profile?.is_premium || false;
-        
-        if (isOwner) {
-          console.log('[Auth] 👑 Owner account detected - granting Pro access!');
+        // Check premium status from user_subscriptions table
+        let isPremiumUser = false;
+        try {
+          const { data: subData } = await withTimeout(
+            supabase
+              .from('user_subscriptions')
+              .select('is_active, tier, expires_at')
+              .eq('user_id', supabaseUser.id)
+              .single(),
+            2000,
+            'select:user_subscriptions'
+          ).catch(() => ({ data: null } as any));
+          
+          if (subData?.is_active) {
+            const notExpired = !subData.expires_at || new Date(subData.expires_at) > new Date();
+            if (notExpired && (subData.tier === 'pro' || subData.tier === 'enterprise')) {
+              isPremiumUser = true;
+              console.log('[Auth] ✅ User has active Pro subscription');
+            }
+          }
+        } catch (subErr) {
+          // No subscription record - free tier
+          console.log('[Auth] No subscription found - free tier');
         }
         
         // Construct app User object from auth + profile + role data
@@ -250,8 +311,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         setUser(appUser);
         setIsAuthenticated(true);
         
-        // Initialize cloud sync for this user
-        cloudSyncService.initialize(supabaseUser.id);
+        // Initialize cloud sync for this user (do not block auth; avoid unhandled rejections)
+        void cloudSyncService.initialize(supabaseUser.id).catch((err) => {
+          console.warn('[CloudSync] initialize failed:', err);
+        });
         
         console.log('[Auth] User session updated:', appUser.id, 'Role:', appUser.role, 'Provider:', authProvider, 'Premium:', isPremiumUser);
       } catch (error) {
@@ -265,7 +328,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           role: 'user', // Default role on error
         });
         setIsAuthenticated(true);
-        cloudSyncService.initialize(supabaseUser.id);
+        void cloudSyncService.initialize(supabaseUser.id).catch((err) => {
+          console.warn('[CloudSync] initialize failed:', err);
+        });
       }
     } else {
       // No user - clear state
@@ -303,9 +368,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         case 'TOKEN_REFRESHED':
           // User signed in or token refreshed - update state
           if (session?.user) {
-            await updateUserFromSession(session.user);
-            setIsLoading(false);
+            // Do not block rendering on network calls.
+            void updateUserFromSession(session.user);
           }
+          setIsLoading(false);
           break;
           
         case 'SIGNED_OUT':
@@ -317,7 +383,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         case 'INITIAL_SESSION':
           // App loaded with existing session
           if (session?.user) {
-            await updateUserFromSession(session.user);
+            // Do not block rendering on network calls.
+            void updateUserFromSession(session.user);
           }
           setIsLoading(false);
           break;
@@ -325,7 +392,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         case 'USER_UPDATED':
           // User profile updated - refresh data
           if (session?.user) {
-            await updateUserFromSession(session.user);
+            void updateUserFromSession(session.user);
           }
           break;
           
@@ -350,17 +417,23 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const checkUser = async () => {
     try {
       // First check for existing session in secure storage
-      const { data: sessionData } = await supabase.auth.getSession();
+      const { data: sessionData } = await withTimeout(
+        supabase.auth.getSession(),
+        1500,
+        'auth.getSession'
+      ).catch(() => ({ data: { session: null } } as any));
       if (sessionData?.session?.user) {
-        await updateUserFromSession(sessionData.session.user);
-        setIsLoading(false);
+        // Let UI render immediately; enrich in background.
+        void updateUserFromSession(sessionData.session.user);
         return;
       }
       
       // Fallback to getUser API
-      const { data, error } = await getCurrentUser();
+      const { data, error } = await withTimeout(getCurrentUser(), 1500, 'getCurrentUser').catch(
+        () => ({ data: null, error: null } as any)
+      );
       if (data?.user) {
-        await updateUserFromSession(data.user);
+        void updateUserFromSession(data.user);
       }
     } catch (error) {
       console.error('[Auth] Error checking user:', error);

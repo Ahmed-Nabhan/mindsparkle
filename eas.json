@@ -5,20 +5,23 @@
   },
   "build": {
     "development": {
-      "developmentClient": true,
+      "developmentClient": false,
       "distribution": "internal",
+      "channel": "development",
       "ios": {
         "simulator": true
       }
     },
     "preview": {
       "distribution": "internal",
+      "channel": "preview",
       "ios": {
         "simulator": false
       }
     },
     "production": {
       "autoIncrement": true,
+      "channel": "production",
       "ios": {
         "resourceClass": "m-medium"
       },
@@ -36,7 +39,17 @@
       },
       "android": {
         "serviceAccountKeyPath": "./google-service-account.json",
-        "track": "production"
+        "track": "production",
+        "changesNotSentForReview": true,
+        "releaseStatus": "draft"
+      }
+    },
+    "internal": {
+      "android": {
+        "serviceAccountKeyPath": "./google-service-account.json",
+        "track": "internal",
+        "changesNotSentForReview": true,
+        "releaseStatus": "draft"
       }
     }
   }

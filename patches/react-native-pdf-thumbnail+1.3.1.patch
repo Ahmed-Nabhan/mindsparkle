@@ -1,0 +1,45 @@
+diff --git a/node_modules/react-native-pdf-thumbnail/android/src/main/java/com/pdfthumbnail/PdfThumbnailPackage.java b/node_modules/react-native-pdf-thumbnail/android/src/main/java/com/pdfthumbnail/PdfThumbnailPackage.java
+new file mode 100644
+index 0000000..7ab660e
+--- /dev/null
++++ b/node_modules/react-native-pdf-thumbnail/android/src/main/java/com/pdfthumbnail/PdfThumbnailPackage.java
+@@ -0,0 +1,26 @@
++package com.pdfthumbnail;
++
++import com.facebook.react.ReactPackage;
++import com.facebook.react.bridge.NativeModule;
++import com.facebook.react.bridge.ReactApplicationContext;
++import com.facebook.react.uimanager.ViewManager;
++
++import org.songsterq.pdfthumbnail.PdfThumbnailModule;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++public class PdfThumbnailPackage implements ReactPackage {
++  @Override
++  public List<NativeModule> createNativeModules(ReactApplicationContext reactContext) {
++    List<NativeModule> modules = new ArrayList<>();
++    modules.add(new PdfThumbnailModule(reactContext));
++    return modules;
++  }
++
++  @Override
++  public List<ViewManager> createViewManagers(ReactApplicationContext reactContext) {
++    return Collections.emptyList();
++  }
++}
+diff --git a/node_modules/react-native-pdf-thumbnail/android/src/main/java/org/songsterq/pdfthumbnail/PdfThumbnailModule.kt b/node_modules/react-native-pdf-thumbnail/android/src/main/java/org/songsterq/pdfthumbnail/PdfThumbnailModule.kt
+index 921b578..3e4aa6b 100644
+--- a/node_modules/react-native-pdf-thumbnail/android/src/main/java/org/songsterq/pdfthumbnail/PdfThumbnailModule.kt
++++ b/node_modules/react-native-pdf-thumbnail/android/src/main/java/org/songsterq/pdfthumbnail/PdfThumbnailModule.kt
+@@ -98,7 +98,7 @@ class PdfThumbnailModule(reactContext: ReactApplicationContext) :
+     currentPage.close()
+ 
+     // Some bitmaps have transparent background which results in a black thumbnail. Add a white background.
+-    val bitmapWhiteBG = Bitmap.createBitmap(bitmap.width, bitmap.height, bitmap.config)
++    val bitmapWhiteBG = Bitmap.createBitmap(bitmap.width, bitmap.height, bitmap.config ?: Bitmap.Config.ARGB_8888)
+     val canvas = Canvas(bitmapWhiteBG)
+     canvas.drawBitmap(bitmap, 0f, 0f, null)
+     bitmap.recycle()

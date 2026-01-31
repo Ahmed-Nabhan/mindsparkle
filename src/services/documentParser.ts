@@ -270,14 +270,31 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
     
     console.log('[PPTX] Processing file with JSZip, size:', fileSizeMB, 'MB');
     
+    // For very large files (>50MB), skip local processing - too slow/memory intensive
+    if (fileSizeMB > 50) {
+      console.log('[PPTX] File too large for local processing, will use cloud');
+      throw new Error('File too large for local processing (>50MB). Using cloud extraction.');
+    }
+    
     // Read file as base64
+    console.log('[PPTX] Reading file as base64...');
     const base64Content = await FileSystem.readAsStringAsync(fileUri, {
       encoding: FileSystem.EncodingType.Base64,
     });
+    console.log('[PPTX] Base64 content length:', base64Content.length);
     
     // PPTX is a ZIP file - use JSZip to properly extract
+    console.log('[PPTX] Loading ZIP...');
     const zip = new JSZip();
     await zip.loadAsync(base64Content, { base64: true });
+    
+    // Debug: list all files in the ZIP
+    const allFiles: string[] = [];
+    zip.forEach((relativePath: string) => {
+      allFiles.push(relativePath);
+    });
+    console.log('[PPTX] ZIP contains', allFiles.length, 'files');
+    console.log('[PPTX] Sample files:', allFiles.slice(0, 10));
     
     // Find all slide XML files
     const slideFiles: string[] = [];
@@ -294,7 +311,7 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
       return numA - numB;
     });
     
-    console.log('[PPTX] Found', slideFiles.length, 'slides');
+    console.log('[PPTX] Found', slideFiles.length, 'slides:', slideFiles.slice(0, 5));
     
     let allText = '';
     
@@ -304,14 +321,41 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
       const slideXml = await zip.file(slideFile)?.async('string');
       
       if (slideXml) {
-        // Extract all <a:t> text elements
-        const textPattern = /<a:t[^>]*>([^<]*)<\/a:t>/g;
-        let match;
+        // Debug first slide
+        if (i === 0) {
+          console.log('[PPTX] First slide XML length:', slideXml.length);
+          console.log('[PPTX] First slide XML preview:', slideXml.substring(0, 500));
+        }
+        
+        // Extract all <a:t> text elements - handle various formats
+        // Pattern 1: <a:t>text</a:t>
+        // Pattern 2: <a:t xml:space="preserve">text</a:t>
         const slideTexts: string[] = [];
         
-        while ((match = textPattern.exec(slideXml)) !== null) {
-          const text = match[1].trim();
-          if (text) {
+        // Use a more robust approach - find all a:t tags and extract content
+        let searchStart = 0;
+        while (searchStart < slideXml.length) {
+          const tagStart = slideXml.indexOf('<a:t', searchStart);
+          if (tagStart === -1) break;
+          
+          const tagEnd = slideXml.indexOf('>', tagStart);
+          if (tagEnd === -1) break;
+          
+          // Check if self-closing tag
+          if (slideXml[tagEnd - 1] === '/') {
+            searchStart = tagEnd + 1;
+            continue;
+          }
+          
+          const closeTag = '</a:t>';
+          const closeStart = slideXml.indexOf(closeTag, tagEnd);
+          if (closeStart === -1) {
+            searchStart = tagEnd + 1;
+            continue;
+          }
+          
+          const text = slideXml.substring(tagEnd + 1, closeStart);
+          if (text && text.trim()) {
             // Decode XML entities
             const decoded = text
               .replace(/&amp;/g, '&')
@@ -319,9 +363,20 @@ const extractPptxText = async (fileUri: string): Promise<string> => {
               .replace(/&gt;/g, '>')
               .replace(/&quot;/g, '"')
               .replace(/&apos;/g, "'")
-              .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code)));
-            slideTexts.push(decoded);
+              .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code)))
+              .trim();
+            if (decoded) {
+              slideTexts.push(decoded);
+            }
           }
+          
+          searchStart = closeStart + closeTag.length;
+        }
+        
+        // Debug first slide extraction
+        if (i === 0) {
+          console.log('[PPTX] First slide extracted texts:', slideTexts.length, 'items');
+          console.log('[PPTX] First slide sample:', slideTexts.slice(0, 5));
         }
         
         if (slideTexts.length > 0) {

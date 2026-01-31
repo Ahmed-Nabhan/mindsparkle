@@ -1,0 +1,2437 @@
+// @ts-nocheck - This file runs in Deno runtime, not Node.js
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*", // narrowed at runtime
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+const ALLOWED_ORIGINS = (Deno.env.get("ALLOWED_ORIGINS") || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+const MAX_CONTENT_LENGTH = 400000; // Increased for larger summaries - handles 200+ page documents
+const MAX_REQUESTS_PER_MIN = 200; // INSTANT RESULTS: handle ALL parallel chunks at once
+const rateBuckets = new Map<string, { count: number; windowStart: number }>();
+
+// ========== RBAC: Role Types and Helpers ==========
+/**
+ * RBAC Configuration
+ * 
+ * Role definitions:
+ * - user: Standard user, can only access own documents
+ * - admin: Full access to all documents and admin functions
+ * - vendor: Can access own docs and those shared with them
+ * 
+ * Role is fetched from user_roles table via get_user_role() RPC
+ */
+type UserRole = 'user' | 'admin' | 'vendor';
+
+/**
+ * RBAC: Fetch user role from database
+ * Uses service role key to bypass RLS and get actual role
+ * 
+ * @param userId - The authenticated user's ID
+ * @returns UserRole - defaults to 'user' if not found
+ */
+async function getUserRole(userId: string): Promise<UserRole> {
+  if (!userId || userId.startsWith('anonymous')) {
+    return 'user'; // Anonymous users get basic role
+  }
+  
+  const supabaseUrl = Deno.env.get("PROJECT_URL") || Deno.env.get("SUPABASE_URL");
+  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  
+  if (!supabaseUrl || !supabaseServiceKey) {
+    console.warn('[RBAC] Missing Supabase config, defaulting to user role');
+    return 'user';
+  }
+  
+  try {
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+    
+    // Call the get_user_role RPC function we created in the migration
+    const { data, error } = await supabase.rpc('get_user_role', { user_id: userId });
+    
+    if (error) {
+      console.warn('[RBAC] Failed to fetch role:', error.message);
+      return 'user';
+    }
+    
+    // Validate the role is one of our known types
+    if (data && ['user', 'admin', 'vendor'].includes(data)) {
+      return data as UserRole;
+    }
+    
+    return 'user';
+  } catch (err) {
+    console.error('[RBAC] Error fetching role:', err);
+    return 'user';
+  }
+}
+
+/**
+ * Check if user has active Pro/Premium subscription
+ * Checks the subscriptions table for active status
+ * 
+ * @param userId - The authenticated user's ID
+ * @returns boolean - true if user has active premium subscription
+ */
+async function isPremiumUser(userId: string): Promise<boolean> {
+  if (!userId || userId.startsWith('anonymous')) {
+    return false;
+  }
+  
+  const supabaseUrl = Deno.env.get("PROJECT_URL") || Deno.env.get("SUPABASE_URL");
+  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  
+  if (!supabaseUrl || !supabaseServiceKey) {
+    return false;
+  }
+  
+  try {
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+    
+    // Check subscriptions table for active subscription
+    const { data, error } = await supabase
+      .from('subscriptions')
+      .select('status')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .single();
+    
+    if (error || !data) {
+      return false;
+    }
+    
+    return data.status === 'active';
+  } catch (err) {
+    console.error('[Premium] Error checking subscription:', err);
+    return false;
+  }
+}
+
+/**
+ * RBAC: Check if user can access a specific document
+ * Uses can_access_document() database function for consistent enforcement
+ * 
+ * @param userId - The user requesting access
+ * @param documentId - The document being accessed
+ * @returns boolean - true if access allowed
+ */
+async function canAccessDocument(userId: string, documentId: string): Promise<boolean> {
+  if (!userId || !documentId) return false;
+  
+  const supabaseUrl = Deno.env.get("PROJECT_URL") || Deno.env.get("SUPABASE_URL");
+  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  
+  if (!supabaseUrl || !supabaseServiceKey) {
+    console.warn('[RBAC] Missing Supabase config for document access check');
+    return false;
+  }
+  
+  try {
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+    
+    // Use the can_access_document RPC function
+    const { data, error } = await supabase.rpc('can_access_document', { 
+      doc_id: documentId,
+      user_id: userId 
+    });
+    
+    if (error) {
+      console.warn('[RBAC] Document access check failed:', error.message);
+      return false;
+    }
+    
+    return !!data;
+  } catch (err) {
+    console.error('[RBAC] Error checking document access:', err);
+    return false;
+  }
+}
+
+/**
+ * RBAC: Permission matrix for actions
+ * Maps actions to required roles
+ */
+const ACTION_PERMISSIONS: Record<string, UserRole[]> = {
+  // Standard user actions (all roles)
+  'summarize': ['user', 'admin', 'vendor'],
+  'quiz': ['user', 'admin', 'vendor'],
+  'flashcards': ['user', 'admin', 'vendor'],
+  'studyGuide': ['user', 'admin', 'vendor'],
+  'explain': ['user', 'admin', 'vendor'],
+  'interview': ['user', 'admin', 'vendor'],
+  'chat': ['user', 'admin', 'vendor'],
+  'extract-text': ['user', 'admin', 'vendor'],
+  'lecture': ['user', 'admin', 'vendor'],
+  
+  // Admin-only actions
+  'admin-stats': ['admin'],
+  'admin-users': ['admin'],
+  'bulk-delete': ['admin'],
+  
+  // Vendor + Admin actions
+  'shared-analytics': ['admin', 'vendor'],
+};
+
+/**
+ * RBAC: Check if role can perform action
+ * 
+ * @param role - User's current role
+ * @param action - The action being attempted
+ * @returns boolean - true if action allowed
+ */
+function canPerformAction(role: UserRole, action: string): boolean {
+  const allowedRoles = ACTION_PERMISSIONS[action];
+  
+  // If action not in matrix, allow standard roles (backwards compatibility)
+  if (!allowedRoles) {
+    return ['user', 'admin', 'vendor'].includes(role);
+  }
+  
+  return allowedRoles.includes(role);
+}
+// ========== END RBAC Helpers ==========
+
+function enforceCors(req: Request) {
+  // If no origins configured, allow all (for development/Expo Go)
+  if (ALLOWED_ORIGINS.length === 0) {
+    return corsHeaders; // Uses "*" wildcard
+  }
+  
+  const origin = req.headers.get("Origin") || "";
+  
+  // Allow requests with no origin (mobile apps, Expo Go)
+  if (!origin) {
+    return corsHeaders;
+  }
+  
+  // Check allowed origins list
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    return { ...corsHeaders, "Access-Control-Allow-Origin": origin };
+  }
+  
+  // Allow Expo Go and development origins
+  if (origin.includes("exp://") || origin.includes("localhost") || origin.includes("192.168.")) {
+    return { ...corsHeaders, "Access-Control-Allow-Origin": origin };
+  }
+  
+  throw new Error("Origin not allowed");
+}
+
+function rateLimit(req: Request) {
+  const ip = req.headers.get("x-forwarded-for") || req.headers.get("cf-connecting-ip") || "unknown";
+  const now = Date.now();
+  const windowStart = now - 60_000;
+  const bucket = rateBuckets.get(ip) || { count: 0, windowStart: now };
+  if (bucket.windowStart < windowStart) {
+    bucket.count = 0;
+    bucket.windowStart = now;
+  }
+  bucket.count += 1;
+  rateBuckets.set(ip, bucket);
+  if (bucket.count > MAX_REQUESTS_PER_MIN) {
+    const err: any = new Error("Rate limit exceeded");
+    err.status = 429;
+    throw err;
+  }
+}
+
+async function getAuthUser(req: Request) {
+  const authHeader = req.headers.get("Authorization") || "";
+  const token = authHeader.replace("Bearer ", "").trim();
+  
+  // Get Supabase config
+  const supabaseUrl = Deno.env.get("PROJECT_URL") || Deno.env.get("SUPABASE_URL");
+  const supabaseAnonKey = Deno.env.get("PROJECT_ANON_KEY") || Deno.env.get("SUPABASE_ANON_KEY");
+  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  
+  if (!supabaseUrl || !supabaseAnonKey) {
+    const err: any = new Error("Supabase config missing");
+    err.status = 500;
+    throw err;
+  }
+  
+  // If token is the anon key itself, allow anonymous access with a dummy user
+  // This handles cases where session hasn't loaded yet but anon key is valid
+  if (token === supabaseAnonKey) {
+    console.log("[Auth] Using anon key - allowing anonymous access");
+    return { id: "anonymous", email: "anonymous@app.local" };
+  }
+  
+  // No token at all
+  if (!token) {
+    const err: any = new Error("Missing auth token");
+    err.status = 401;
+    throw err;
+  }
+
+  // Try to verify the user token
+  const supabase = createClient(supabaseUrl, supabaseServiceKey || supabaseAnonKey, {
+    global: { headers: { Authorization: `Bearer ${token}` } },
+  });
+
+  const { data, error } = await supabase.auth.getUser(token);
+  
+  // If token verification failed but we have a token, allow with limited access
+  // This handles edge cases with token refresh timing
+  if (error || !data?.user) {
+    console.warn("[Auth] Token verification failed:", error?.message || "no user");
+    // Allow with anonymous user ID for better UX
+    return { id: "anonymous-" + Date.now(), email: "guest@app.local" };
+  }
+  
+  return data.user;
+}
+
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
+const GOOGLE_CLOUD_API_KEY = Deno.env.get("GOOGLE_CLOUD_API_KEY"); // For Document AI
+const GOOGLE_PROJECT_ID = Deno.env.get("GOOGLE_PROJECT_ID") || "mindsparkle-app";
+const GOOGLE_LOCATION = "us"; // Document AI processor location
+const ADMIN_EMAIL = Deno.env.get("ADMIN_EMAIL") || "admin@example.com";
+
+// ========== SMART PDF EXTRACTION ==========
+// Uses multiple methods for best quality:
+// 1. pdf-parse for text-based PDFs (fast, accurate)
+// 2. GPT-4o Vision for scanned/image PDFs (handles tables, equations, images)
+
+// Extract text using pdf-parse (works with most PDFs)
+async function extractWithPdfParse(base64Pdf: string): Promise<{ text: string; pages: { pageNum: number; text: string }[]; numPages: number }> {
+  // Import pdf-parse dynamically (works in Deno)
+  const pdfParse = (await import("https://esm.sh/pdf-parse@1.1.1")).default;
+  
+  // Convert base64 to Uint8Array
+  const binaryString = atob(base64Pdf);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  
+  // Parse PDF
+  const data = await pdfParse(bytes);
+  
+  // Extract pages if available
+  const pages: { pageNum: number; text: string }[] = [];
+  const fullText = data.text || "";
+  const numPages = data.numpages || 1;
+  
+  // Split text into pages (approximate by dividing evenly if page breaks not detected)
+  const avgCharsPerPage = Math.ceil(fullText.length / numPages);
+  let pos = 0;
+  for (let i = 0; i < numPages && pos < fullText.length; i++) {
+    // Try to find natural page breaks
+    let endPos = Math.min(pos + avgCharsPerPage, fullText.length);
+    
+    // Look for page break patterns
+    const pageBreakMatch = fullText.substring(pos, endPos + 500).match(/\n{3,}|\f/);
+    if (pageBreakMatch && pageBreakMatch.index) {
+      endPos = pos + pageBreakMatch.index + pageBreakMatch[0].length;
+    }
+    
+    const pageText = fullText.substring(pos, endPos).trim();
+    if (pageText.length > 0) {
+      pages.push({ pageNum: i + 1, text: pageText });
+    }
+    pos = endPos;
+  }
+  
+  // Ensure we have at least one page
+  if (pages.length === 0 && fullText.length > 0) {
+    pages.push({ pageNum: 1, text: fullText });
+  }
+  
+  return { text: fullText, pages, numPages };
+}
+
+// Check text quality to detect garbage extraction
+function checkTextQuality(text: string): { quality: 'good' | 'poor' | 'garbage'; score: number } {
+  if (!text || text.length < 50) return { quality: 'garbage', score: 0 };
+  
+  const sample = text.substring(0, 3000);
+  
+  // Count meaningful characters
+  let letters = 0, digits = 0, spaces = 0, symbols = 0;
+  const commonWords = ['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'has', 'have', 'been', 'this', 'that', 'with', 'from', 'they', 'will', 'would', 'there', 'their', 'what', 'about', 'which', 'when', 'make', 'like', 'time', 'just', 'know', 'take', 'people', 'into', 'year', 'your', 'good', 'some', 'could', 'them', 'other', 'than', 'then', 'now', 'look', 'only', 'come', 'its', 'over', 'think', 'also', 'back', 'after', 'use', 'two', 'how', 'work', 'first', 'well', 'way', 'even', 'new', 'want', 'because', 'any', 'these', 'give', 'day', 'most', 'network', 'data', 'system', 'device', 'router', 'switch', 'protocol', 'layer', 'packet', 'address', 'port', 'connection'];
+  
+  for (let i = 0; i < sample.length; i++) {
+    const c = sample[i];
+    const code = c.charCodeAt(0);
+    if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) letters++;
+    else if (code >= 48 && code <= 57) digits++;
+    else if (c === ' ' || c === '\n' || c === '\t') spaces++;
+    else if (code >= 33 && code <= 126) symbols++;
+  }
+  
+  const total = sample.length;
+  const letterRatio = letters / total;
+  const symbolRatio = symbols / total;
+  
+  // Check for common words
+  const lowerSample = sample.toLowerCase();
+  let commonWordCount = 0;
+  for (const word of commonWords) {
+    if (lowerSample.includes(word)) commonWordCount++;
+  }
+  
+  // Calculate score (0-100)
+  let score = 0;
+  score += letterRatio * 50; // Up to 50 points for letters
+  score += Math.min(commonWordCount / 10, 1) * 30; // Up to 30 points for common words
+  score -= symbolRatio * 30; // Penalty for too many symbols
+  score = Math.max(0, Math.min(100, score));
+  
+  if (score >= 40 && commonWordCount >= 5) return { quality: 'good', score };
+  if (score >= 20 && commonWordCount >= 2) return { quality: 'poor', score };
+  return { quality: 'garbage', score };
+}
+
+// GPT-4o Vision extraction for image-based PDFs
+async function extractWithGPTVision(imageUrls: string[], maxPages = 10): Promise<{ text: string; pages: { pageNum: number; text: string }[] }> {
+  const pages: { pageNum: number; text: string }[] = [];
+  
+  // Process images in batches of 4 (GPT-4o can handle multiple images)
+  const batchSize = 4;
+  for (let i = 0; i < Math.min(imageUrls.length, maxPages); i += batchSize) {
+    const batch = imageUrls.slice(i, i + batchSize);
+    
+    const imageContent = batch.map((url, idx) => ({
+      type: "image_url" as const,
+      image_url: { url, detail: "high" as const }
+    }));
+    
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [
+          {
+            role: "system",
+            content: `You are an expert document extractor. Extract ALL content from the PDF page images provided.
+
+For each page, extract:
+1. **All Text**: Every word, heading, paragraph, caption
+2. **Tables**: Format as markdown tables with | separators
+3. **Equations**: Format using LaTeX notation (e.g., $E = mc^2$)
+4. **Diagrams/Figures**: Describe in [Figure: description] format
+5. **Lists**: Preserve bullet points and numbering
+
+Output format for each page:
+=== PAGE X ===
+[content]
+
+Be thorough - extract EVERYTHING visible on each page.`
+          },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: `Extract all content from these ${batch.length} PDF page(s). Pages ${i + 1} to ${i + batch.length}.` },
+              ...imageContent
+            ]
+          }
+        ],
+        max_tokens: 4096,
+        temperature: 0.1,
+      }),
+    });
+    
+    if (!response.ok) {
+      const error = await response.text();
+      console.error("[GPTVision] Error:", error);
+      throw new Error(`GPT Vision failed: ${response.status}`);
+    }
+    
+    const result = await response.json();
+    const content = result.choices?.[0]?.message?.content || "";
+    
+    // Parse pages from response
+    const pageMatches = content.split(/===\s*PAGE\s*(\d+)\s*===/i);
+    for (let j = 1; j < pageMatches.length; j += 2) {
+      const pageNum = parseInt(pageMatches[j]) || (i + Math.ceil(j / 2));
+      const pageText = pageMatches[j + 1]?.trim() || "";
+      if (pageText.length > 10) {
+        pages.push({ pageNum, text: pageText });
+      }
+    }
+    
+    // If no page markers found, treat whole response as one page
+    if (pages.length === 0 && content.length > 10) {
+      pages.push({ pageNum: i + 1, text: content });
+    }
+  }
+  
+  const fullText = pages.map(p => p.text).join("\n\n");
+  return { text: fullText, pages };
+}
+
+// Google Document AI - Extract text from PDF (1000 pages FREE/month, then $0.001/page)
+// NOTE: Requires a Document AI processor to be created in Google Cloud Console
+async function extractWithGoogleDocumentAI(base64Pdf: string): Promise<{ text: string; pages: { pageNum: number; text: string }[] }> {
+  if (!GOOGLE_CLOUD_API_KEY) {
+    throw new Error("Google Cloud API key not configured");
+  }
+  
+  // Check if we have a processor ID configured
+  const PROCESSOR_ID = Deno.env.get("GOOGLE_DOCUMENT_AI_PROCESSOR_ID");
+  if (!PROCESSOR_ID) {
+    throw new Error("Document AI processor not configured. Set GOOGLE_DOCUMENT_AI_PROCESSOR_ID secret.");
+  }
+  
+  console.log("[DocumentAI] Starting extraction with processor:", PROCESSOR_ID);
+  
+  // Use the Document AI REST API with API key
+  const url = `https://documentai.googleapis.com/v1/projects/${GOOGLE_PROJECT_ID}/locations/${GOOGLE_LOCATION}/processors/${PROCESSOR_ID}:process?key=${GOOGLE_CLOUD_API_KEY}`;
+  
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      rawDocument: {
+        content: base64Pdf,
+        mimeType: "application/pdf",
+      },
+      skipHumanReview: true,
+    }),
+  });
+  
+  if (!response.ok) {
+    const error = await response.text();
+    console.error("[DocumentAI] Error:", error);
+    throw new Error(`Document AI failed: ${response.status}`);
+  }
+  
+  const result = await response.json();
+  
+  // Extract text from response
+  const document = result.document;
+  const fullText = document?.text || "";
+  
+  // Extract pages
+  const pages: { pageNum: number; text: string }[] = [];
+  if (document?.pages) {
+    for (let i = 0; i < document.pages.length; i++) {
+      const page = document.pages[i];
+      let pageText = "";
+      
+      // Get text from page layout
+      if (page.layout?.textAnchor?.textSegments) {
+        for (const segment of page.layout.textAnchor.textSegments) {
+          const start = parseInt(segment.startIndex || "0");
+          const end = parseInt(segment.endIndex || fullText.length.toString());
+          pageText += fullText.substring(start, end);
+        }
+      }
+      
+      // Fallback: extract from paragraphs
+      if (!pageText && page.paragraphs) {
+        for (const para of page.paragraphs) {
+          if (para.layout?.textAnchor?.textSegments) {
+            for (const segment of para.layout.textAnchor.textSegments) {
+              const start = parseInt(segment.startIndex || "0");
+              const end = parseInt(segment.endIndex || fullText.length.toString());
+              pageText += fullText.substring(start, end) + "\n";
+            }
+          }
+        }
+      }
+      
+      pages.push({
+        pageNum: i + 1,
+        text: pageText.trim() || `[Page ${i + 1}]`,
+      });
+    }
+  }
+  
+  // If no pages extracted, create one from full text
+  if (pages.length === 0 && fullText) {
+    pages.push({ pageNum: 1, text: fullText });
+  }
+  
+  console.log("[DocumentAI] Extracted", pages.length, "pages,", fullText.length, "chars");
+  
+  return { text: fullText, pages };
+}
+
+// Send email notification to admin when credits run out
+async function notifyAdminCreditExhausted(errorDetails: string) {
+  try {
+    // Use a free email service - Resend, SendGrid, or Supabase's built-in
+    // For now, log it and you can check Supabase logs
+    console.error("🚨 CRITICAL: OpenAI Credits Exhausted!");
+    console.error("Admin Email:", ADMIN_EMAIL);
+    console.error("Error:", errorDetails);
+    console.error("Action Required: Add credits at https://platform.openai.com/account/billing");
+    
+    // Try to send email via Resend (free tier: 100 emails/day)
+    // You can add RESEND_API_KEY to Supabase secrets if you want email notifications
+    const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
+    if (RESEND_API_KEY) {
+      await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: "MindSparkle <notifications@resend.dev>",
+          to: ADMIN_EMAIL,
+          subject: "🚨 MindSparkle: OpenAI Credits Exhausted!",
+          html: `
+            <h2>⚠️ OpenAI API Credits Exhausted</h2>
+            <p>Your MindSparkle app's OpenAI credits have run out.</p>
+            <p><strong>Error:</strong> ${errorDetails}</p>
+            <p><strong>Action Required:</strong></p>
+            <ol>
+              <li>Go to <a href="https://platform.openai.com/account/billing">OpenAI Billing</a></li>
+              <li>Add credits to your account</li>
+              <li>Recommended: Add $10-20 for continued service</li>
+            </ol>
+            <p>Users are seeing "Service temporarily unavailable" message.</p>
+          `,
+        }),
+      });
+      console.log("Email notification sent to", ADMIN_EMAIL);
+    }
+  } catch (e) {
+    console.error("Failed to send notification:", e);
+  }
+}
+
+// Helper to detect and format OpenAI billing errors
+function formatOpenAIError(error: any, statusCode?: number): string {
+  const errorMessage = error?.message || error?.toString() || "Unknown error";
+  const errorLower = errorMessage.toLowerCase();
+  
+  // Check for quota/billing errors
+  if (
+    statusCode === 429 ||
+    statusCode === 402 ||
+    errorLower.includes("quota") ||
+    errorLower.includes("insufficient") ||
+    errorLower.includes("billing") ||
+    errorLower.includes("exceeded") ||
+    errorLower.includes("rate limit")
+  ) {
+    // Notify admin (you) about the credit issue
+    notifyAdminCreditExhausted(errorMessage);
+    
+    // Return generic message for users
+    return "QUOTA_EXCEEDED: Service temporarily unavailable. Please try again later.";
+  }
+  
+  return errorMessage;
+}
+
+// Retry helper for rate limits
+async function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Detect if content is Cisco-related
+function detectCiscoContent(text: string): { isCisco: boolean; topics: string[] } {
+  const CISCO_KEYWORDS = [
+    'cisco', 'ios', 'ios-xe', 'nx-os', 'asa', 'firepower',
+    'ccna', 'ccnp', 'ccie', 'ccent', 'devnet',
+    'catalyst', 'nexus', 'meraki', 'webex',
+    'eigrp', 'ospf', 'bgp', 'hsrp', 'vrrp',
+    'vlan', 'stp', 'rstp', 'pvst', 'vxlan',
+    'router#', 'switch#', 'switch>', 'router>',
+    'configure terminal', 'show running-config',
+    'interface gigabitethernet', 'switchport'
+  ];
+  
+  const lowerText = text.toLowerCase();
+  const foundTopics: string[] = [];
+  
+  for (const keyword of CISCO_KEYWORDS) {
+    if (lowerText.includes(keyword.toLowerCase())) {
+      foundTopics.push(keyword);
+    }
+  }
+  
+  // Check for CLI patterns
+  const cliPatterns = [
+    /[A-Za-z0-9_-]+[#>]\s*.+/g,
+    /^\s*(config|interface|router|line|vlan)/gm,
+    /^\s*show\s+(ip|running|startup)/gm
+  ];
+  
+  let cliMatches = 0;
+  for (const pattern of cliPatterns) {
+    const matches = text.match(pattern);
+    if (matches) cliMatches += matches.length;
+  }
+  
+  if (cliMatches > 3) foundTopics.push('CLI Commands');
+  
+  return {
+    isCisco: foundTopics.length >= 2 || cliMatches > 5,
+    topics: [...new Set(foundTopics)].slice(0, 10)
+  };
+}
+
+// ============================================
+// FULL VENDOR DETECTION (All 30+ vendors)
+// ============================================
+interface VendorDetectionResult {
+  detected: boolean;
+  vendorId: string;
+  vendorName: string;
+  confidence: number;
+  matchedKeywords: string[];
+  certificationDetected?: string;
+  specialInstructions: string[];
+}
+
+const VENDOR_CONFIGS: Record<string, { name: string; keywords: string[]; certs: string[]; instructions: string[] }> = {
+  cisco: {
+    name: 'Cisco Systems',
+    keywords: ['cisco', 'ios', 'ios-xe', 'nx-os', 'asa', 'firepower', 'ccna', 'ccnp', 'ccie', 'catalyst', 'nexus', 'eigrp', 'ospf', 'bgp', 'vlan', 'stp', 'switchport', 'router#', 'switch#'],
+    certs: ['CCNA', 'CCNP', 'CCIE', 'CCENT', 'DevNet'],
+    instructions: ['Preserve all CLI commands exactly', 'Include command prompts (Router#, Switch>)', 'Reference IOS version differences'],
+  },
+  aws: {
+    name: 'Amazon Web Services',
+    keywords: ['aws', 'amazon web services', 'ec2', 's3', 'lambda', 'rds', 'vpc', 'iam', 'cloudformation', 'cloudwatch', 'route53', 'dynamodb', 'sqs', 'sns', 'eks', 'ecs'],
+    certs: ['SAA-C03', 'DVA-C02', 'SOA-C02', 'Solutions Architect'],
+    instructions: ['Preserve AWS CLI commands', 'Include ARN formats', 'Reference AWS Well-Architected Framework'],
+  },
+  microsoft: {
+    name: 'Microsoft Azure',
+    keywords: ['azure', 'microsoft', 'active directory', 'entra', 'intune', 'windows server', 'powershell', 'az-104', 'az-900', 'office 365', 'm365', 'sharepoint', 'teams'],
+    certs: ['AZ-900', 'AZ-104', 'AZ-204', 'AZ-305', 'AZ-500'],
+    instructions: ['Preserve Azure CLI and PowerShell commands', 'Include RBAC roles', 'Reference Microsoft Learn'],
+  },
+  google: {
+    name: 'Google Cloud',
+    keywords: ['google cloud', 'gcp', 'gcloud', 'compute engine', 'cloud storage', 'bigquery', 'gke', 'cloud functions', 'cloud run', 'firebase'],
+    certs: ['ACE', 'PCA', 'PDE', 'Associate Cloud Engineer'],
+    instructions: ['Preserve gcloud commands', 'Include project references', 'Reference GCP documentation'],
+  },
+  comptia: {
+    name: 'CompTIA',
+    keywords: ['comptia', 'a+', 'network+', 'security+', 'linux+', 'cloud+', 'cysa+', 'pentest+', 'casp+', 'osi model', 'tcp/ip'],
+    certs: ['A+', 'Network+', 'Security+', 'CySA+', 'PenTest+', 'CASP+'],
+    instructions: ['Focus on exam objectives', 'Include acronym expansions', 'Use CompTIA terminology'],
+  },
+  vmware: {
+    name: 'VMware',
+    keywords: ['vmware', 'vsphere', 'vcenter', 'esxi', 'vsan', 'nsx', 'vmotion', 'drs', 'ha', 'horizon', 'tanzu'],
+    certs: ['VCP-DCV', 'VCAP', 'VCDX'],
+    instructions: ['Preserve ESXi CLI commands', 'Include vSphere versions', 'Highlight licensing tiers'],
+  },
+  redhat: {
+    name: 'Red Hat',
+    keywords: ['red hat', 'rhel', 'centos', 'fedora', 'openshift', 'ansible', 'rhcsa', 'rhce', 'systemd', 'selinux', 'podman', 'dnf', 'yum'],
+    certs: ['RHCSA', 'RHCE', 'RHCA', 'EX200', 'EX294'],
+    instructions: ['Preserve Linux commands', 'Include SELinux contexts', 'Highlight RHEL versions'],
+  },
+  kubernetes: {
+    name: 'Kubernetes',
+    keywords: ['kubernetes', 'k8s', 'kubectl', 'pod', 'deployment', 'service', 'ingress', 'helm', 'cka', 'ckad', 'cks', 'etcd', 'kubelet'],
+    certs: ['CKA', 'CKAD', 'CKS', 'KCNA'],
+    instructions: ['Preserve YAML manifests exactly', 'Include API versions', 'Reference kubectl commands'],
+  },
+  docker: {
+    name: 'Docker',
+    keywords: ['docker', 'dockerfile', 'docker-compose', 'container', 'image', 'docker hub', 'containerd'],
+    certs: ['DCA', 'Docker Certified Associate'],
+    instructions: ['Preserve Dockerfile syntax', 'Include docker commands', 'Reference best practices'],
+  },
+  hashicorp: {
+    name: 'HashiCorp',
+    keywords: ['terraform', 'vault', 'consul', 'nomad', 'packer', 'hcl', 'infrastructure as code', 'iac'],
+    certs: ['Terraform Associate', 'Vault Associate', 'Consul Associate'],
+    instructions: ['Preserve HCL/Terraform syntax exactly', 'Include state management', 'Reference modules'],
+  },
+  fortinet: {
+    name: 'Fortinet',
+    keywords: ['fortinet', 'fortigate', 'fortianalyzer', 'fortimanager', 'fortios', 'nse4', 'nse5', 'nse6', 'nse7', 'ngfw'],
+    certs: ['NSE4', 'NSE5', 'NSE6', 'NSE7', 'NSE8'],
+    instructions: ['Preserve FortiOS CLI syntax', 'Include policy IDs', 'Reference Security Fabric'],
+  },
+  paloalto: {
+    name: 'Palo Alto Networks',
+    keywords: ['palo alto', 'pan-os', 'panorama', 'prisma', 'cortex', 'pcnsa', 'pcnse', 'wildfire', 'globalprotect'],
+    certs: ['PCNSA', 'PCNSE', 'PCSAE'],
+    instructions: ['Preserve PAN-OS CLI syntax', 'Include commit workflow', 'Reference App-ID'],
+  },
+  juniper: {
+    name: 'Juniper Networks',
+    keywords: ['juniper', 'junos', 'srx', 'ex', 'mx', 'qfx', 'jncia', 'jncis', 'jncip', 'jncie'],
+    certs: ['JNCIA', 'JNCIS', 'JNCIP', 'JNCIE'],
+    instructions: ['Preserve Junos CLI syntax', 'Include hierarchy context', 'Reference commit model'],
+  },
+  oracle: {
+    name: 'Oracle',
+    keywords: ['oracle', 'oci', 'oracle cloud', 'pl/sql', 'sql*plus', 'rman', 'data guard', 'rac', 'weblogic', 'oca', 'ocp'],
+    certs: ['OCA', 'OCP', 'OCM'],
+    instructions: ['Preserve SQL/PL-SQL syntax', 'Include version features', 'Reference licensing'],
+  },
+  splunk: {
+    name: 'Splunk',
+    keywords: ['splunk', 'spl', 'splunk enterprise', 'siem', 'index', 'sourcetype', 'forwarder'],
+    certs: ['Core Certified User', 'Core Certified Power User', 'Enterprise Admin'],
+    instructions: ['Preserve SPL queries exactly', 'Include index references', 'Reference search commands'],
+  },
+  isc2: {
+    name: 'ISC2',
+    keywords: ['isc2', 'cissp', 'ccsp', 'sscp', 'csslp', 'security domains', 'cbk'],
+    certs: ['CISSP', 'CCSP', 'SSCP', 'CSSLP', 'CGRC'],
+    instructions: ['Focus on security concepts', 'Use ISC2 terminology', 'Reference CBK domains'],
+  },
+  isaca: {
+    name: 'ISACA',
+    keywords: ['isaca', 'cisa', 'cism', 'crisc', 'cgeit', 'cobit', 'it governance', 'audit'],
+    certs: ['CISA', 'CISM', 'CRISC', 'CGEIT', 'CDPSE'],
+    instructions: ['Focus on governance frameworks', 'Use ISACA terminology', 'Reference COBIT'],
+  },
+  'ec-council': {
+    name: 'EC-Council',
+    keywords: ['ec-council', 'ceh', 'certified ethical hacker', 'ecsa', 'chfi', 'penetration testing', 'ethical hacking'],
+    certs: ['CEH', 'ECSA', 'LPT', 'CHFI', 'CTIA'],
+    instructions: ['Preserve hacking tool syntax', 'Follow ethical guidelines', 'Reference methodologies'],
+  },
+  salesforce: {
+    name: 'Salesforce',
+    keywords: ['salesforce', 'apex', 'soql', 'visualforce', 'lightning', 'lwc', 'trailhead', 'admin', 'platform developer'],
+    certs: ['Admin', 'Platform Developer', 'Architect'],
+    instructions: ['Preserve Apex/SOQL syntax', 'Include API references', 'Reference Trailhead'],
+  },
+  sap: {
+    name: 'SAP',
+    keywords: ['sap', 's/4hana', 'hana', 'abap', 'fiori', 'netweaver', 'sap erp', 'sap bw'],
+    certs: ['SAP Certified Associate', 'SAP Certified Professional'],
+    instructions: ['Preserve ABAP syntax', 'Include module references', 'Reference transactions'],
+  },
+  mongodb: {
+    name: 'MongoDB',
+    keywords: ['mongodb', 'mongo', 'nosql', 'document database', 'atlas', 'aggregation', 'replica set'],
+    certs: ['MongoDB Certified DBA', 'MongoDB Certified Developer'],
+    instructions: ['Preserve MongoDB query syntax', 'Include index strategies', 'Reference aggregation pipeline'],
+  },
+  snowflake: {
+    name: 'Snowflake',
+    keywords: ['snowflake', 'data warehouse', 'snowpark', 'virtual warehouse', 'snowpipe', 'time travel'],
+    certs: ['SnowPro Core', 'SnowPro Advanced'],
+    instructions: ['Preserve Snowflake SQL syntax', 'Include warehouse sizing', 'Reference data sharing'],
+  },
+  databricks: {
+    name: 'Databricks',
+    keywords: ['databricks', 'spark', 'delta lake', 'mlflow', 'lakehouse', 'pyspark'],
+    certs: ['Data Engineer Associate', 'Data Engineer Professional', 'ML Associate'],
+    instructions: ['Preserve Spark/PySpark syntax', 'Include cluster configs', 'Reference Unity Catalog'],
+  },
+  servicenow: {
+    name: 'ServiceNow',
+    keywords: ['servicenow', 'snow', 'itsm', 'itom', 'gliderecord', 'flow designer', 'cmdb'],
+    certs: ['CSA', 'CAD', 'CIS-ITSM', 'CIS-ITOM'],
+    instructions: ['Preserve GlideRecord syntax', 'Include script examples', 'Reference ServiceNow docs'],
+  },
+  itil: {
+    name: 'ITIL',
+    keywords: ['itil', 'itil 4', 'itsm', 'service management', 'incident management', 'change management', 'service value system'],
+    certs: ['ITIL Foundation', 'ITIL Managing Professional'],
+    instructions: ['Use official ITIL terminology', 'Reference ITIL 4 practices', 'Include process flows'],
+  },
+  pmi: {
+    name: 'PMI',
+    keywords: ['pmi', 'pmp', 'capm', 'pgmp', 'pmi-acp', 'pmbok', 'project management', 'agile', 'waterfall'],
+    certs: ['PMP', 'CAPM', 'PgMP', 'PMI-ACP'],
+    instructions: ['Use PMI terminology', 'Reference PMBOK Guide', 'Include ITTOs'],
+  },
+  f5: {
+    name: 'F5 Networks',
+    keywords: ['f5', 'big-ip', 'ltm', 'gtm', 'asm', 'apm', 'irule', 'virtual server', 'load balancing'],
+    certs: ['F5-CA', '201', '301', '302'],
+    instructions: ['Preserve TMSH and iRule syntax', 'Include pool configurations', 'Reference LTM concepts'],
+  },
+  arista: {
+    name: 'Arista Networks',
+    keywords: ['arista', 'eos', 'cloudvision', 'mlag', 'vxlan', 'evpn'],
+    certs: ['ACE', 'ACE-L', 'ACE-A'],
+    instructions: ['Preserve EOS CLI syntax', 'Include MLAG configs', 'Reference CloudVision'],
+  },
+  netapp: {
+    name: 'NetApp',
+    keywords: ['netapp', 'ontap', 'data ontap', 'snapmirror', 'snapvault', 'aggregate', 'volume', 'lun'],
+    certs: ['NCA', 'NCDA', 'NCSIE'],
+    instructions: ['Preserve ONTAP CLI syntax', 'Include data protection', 'Reference storage concepts'],
+  },
+  checkpoint: {
+    name: 'Check Point',
+    keywords: ['check point', 'checkpoint', 'gaia', 'smartconsole', 'ccsa', 'ccse', 'firewall', 'threat prevention'],
+    certs: ['CCSA', 'CCSE', 'CCSM'],
+    instructions: ['Preserve Gaia CLI syntax', 'Include policy layers', 'Reference SmartConsole'],
+  },
+  crowdstrike: {
+    name: 'CrowdStrike',
+    keywords: ['crowdstrike', 'falcon', 'edr', 'xdr', 'threat hunting', 'endpoint protection'],
+    certs: ['CCFA', 'CCFR', 'CCFH'],
+    instructions: ['Focus on detection procedures', 'Include hunting queries', 'Reference Falcon platform'],
+  },
+};
+
+function detectVendor(text: string): VendorDetectionResult {
+  const lowerText = text.toLowerCase();
+  const scores: { vendorId: string; score: number; keywords: string[]; cert?: string }[] = [];
+
+  for (const [vendorId, config] of Object.entries(VENDOR_CONFIGS)) {
+    let score = 0;
+    const matchedKeywords: string[] = [];
+    let certDetected: string | undefined;
+
+    // Check keywords
+    for (const keyword of config.keywords) {
+      if (lowerText.includes(keyword.toLowerCase())) {
+        matchedKeywords.push(keyword);
+        score += keyword.length > 6 ? 3 : keyword.length > 3 ? 2 : 1;
+      }
+    }
+
+    // Check certifications (high weight)
+    for (const cert of config.certs) {
+      const certPattern = new RegExp(`\\b${cert.replace(/[+]/g, '\\+')}\\b`, 'gi');
+      if (certPattern.test(text)) {
+        certDetected = cert;
+        score += 20;
+      }
+    }
+
+    if (score > 0) {
+      scores.push({ vendorId, score, keywords: matchedKeywords, cert: certDetected });
+    }
+  }
+
+  // Sort by score
+  scores.sort((a, b) => b.score - a.score);
+
+  if (scores.length > 0 && scores[0].score >= 5) {
+    const top = scores[0];
+    const config = VENDOR_CONFIGS[top.vendorId];
+    return {
+      detected: true,
+      vendorId: top.vendorId,
+      vendorName: config.name,
+      confidence: Math.min(top.score / 50, 1),
+      matchedKeywords: top.keywords.slice(0, 10),
+      certificationDetected: top.cert,
+      specialInstructions: config.instructions,
+    };
+  }
+
+  return {
+    detected: false,
+    vendorId: 'generic',
+    vendorName: 'General Document',
+    confidence: 0,
+    matchedKeywords: [],
+    specialInstructions: ['Organize content clearly', 'Highlight key concepts'],
+  };
+}
+
+// Prompt builder: returns tuned system prompts for different actions and languages
+function buildSystemPrompt(action: string, opts: any = {}, language: string | undefined = 'en', style?: string, useAnimations?: boolean) {
+  const langPrefix = language && language !== 'en' ? `Respond in ${language}. ` : '';
+  
+  // Check if content is Cisco-related (legacy)
+  const isCisco = opts.isCisco || false;
+  const ciscoTopics = opts.ciscoTopics || [];
+  
+  // New vendor detection (supports 30+ vendors)
+  const vendorDetection = opts.vendorDetection as VendorDetectionResult | undefined;
+
+  if (action === 'summarize') {
+    // VENDOR-SPECIFIC PROMPTS (new - supports 30+ vendors)
+    if (vendorDetection && vendorDetection.detected && vendorDetection.vendorId !== 'cisco') {
+      const vendorInstructions = vendorDetection.specialInstructions.join('\n- ');
+      const certInfo = vendorDetection.certificationDetected 
+        ? `\n\n📜 CERTIFICATION DETECTED: ${vendorDetection.certificationDetected}` 
+        : '';
+      
+      return langPrefix + `You are an expert ${vendorDetection.vendorName} instructor creating a VISUAL STUDY GUIDE.
+      ${certInfo}
+      
+      ⚠️ STRICT GROUNDING RULES:
+      1. ONLY use information from the document provided
+      2. DO NOT add external ${vendorDetection.vendorName} knowledge not in the document
+      3. If information is missing, say "Not specified in the document"
+      4. Preserve ALL commands and code EXACTLY as written
+      5. DO NOT guess or infer configurations
+      
+      📌 VENDOR-SPECIFIC INSTRUCTIONS:
+      - ${vendorInstructions}
+      
+      🔍 KEYWORDS DETECTED: ${vendorDetection.matchedKeywords.slice(0, 8).join(', ')}
+      
+      STRUCTURE YOUR RESPONSE WITH VISUALS:
+      
+      ## 🎯 ${vendorDetection.vendorName} Overview
+      Brief description of what this document covers.
+      
+      ![${vendorDetection.vendorName}](https://source.unsplash.com/800x400/?technology,${vendorDetection.vendorId.replace('-', ',')})
+      
+      ## 💻 Commands & Code Reference
+      | Command/Code | Purpose | Example |
+      |--------------|---------|----------|
+      | cmd1 | description | usage |
+      
+      Include ALL commands/code from the document in this table format.
+      
+      ## 📊 Configuration/Setup Tables
+      Present configurations as tables when applicable:
+      | Parameter | Value | Description |
+      |-----------|-------|-------------|
+      
+      ## 🔧 Technical Concepts
+      Explain key concepts covered in the document.
+      - Only concepts from the document
+      - Include page references if available
+      
+      ## ⚠️ Important Notes
+      - Security considerations mentioned
+      - Best practices from the document
+      - Common pitfalls discussed
+      
+      ## 📝 ${vendorDetection.certificationDetected ? vendorDetection.certificationDetected + ' ' : ''}Exam Topics Covered
+      - List exam-relevant topics
+      - Key points to remember
+      
+      ![Study Tips](https://source.unsplash.com/600x300/?study,exam,certification)
+      
+      Remember: If it's not in the document, don't include it.`;
+    }
+    
+    // CISCO/NETWORK-SPECIFIC PROMPT with enhanced visuals (legacy, still works)
+    if (isCisco) {
+      return langPrefix + `You are an expert Cisco networking instructor creating a VISUAL STUDY GUIDE with network diagrams.
+      
+      ⚠️ STRICT GROUNDING RULES:
+      1. ONLY use information from the document provided
+      2. DO NOT add external Cisco knowledge or commands not in the document
+      3. If information is missing, say "Not specified in the document"
+      4. Preserve ALL CLI commands EXACTLY as written
+      5. DO NOT guess or infer configurations
+      
+      CISCO TOPICS DETECTED: ${ciscoTopics.join(', ')}
+      
+      STRUCTURE YOUR RESPONSE WITH VISUALS:
+      
+      ## 🌐 Network Overview
+      Brief description of what this document covers.
+      
+      ![Network Topology](https://source.unsplash.com/800x400/?network,cisco,technology)
+      
+      ## 🖼️ Network Diagram
+      Create an ASCII network diagram showing the topology discussed:
+      \`\`\`
+      ┌─────────┐     ┌─────────┐     ┌─────────┐
+      │ Router  │────▶│ Switch  │────▶│  Host   │
+      └─────────┘     └─────────┘     └─────────┘
+      \`\`\`
+      (Adapt this to match the actual topology from the document)
+      
+      ## 💻 CLI Commands Reference
+      | Command | Purpose | Example |
+      |---------|---------|----------|
+      | cmd1 | description | usage |
+      
+      Include ALL CLI commands from the document in this table format.
+      
+      ## 📊 Configuration Tables
+      Present configurations as tables when applicable:
+      | Parameter | Value | Description |
+      |-----------|-------|-------------|
+      
+      ## 📋 Key Configurations
+      - Configuration steps mentioned
+      - Parameters and values shown
+      - Any verification commands
+      
+      ## 🔧 Technical Concepts
+      Explain networking concepts covered (VLAN, routing, etc.)
+      - Only concepts from the document
+      - Include page references if available
+      
+      ## ⚠️ Important Notes
+      - Security considerations mentioned
+      - Best practices from the document
+      - Common mistakes discussed
+      
+      ## 📝 Exam Topics Covered
+      - List exam-relevant topics
+      - Key points to remember
+      
+      ![Study Tips](https://source.unsplash.com/600x300/?study,exam,certification)
+      
+      Remember: If it's not in the document, don't include it.`;
+    }
+
+    if (opts.isCombine) {
+      return langPrefix + `You are an expert academic summarizer. Combine the provided section summaries into a single, exam-ready STUDY GUIDE. Output a clear hierarchical summary with: (1) Executive Overview (2-3 sentences), (2) Key Topics (bullet list), (3) Detailed Breakdown by topic with short explanations and page references, (4) Critical Terms table, (5) 7 Key Takeaways, and (6) a Quick Review checklist. Use concise, precise language suitable for students; prefer numbered lists and short paragraphs. Keep tone neutral and authoritative.`;
+    }
+
+    if (opts.chunkInfo) {
+      return langPrefix + `You are an expert educational writer. Summarize ${opts.chunkInfo} as a self-contained study section.
+      
+      Include:
+      - A short section title
+      - ONE relevant image at the start: ![Topic](https://source.unsplash.com/600x300/?[keyword]) where [keyword] is 1-2 words describing the main topic
+      - 3–6 bullet key points
+      - 2 brief examples or clarifying sentences
+      - Any page references present
+      
+      Keep the summary concise but complete.`;
+    }
+
+    // PROFESSIONAL WHOLE DOCUMENT SUMMARY WITH IMAGES, TABLES, AND DIAGRAMS
+    return langPrefix + `You are an elite educational content creator and subject matter expert. Create a COMPREHENSIVE, PROFESSIONAL STUDY GUIDE that transforms this document into an engaging, visually-rich learning experience.
+
+    ⚠️ CRITICAL: DO NOT LIMIT YOUR RESPONSE. This should be a COMPLETE, MULTI-PAGE summary covering the ENTIRE document thoroughly. Quality and completeness are more important than brevity.
+    
+    🎯 YOUR MISSION:
+    - Make complex topics SIMPLE and easy to understand
+    - Use visuals, tables, and diagrams to enhance learning
+    - Cover 100% of the document content (beginning, middle, AND end)
+    - Write as if teaching a student who knows nothing about the topic
+    
+    📊 SMART CONTENT DETECTION - Automatically adapt your style:
+    - **Technical/IT**: CLI commands tables, architecture diagrams, protocol comparisons
+    - **Cloud/DevOps**: Service comparison tables, architecture diagrams, pricing tiers
+    - **Security**: Threat matrices, control frameworks, attack flow diagrams
+    - **Networking**: Topology diagrams (ASCII), port tables, protocol stacks
+    - **Business/Management**: Process flows, SWOT tables, timeline charts
+    - **Science/Math**: Formulas (LaTeX: $formula$), experiment tables, data charts
+    - **Medical/Health**: Symptom tables, treatment protocols, anatomical references
+    - **Legal/Compliance**: Requirement checklists, comparison tables, timeline flows
+    
+    📝 COMPREHENSIVE STRUCTURE (use ALL that apply):
+    
+    ## 🎯 Executive Summary
+    A clear 4-5 sentence overview answering: What is this about? Why does it matter? What will you learn?
+    
+    ![Topic Overview](https://source.unsplash.com/900x400/?[main-topic-keywords])
+    
+    ---
+    
+    ## 📚 Table of Contents
+    Create a clickable outline of all major sections covered.
+    
+    ---
+    
+    ## 📖 Detailed Breakdown
+    For EACH major topic in the document, create a section with:
+    
+    ### [Topic Title] 
+    ![Relevant Image](https://source.unsplash.com/700x350/?[topic-keyword])
+    
+    **Overview**: 2-3 sentences explaining what this section covers.
+    
+    **Key Concepts**:
+    Explain each concept thoroughly with:
+    - Clear definitions
+    - Real-world analogies (e.g., "Think of a VPC like a private office building...")
+    - Examples from the document
+    
+    **Visual Aid** (create one of these for each section):
+    - 📊 **Comparison Table**: Side-by-side comparisons
+    - 📋 **Feature Table**: List of features/capabilities
+    - 🔄 **Process Flow**: Step-by-step procedures
+    - 📈 **Data Table**: Numbers, metrics, specifications
+    
+    ---
+    
+    ## 📊 Master Reference Tables
+    Create comprehensive tables for quick reference:
+    
+    ### Key Terms & Definitions
+    | Term | Definition | Example |
+    |------|------------|---------|
+    | term1 | clear definition | practical example |
+    
+    ### Commands/Syntax Reference (if applicable)
+    | Command | Purpose | Syntax |
+    |---------|---------|--------|
+    | cmd | what it does | how to use |
+    
+    ### Comparison Matrix (if applicable)
+    | Feature | Option A | Option B | Option C |
+    |---------|----------|----------|----------|
+    | feature1 | ✅/❌ | ✅/❌ | ✅/❌ |
+    
+    ---
+    
+    ## 🗺️ Visual Diagrams
+    Create ASCII diagrams to illustrate relationships and flows:
+    
+    \`\`\`
+    ┌──────────────┐         ┌──────────────┐
+    │   Component  │────────▶│   Component  │
+    │      A       │         │      B       │
+    └──────────────┘         └──────────────┘
+            │                        │
+            ▼                        ▼
+    ┌──────────────┐         ┌──────────────┐
+    │   Component  │◀────────│   Component  │
+    │      C       │         │      D       │
+    └──────────────┘         └──────────────┘
+    \`\`\`
+    
+    ---
+    
+    ## 💡 Practical Examples
+    Include 2-3 real-world scenarios or use cases from the document.
+    
+    ---
+    
+    ## ⚠️ Important Notes & Warnings
+    - Critical points to remember
+    - Common mistakes to avoid
+    - Best practices mentioned
+    
+    ---
+    
+    ## 🧠 Deep Understanding
+    - Why does this matter?
+    - How do the concepts connect?
+    - What's the bigger picture?
+    
+    ---
+    
+    ## ✅ Exam Preparation
+    
+    ### Key Takeaways (7-10 points)
+    1. Most important point...
+    2. Second most important...
+    
+    ### Quick Review Checklist
+    - [ ] Can I explain [concept 1]?
+    - [ ] Do I understand [concept 2]?
+    - [ ] Can I apply [concept 3]?
+    
+    ### Memory Aids
+    - **Acronyms**: Create memorable acronyms
+    - **Mnemonics**: Easy ways to remember lists
+    
+    ![Study Success](https://source.unsplash.com/600x300/?success,study,graduation)
+    
+    ---
+    
+    🖼️ IMAGE GUIDELINES:
+    - Use: https://source.unsplash.com/WIDTHxHEIGHT/?KEYWORD1,KEYWORD2
+    - Include 5-8 relevant images throughout
+    - Choose professional, educational imagery
+    - Keywords should match the actual content
+    
+    📏 LENGTH: Be COMPREHENSIVE. This can be 3-10+ pages. Cover EVERYTHING in the document.
+    
+    🎨 FORMATTING: Use emojis for visual appeal, bold for emphasis, code blocks for commands/code.
+    
+    Remember: Your goal is to create the BEST possible study material that makes learning EASY and ENJOYABLE.`;
+  }
+
+  if (action === 'studyGuide') {
+    return langPrefix + `Create a comprehensive JSON study guide that ONLY uses information from the document. Return valid JSON with keys: title, sections (each with title, pageRef, keyPoints array), keyTerms (term, definition, pageRef), reviewChecklist array. Be precise; include page refs where available; do not invent facts.`;
+  }
+
+  if (action === 'videoWithSlides') {
+    const animDirective = useAnimations === false ? 'Do not include animation directions.' : 'Include a `visualDirections` array for each section with concrete animation/visual cues for the AI Teacher and the Screen (e.g., "Teacher points to graph", "Screen shows equation X").';
+    const styleDirective = style ? `Use this narration style: ${style}. ` : '';
+    
+    return langPrefix + `You are an expert YouTube educational content creator. Create an ENGAGING video lesson script that TEACHES the content, not just summarizes it.
+    
+    TEACHING STYLE - Like the best educational YouTube channels:
+    - Start with a HOOK: An interesting question, surprising fact, or relatable scenario
+    - Use analogies and real-world examples to explain complex concepts
+    - Break down difficult topics step-by-step
+    - Ask rhetorical questions to keep viewers engaged ("But wait, why does this matter?")
+    - Include "aha moments" where concepts click together
+    - End sections with quick recap and transition
+    
+    OUTPUT FORMAT (JSON ONLY):
+    {
+      "introduction": "Engaging hook + what we'll learn today...",
+      "sections": [
+        {
+          "title": "Section Title",
+          "narration": "Engaging explanation with analogies, examples, and rhetorical questions. Explain like a great teacher, not like reading a textbook.",
+          "visualDirections": [
+            "Screen: Animated title appears",
+            "Teacher: Uses hand gestures while explaining",
+            "Screen: Diagram animates in step by step",
+            "Screen: Key term highlighted and defined",
+            "Teacher: Points to important detail"
+          ],
+          "keyPoints": ["Main takeaway 1", "Main takeaway 2"],
+          "teachingTip": "Real-world example or analogy for this concept",
+          "interactiveElement": "Think about: [question for viewer to consider]",
+          "pageRef": 1
+        }
+      ],
+      "conclusion": "Recap of key learnings + call to action (take quiz, review notes, etc.)"
+    }
+    
+    INSTRUCTIONS:
+    - The "narration" must be CONVERSATIONAL and ENGAGING (like talking to a friend)
+    - Use phrases like: "Here's the thing...", "Think of it this way...", "This is crucial..."
+    - Include mini-stories or scenarios when possible
+    - "visualDirections" should create a dynamic, animated learning experience
+    - "teachingTip" provides an analogy or real-world connection
+    - "interactiveElement" keeps viewers thinking
+    - Cover the WHOLE document but prioritize the most important concepts
+    - Make complex topics SIMPLE without losing accuracy
+    - ${styleDirective}
+    - ${animDirective}`;
+  }
+
+  // default fallback
+  return language && language !== 'en' ? `Respond in ${language}. Provide a clear, concise summary.` : 'Provide a clear, concise summary.';
+}
+
+// Generate image using DALL-E 3
+async function generateImage(prompt: string): Promise<string | null> {
+  try {
+    const response = await fetch("https://api.openai.com/v1/images/generations", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "dall-e-3",
+        prompt: prompt.substring(0, 1000), // Limit prompt length
+        n: 1,
+        size: "1024x1024",
+        quality: "standard",
+        response_format: "url",
+      }),
+    });
+
+    const data = await response.json();
+    if (data.error) {
+      console.error("DALL-E error:", data.error);
+      return null;
+    }
+    return data.data?.[0]?.url || null;
+  } catch (e) {
+    console.error("Image generation failed:", e);
+    return null;
+  }
+}
+
+/**
+ * Sleep utility for retry delays
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function callOpenAI(systemPrompt: string, userPrompt: string, maxTokens = 4096, temperature = 0.3, useGpt4o = false): Promise<string> {
+  // Model fallback chain: gpt-4o-mini (fast & cheap) -> gpt-4o (powerful backup)
+  // For premium users, start with gpt-4o
+  const models = useGpt4o ? ["gpt-4o", "gpt-4o-mini"] : ["gpt-4o-mini", "gpt-4o"];
+  const safeMaxTokens = Math.min(maxTokens, 16384); // gpt-4o-mini supports up to 16K output tokens
+  
+  for (const model of models) {
+    console.log(`[callOpenAI] Trying model: ${model}, prompt length: ${userPrompt.length}`);
+    const startTime = Date.now();
+    
+    try {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          max_tokens: safeMaxTokens,
+          temperature: temperature,
+        }),
+      });
+
+      const data = await response.json();
+      const elapsed = Date.now() - startTime;
+      console.log(`[callOpenAI] Response from ${model} in ${elapsed}ms, status: ${response.status}`);
+      
+      if (data.error) {
+        console.warn(`[callOpenAI] ${model} failed: ${JSON.stringify(data.error)}`);
+        
+        // If rate limited (429), wait and retry with same model
+        if (response.status === 429) {
+          console.log(`[callOpenAI] Rate limited, waiting 3 seconds...`);
+          await sleep(3000);
+          continue;
+        }
+        
+        // If model not found or similar error, try next model
+        if (data.error.code === "model_not_found" || data.error.type === "invalid_request_error") {
+          console.log(`[callOpenAI] Falling back to next model...`);
+          continue;
+        }
+        // For other errors, throw immediately
+        throw new Error(formatOpenAIError(data.error, response.status));
+      }
+      
+      const result = data.choices?.[0]?.message?.content || "";
+      console.log(`[callOpenAI] Success with ${model}, result length: ${result.length} chars`);
+      return result;
+    } catch (fetchError: any) {
+      console.error(`[callOpenAI] Fetch error with ${model}:`, fetchError.message);
+      // If it's a network error, try next model
+      if (model !== models[models.length - 1]) {
+        continue;
+      }
+      throw fetchError;
+    }
+  }
+  
+  throw new Error("All models failed");
+}
+
+/**
+ * Call OpenAI Vision API for image-based tasks (OCR, image analysis)
+ */
+async function callOpenAIVision(systemPrompt: string, imageUrls: string[], userPrompt: string, maxTokens = 4096): Promise<string> {
+  const model = "gpt-4o"; // Vision requires gpt-4o or gpt-4o-mini
+  const safeMaxTokens = Math.min(maxTokens, 4096);
+  
+  console.log(`[callOpenAIVision] Processing ${imageUrls.length} images, prompt length: ${userPrompt.length}`);
+  const startTime = Date.now();
+  
+  try {
+    // Build content array with text and images
+    const content: Array<{type: string; text?: string; image_url?: {url: string}}> = [
+      { type: "text", text: userPrompt }
+    ];
+    
+    // Add images (limit to first 10 to avoid token limits)
+    const limitedImages = imageUrls.slice(0, 10);
+    for (const imageUrl of limitedImages) {
+      content.push({
+        type: "image_url",
+        image_url: { url: imageUrl }
+      });
+    }
+    
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: content },
+        ],
+        max_tokens: safeMaxTokens,
+        temperature: 0.2,
+      }),
+    });
+
+    const data = await response.json();
+    const elapsed = Date.now() - startTime;
+    console.log(`[callOpenAIVision] Response in ${elapsed}ms, status: ${response.status}`);
+    
+    if (data.error) {
+      console.error(`[callOpenAIVision] API error:`, data.error);
+      throw new Error(formatOpenAIError(data.error, response.status));
+    }
+    
+    const result = data.choices?.[0]?.message?.content || "";
+    console.log(`[callOpenAIVision] Success, result length: ${result.length} chars`);
+    return result;
+  } catch (error: any) {
+    console.error(`[callOpenAIVision] Error:`, error.message);
+    throw error;
+  }
+}
+
+Deno.serve(async (req) => {
+  let cors = corsHeaders;
+
+  try {
+    cors = enforceCors(req);
+
+    if (req.method === 'OPTIONS') {
+      return new Response('ok', { headers: cors });
+    }
+
+    rateLimit(req);
+    const user = await getAuthUser(req);
+
+    const { action, content, language, isCombine, chunkInfo, includeImages, imageUrls, questionCount, totalPages, pageCount, style, useAnimations, documentId, ...body } = await req.json();
+
+    // ========== RBAC: Role Validation ==========
+    /**
+     * RBAC: Validate user role and permissions before processing
+     * 
+     * 1. Fetch user's role from database
+     * 2. Check if action is allowed for this role
+     * 3. If documentId provided, verify document access
+     * 
+     * This provides server-side enforcement in addition to RLS policies
+     */
+    const userRole = await getUserRole(user.id);
+    console.log(`[RBAC] User ${user.id} has role: ${userRole}, action: ${action}`);
+    
+    // Check if action is allowed for user's role
+    if (!canPerformAction(userRole, action)) {
+      console.warn(`[RBAC] Action denied: ${action} not allowed for role ${userRole}`);
+      return new Response(JSON.stringify({ 
+        error: 'Permission denied: Your role does not allow this action',
+        code: 'RBAC_ACTION_DENIED',
+        role: userRole,
+        action: action
+      }), {
+        status: 403,
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+    
+    // If documentId is provided, verify access to that specific document
+    if (documentId) {
+      const hasDocumentAccess = await canAccessDocument(user.id, documentId);
+      if (!hasDocumentAccess) {
+        console.warn(`[RBAC] Document access denied: User ${user.id} cannot access document ${documentId}`);
+        return new Response(JSON.stringify({ 
+          error: 'Permission denied: You do not have access to this document',
+          code: 'RBAC_DOCUMENT_DENIED',
+          documentId: documentId
+        }), {
+          status: 403,
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+    }
+    // ========== END RBAC Validation ==========
+
+    if (content && typeof content === 'string' && content.length > MAX_CONTENT_LENGTH) {
+      return new Response(JSON.stringify({ error: 'Content too large' }), {
+        status: 413,
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+
+    let result;
+    let systemPrompt;
+    const hasImages = imageUrls && imageUrls.length > 0;
+    const hasContent = content && content.length > 0;
+
+    switch (action) {
+      case 'summarize': {
+        // VALIDATION: Check if content is sufficient
+        if (!hasContent && !hasImages) {
+          console.warn('[summarize] No content or images provided');
+          return new Response(JSON.stringify({ 
+            summary: 'Unable to generate summary: No content found in the document. Please ensure the document has extractable text.',
+            userId: user.id 
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        // Check if user is premium for GPT-4o model
+        const isPremium = await isPremiumUser(user.id);
+        console.log(`[summarize] User ${user.id} premium status: ${isPremium}`);
+        
+        // Detect vendor for specialized handling (supports 30+ vendors)
+        const vendorDetection = detectVendor(content || '');
+        console.log('[summarize] Vendor detection:', vendorDetection.vendorName, 
+          'Confidence:', vendorDetection.confidence.toFixed(2),
+          'Cert:', vendorDetection.certificationDetected || 'none',
+          'Keywords:', vendorDetection.matchedKeywords.slice(0, 5).join(', '));
+        
+        // Also run legacy Cisco detection for backward compatibility
+        const ciscoDetection = detectCiscoContent(content || '');
+  
+        // Build a tuned system prompt using prompt builder (vendor-aware)
+        systemPrompt = buildSystemPrompt('summarize', { 
+          isCombine, 
+          chunkInfo,
+          // Legacy Cisco support
+          isCisco: ciscoDetection.isCisco,
+          ciscoTopics: ciscoDetection.topics,
+          // New vendor detection
+          vendorDetection: vendorDetection.detected ? vendorDetection : undefined
+        }, language);
+        
+        // If images are available and either text is small or includeImages explicitly requested,
+        // use the vision-capable endpoint to produce a multimodal summary that references images.
+        if (hasImages && (includeImages || !hasContent || content.length < 800)) {
+          console.log('[summarize] Using Vision API for multimodal summarization');
+          const visionPrompt = `Create a comprehensive STUDY SUMMARY using both the text and the images. Include references to images where relevant (e.g., "see image on page X"), and produce the same structured study-friendly format as the system prompt. Respond in ${language || 'English'}.`;
+          // Premium users get longer summaries (16K tokens)
+          const visionMaxTokens = isPremium ? 16384 : 8192;
+          result = await callOpenAIVision(systemPrompt, imageUrls, `Summarize this content and images:\n\n${content}\n\nInstructions: ${visionPrompt}`, visionMaxTokens);
+        } else {
+          // Add language directive if requested
+          const langPrefix = language && language !== 'en' ? `Respond in ${language}. ` : '';
+          // Premium users get GPT-4o + longer summaries (16K tokens for comprehensive multi-page output)
+          const summaryMaxTokens = isPremium ? 16384 : 8192;
+          result = await callOpenAI(systemPrompt, `${langPrefix}Create a comprehensive, study-friendly summary of this content (${content.length} characters):\n\n${content}`, summaryMaxTokens, 0.3, isPremium);
+        }
+        
+        return new Response(JSON.stringify({ summary: result, userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      case "quiz": {
+        // VALIDATION: Check if content is sufficient
+        if (!hasContent || content.length < 100) {
+          console.warn('[quiz] Content too short:', content?.length || 0);
+          return new Response(JSON.stringify({ 
+            questions: [],
+            error: 'Unable to generate quiz: Document content is too short or empty.',
+            userId: user.id 
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        // Check if user is premium for GPT-4o model
+        const isPremiumQuiz = await isPremiumUser(user.id);
+        console.log(`[quiz] User ${user.id} premium status: ${isPremiumQuiz}`);
+        
+        // Use let for quiz-specific prompt (don't redeclare with const)
+        const quizSystemPrompt = `Create ${questionCount || 10} quiz questions based ONLY on the document content provided.
+
+CRITICAL ACCURACY RULES:
+- Questions must be answerable ONLY from information in the document
+- Correct answers must be EXACTLY as stated in the document
+- DO NOT create questions requiring external knowledge
+- Wrong options should be plausible but clearly incorrect per the document
+- Include page references for where EACH answer can be verified
+
+Return ONLY valid JSON array: [{"question":"...","options":["A","B","C","D"],"correctAnswer":0,"explanation":"The document states on page X: '...'","pageRef":X}]
+
+Create questions from different parts of the document. Every question must be verifiable from the source text.`;
+        
+        // Use GPT-4o for premium users
+        result = await callOpenAI(quizSystemPrompt, `Create quiz questions using ONLY information from this document:\n\n${content}`, 4096, 0.3, isPremiumQuiz);
+        
+        try {
+          const match = result.match(/\[[\s\S]*\]/);
+          if (match) {
+            return new Response(JSON.stringify({ questions: JSON.parse(match[0]), userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
+          }
+        } catch {}
+        
+        return new Response(JSON.stringify({ questions: [], userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      case "studyGuide": {
+        // VALIDATION: Check if content or images are available
+        if (!hasContent && !hasImages) {
+          console.warn('[studyGuide] No content or images provided');
+          return new Response(JSON.stringify({ 
+            studyGuide: null,
+            summary: 'Unable to generate study guide: No content found in the document.',
+            userId: user.id 
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        const studyGuidePrompt = `Create a comprehensive and ACCURATE study guide covering the ENTIRE document.
+
+CRITICAL ACCURACY RULES:
+- ONLY include terms, concepts, and facts that EXPLICITLY appear in the document
+- DO NOT add external information or general knowledge
+- Quote definitions exactly as they appear in the source
+- Use the same terminology as the document
+- Page refs must match where information actually appears
+
+Return ONLY valid JSON in this format:
+{
+  "title": "Study Guide: [Document Topic]",
+  "sections": [
+    {
+      "title": "Section Title (e.g., Chapter 1: Introduction)",
+      "pageRef": 1,
+      "keyPoints": [
+        {"point": "Key concept or term explained", "pageRef": 1},
+        {"point": "Another important point", "pageRef": 2}
+      ]
+    }
+  ],
+  "keyTerms": [
+    {"term": "Term Name", "definition": "Definition from document", "pageRef": 5}
+  ],
+  "reviewChecklist": [
+    {"item": "Understand concept X", "pageRef": 3},
+    {"item": "Know how to apply Y", "pageRef": 7}
+  ]
+}
+
+Create 5-10 sections covering ALL major topics with accurate page references.
+Include 10-20 key terms and 5-10 review checklist items.`;
+        
+        // If we have images but limited text, use vision API
+        if (hasImages && (!hasContent || content.length < 500)) {
+          console.log("Using Vision API for study guide with", imageUrls.length, "images");
+          
+          const visionPrompt = `Analyze these document pages and create a comprehensive study guide. Look at all the images carefully to extract the main topics, key concepts, and important information.
+
+Return ONLY valid JSON in this format:
+{
+  "title": "Study Guide: [Document Topic]",
+  "sections": [
+    {
+      "title": "Section Title",
+      "pageRef": 1,
+      "keyPoints": [
+        {"point": "Key concept explained", "pageRef": 1}
+      ]
+    }
+  ],
+  "keyTerms": [
+    {"term": "Term", "definition": "Definition", "pageRef": 1}
+  ],
+  "reviewChecklist": [
+    {"item": "Understand concept", "pageRef": 1}
+  ]
+}`;
+          
+          result = await callOpenAIVision(studyGuidePrompt, imageUrls, visionPrompt, 4096);
+        } else {
+          // Check if user is premium for GPT-4o model
+          const isPremiumStudyGuide = await isPremiumUser(user.id);
+          console.log(`[studyGuide] User ${user.id} premium status: ${isPremiumStudyGuide}`);
+          
+          // Respect language and vision options for study guides
+          if (hasImages && (!hasContent || content.length < 500)) {
+            console.log("Using Vision API for study guide with", imageUrls.length, "images");
+            const visionPrompt = `Analyze these document pages and create a comprehensive study guide. Return ONLY valid JSON in the specified study guide format. Respond in ${language || 'English'}.`;
+            result = await callOpenAIVision(studyGuidePrompt, imageUrls, visionPrompt, 4096);
+          } else {
+            // Use tuned prompt builder for studyGuide
+            const studyGuidePromptBuilt = buildSystemPrompt('studyGuide', {}, language);
+            const langPrefix = language && language !== 'en' ? `Respond in ${language}. ` : '';
+            // Use GPT-4o for premium users
+            result = await callOpenAI(studyGuidePromptBuilt, `${langPrefix}Create a structured study guide with page references using ONLY information from this document:\n\n${content}`, 4096, 0.2, isPremiumStudyGuide);
+          }
+        }
+        
+        try {
+          const match = result.match(/\{[\s\S]*\}/);
+          if (match) {
+            const studyGuide = JSON.parse(match[0]);
+            return new Response(JSON.stringify({ studyGuide, summary: result, userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
+          }
+        } catch (e) {
+          console.error("Study guide JSON parse error:", e);
+        }
+        
+        return new Response(JSON.stringify({ summary: result, userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      case "videoWithSlides": {
+        const docInfo = totalPages ? `${totalPages} page document` : (pageCount ? `${pageCount} page document` : 'document');
+        
+        // Use tuned prompt builder for video scripts
+        systemPrompt = buildSystemPrompt('videoWithSlides', {}, language, style, useAnimations);
+        // Use gpt-4o-mini for speed
+        result = await callOpenAI(systemPrompt, `Create an engaging, comprehensive video lesson covering this entire ${docInfo}. Make it professional, educational, and memorable:\n\n${content}`, 4096, 0.25, false);
+        
+        try {
+          const match = result.match(/\{[\s\S]*\}/);
+          if (match) {
+            const videoScript = JSON.parse(match[0]);
+            return new Response(JSON.stringify({ videoScript, userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
+          }
+        } catch (e) {
+          console.error("JSON parse error:", e);
+        }
+        
+        return new Response(JSON.stringify({ 
+          videoScript: { 
+            introduction: "Welcome to this lesson.", 
+            sections: [], 
+            conclusion: "Thank you for learning!" 
+          },
+          userId: user.id,
+        }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      // New: Process video chunks in parallel for large documents
+      case "videoChunk": {
+        const chunkInfo = body.chunkInfo || 'document section';
+        const animDirective = useAnimations === false ? '' : 'Include visualDirections array with animation cues.';
+        
+        const chunkPrompt = `You are creating video lesson sections. Return ONLY valid JSON array of sections for ${chunkInfo}:
+[
+  {
+    "title": "Section Title",
+    "narration": "Engaging explanation of the content...",
+    "keyPoints": ["Key point 1", "Key point 2"],
+    "visualDirections": ["Teacher: points to diagram", "Screen: shows formula"],
+    "pageRef": 1
+  }
+]
+Create 1-2 sections per page. ${animDirective} Be educational and engaging.${language !== 'en' ? ` Respond in ${language}.` : ''}`;
+        
+        result = await callOpenAI(chunkPrompt, `Create video sections for this content:\n\n${content}`, 2048, 0.25, false);
+        
+        try {
+          const match = result.match(/\[[\s\S]*\]/);
+          if (match) {
+            const sections = JSON.parse(match[0]);
+            return new Response(JSON.stringify({ sections, userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
+          }
+        } catch (e) {
+          console.error("Video chunk JSON parse error:", e);
+        }
+        
+        return new Response(JSON.stringify({ sections: [], userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      // New: Generate intro and conclusion for parallel-processed videos
+      case "videoIntroConclusion": {
+        const totalSections = body.totalSections || 1;
+        const introPrompt = `Create a video lesson introduction and conclusion. Return ONLY valid JSON:
+{
+  "introduction": "Welcome message introducing the topic (2-3 sentences, engaging)",
+  "conclusion": "Closing remarks summarizing the ${totalSections} sections covered (2-3 sentences)"
+}
+${language !== 'en' ? `Respond in ${language}.` : ''}`;
+        
+        result = await callOpenAI(introPrompt, `Based on this content preview, create intro and conclusion:\n\n${content}`, 512, 0.3, false);
+        
+        try {
+          const match = result.match(/\{[\s\S]*\}/);
+          if (match) {
+            const parsed = JSON.parse(match[0]);
+            return new Response(JSON.stringify({ 
+              introduction: parsed.introduction || "Welcome to this lesson!",
+              conclusion: parsed.conclusion || "Thank you for learning!",
+              userId: user.id 
+            }), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
+          }
+        } catch (e) {
+          console.error("Intro/conclusion JSON parse error:", e);
+        }
+        
+        return new Response(JSON.stringify({ 
+          introduction: "Welcome to this comprehensive lesson!",
+          conclusion: "Thank you for learning with me today!",
+          userId: user.id 
+        }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      case "video": {
+        // Legacy support - redirect to videoWithSlides
+        const systemPrompt = `Create a PROFESSIONAL, ENGAGING video lesson script. Return ONLY valid JSON:
+{
+  "introduction": "📚 Welcome! Today we'll master [topic]...",
+  "sections": [{"title": "📖 Topic", "narration": "Let me explain this fascinating concept... [detailed, engaging explanation]", "pageRef": 1, "keyPoints": ["🔑 point1", "💡 point2"]}],
+  "conclusion": "🎓 Great job! Let's recap: [comprehensive summary]..."
+}
+Make it engaging, educational, and memorable like a great TED talk!`;
+        
+        result = await callOpenAI(systemPrompt, `Create engaging video lesson:\n\n${content}`, 4096);
+        
+        try {
+          const match = result.match(/\{[\s\S]*\]/);
+          if (match) {
+            return new Response(JSON.stringify({ videoScript: JSON.parse(match[0]), userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
+          }
+        } catch {}
+        
+        return new Response(JSON.stringify({ 
+          videoScript: { introduction: "Welcome.", sections: [], conclusion: "Thank you!" },
+          userId: user.id,
+        }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      case "interview": {
+        // content is already the full prompt for interview questions
+        const systemPrompt = `You are an expert interview coach helping candidates prepare for job interviews. Generate interview questions based on the provided document content.`;
+        
+        const temperature = body.temperature || 0.3;
+        result = await callOpenAI(systemPrompt, content, 4096, temperature);
+        
+        return new Response(JSON.stringify({ response: result, userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      case "chat": {
+        const { message, context, history } = body;
+        
+        let systemPrompt = `You are a helpful AI study assistant. You help students understand documents and answer their questions clearly and accurately.`;
+        
+        if (context) {
+          systemPrompt += `\n\nDocument Context:\n${context.substring(0, 8000)}`;
+        }
+        
+        // Build messages array
+        const messages: { role: string; content: string }[] = [
+          { role: "system", content: systemPrompt }
+        ];
+        
+        // Add conversation history if provided
+        if (history && Array.isArray(history)) {
+          for (const msg of history.slice(-10)) {
+            messages.push({ role: msg.role, content: msg.content });
+          }
+        }
+        
+        // Add the current message
+        messages.push({ role: "user", content: message });
+        
+        // Try models with fallback
+        const chatModels = ["gpt-5-mini", "gpt-4o-mini"];
+        let chatResult = null;
+        
+        for (const model of chatModels) {
+          try {
+            console.log(`[chat] Trying model: ${model}`);
+            const response = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                model: model,
+                messages: messages,
+                max_tokens: 4096,
+                temperature: 0.7,
+              }),
+            });
+
+            const data = await response.json();
+            
+            if (data.error) {
+              console.warn(`[chat] ${model} failed:`, data.error);
+              if (data.error.code === "model_not_found" || data.error.type === "invalid_request_error") {
+                continue; // Try next model
+              }
+              throw new Error(data.error.message);
+            }
+            
+            chatResult = data.choices?.[0]?.message?.content || "I couldn't generate a response.";
+            console.log(`[chat] Success with ${model}`);
+            break;
+          } catch (e: any) {
+            console.error(`[chat] Error with ${model}:`, e.message);
+            if (model === chatModels[chatModels.length - 1]) throw e;
+          }
+        }
+        
+        return new Response(JSON.stringify({ 
+          response: chatResult || "I couldn't generate a response.",
+          userId: user.id,
+        }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      case "flashcards": {
+        const systemPrompt = `You are an expert educator. Generate flashcards from the provided content.
+Each flashcard should have:
+
+// Example format for flashcards:
+// [
+//   {"term": "Photosynthesis", "definition": "The process by which plants convert light energy into chemical energy", "difficulty": "medium"},
+//   {"term": "What is the capital of France?", "definition": "Paris", "difficulty": "easy"}
+// ]
+// Generate 10-20 high-quality flashcards covering the most important concepts.`;
+        
+        result = await callOpenAI(systemPrompt, `Create flashcards from this content:\n\n${content}`, 4096);
+        
+        try {
+          const match = result.match(/\[[\s\S]*\]/);
+          if (match) {
+            const flashcards = JSON.parse(match[0]);
+            return new Response(JSON.stringify({ flashcards, userId: user.id }), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
+          }
+        } catch {}
+        
+        return new Response(JSON.stringify({ flashcards: [], userId: user.id }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      case "ocr": {
+        // OCR for scanned PDFs using GPT-4o Vision
+        if (!imageUrls || imageUrls.length === 0) {
+          return new Response(JSON.stringify({ 
+            text: "No image provided for OCR.",
+            error: "Missing imageUrls parameter" 
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        const ocrSystemPrompt = `You are an OCR (Optical Character Recognition) assistant. Your task is to extract ALL visible text from document images with high accuracy.
+
+Instructions:
+- Read and extract every piece of text visible in the image
+- Maintain the original reading order (top to bottom, left to right)
+- Preserve the document structure (paragraphs, headings, lists, etc.)
+- For tables, format them clearly with | separators
+- If text is partially obscured or unclear, indicate with [unclear] but still attempt to read it
+- Include numbers, dates, and special characters exactly as shown
+- Do NOT summarize or paraphrase - extract the actual text verbatim
+
+Your output should be the extracted text in a readable format.`;
+
+        const ocrUserPrompt = content || `Extract ALL text from this document image. Maintain the original structure and formatting. Output only the extracted text.`;
+        
+        try {
+          result = await callOpenAIVision(ocrSystemPrompt, imageUrls, ocrUserPrompt, 4096);
+          
+          return new Response(JSON.stringify({ 
+            text: result,
+            success: true,
+            userId: user.id,
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        } catch (ocrError) {
+          console.error("OCR error:", ocrError);
+          return new Response(JSON.stringify({ 
+            text: "",
+            error: String(ocrError),
+            success: false,
+            userId: user.id,
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      case "extractPdf": {
+        // SMART PDF EXTRACTION - Multiple methods for best quality
+        // 1. pdf-parse for text-based PDFs
+        // 2. GPT-4o Vision for scanned/image PDFs
+        const { pdfBase64, imageUrls } = body;
+        
+        if (!pdfBase64 && (!imageUrls || imageUrls.length === 0)) {
+          return new Response(JSON.stringify({ 
+            error: "Missing pdfBase64 or imageUrls parameter",
+            text: "",
+            pages: [],
+            success: false,
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        let extractedText = "";
+        let extractedPages: { pageNum: number; text: string }[] = [];
+        let method = "none";
+        let numPages = 0;
+        
+        // METHOD 1: Try pdf-parse first (fast, works with text-based PDFs)
+        if (pdfBase64) {
+          try {
+            console.log("[extractPdf] Trying pdf-parse extraction...");
+            const parseResult = await extractWithPdfParse(pdfBase64);
+            
+            // Check extraction quality
+            const quality = checkTextQuality(parseResult.text);
+            console.log("[extractPdf] pdf-parse quality:", quality.quality, "score:", quality.score, "chars:", parseResult.text.length);
+            
+            if (quality.quality === 'good') {
+              extractedText = parseResult.text;
+              extractedPages = parseResult.pages;
+              numPages = parseResult.numPages;
+              method = "pdf-parse";
+              console.log("[extractPdf] pdf-parse SUCCESS:", numPages, "pages,", extractedText.length, "chars");
+            } else {
+              console.log("[extractPdf] pdf-parse quality too low, will try Vision...");
+            }
+          } catch (parseError: any) {
+            console.error("[extractPdf] pdf-parse error:", parseError.message);
+          }
+        }
+        
+        // METHOD 2: GPT-4o Vision for scanned PDFs or when pdf-parse fails
+        if (!extractedText && imageUrls && imageUrls.length > 0) {
+          try {
+            console.log("[extractPdf] Using GPT-4o Vision for", imageUrls.length, "page images...");
+            const visionResult = await extractWithGPTVision(imageUrls, 20); // Up to 20 pages
+            
+            if (visionResult.text && visionResult.text.length > 50) {
+              extractedText = visionResult.text;
+              extractedPages = visionResult.pages;
+              numPages = visionResult.pages.length;
+              method = "gpt-4o-vision";
+              console.log("[extractPdf] GPT-4o Vision SUCCESS:", numPages, "pages,", extractedText.length, "chars");
+            }
+          } catch (visionError: any) {
+            console.error("[extractPdf] GPT-4o Vision error:", visionError.message);
+          }
+        }
+        
+        // METHOD 3: If we have pdfBase64 but no images, send first page to Vision directly
+        if (!extractedText && pdfBase64 && (!imageUrls || imageUrls.length === 0)) {
+          try {
+            console.log("[extractPdf] Attempting direct PDF Vision (limited)...");
+            // Note: This is limited - GPT-4o can't directly read PDFs
+            // We need to convert to images on the client side for best results
+            const response = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${OPENAI_API_KEY}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [
+                  {
+                    role: "system",
+                    content: "The user tried to extract text from a PDF with custom fonts. Explain that they should convert the PDF to images or use Google Drive to convert it."
+                  },
+                  {
+                    role: "user",
+                    content: "PDF extraction failed due to custom font encoding."
+                  }
+                ],
+                max_tokens: 500,
+              }),
+            });
+            
+            if (response.ok) {
+              // Return helpful message
+              return new Response(JSON.stringify({ 
+                text: "",
+                pages: [],
+                pageCount: 0,
+                success: false,
+                needsImages: true,
+                method: "none",
+                message: "This PDF uses custom fonts and requires image conversion. Please upload page screenshots or use Google Drive to convert.",
+                userId: user.id,
+              }), {
+                headers: { ...cors, "Content-Type": "application/json" },
+              });
+            }
+          } catch (e) {
+            console.error("[extractPdf] Direct vision attempt failed:", e);
+          }
+        }
+        
+        // Return results
+        if (extractedText && extractedText.length > 50) {
+          return new Response(JSON.stringify({ 
+            text: extractedText,
+            pages: extractedPages,
+            pageCount: numPages,
+            success: true,
+            method: method,
+            userId: user.id,
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        // Final fallback: Return error with guidance
+        return new Response(JSON.stringify({ 
+          error: "PDF extraction failed. This PDF may have custom font encoding or be image-based.",
+          text: "",
+          pages: [],
+          pageCount: 0,
+          success: false,
+          needsImages: true,
+          suggestion: "For best results: 1) Upload page screenshots, or 2) Use Google Drive to convert the PDF to Google Docs format first.",
+          userId: user.id,
+        }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      case "callOpenAIVision": {
+        // Direct Vision API access for image OCR
+        // NOTE: Only works with images (JPEG, PNG, GIF, WEBP), NOT PDFs!
+        const { imageUrl, prompt } = body;
+        
+        if (!imageUrl) {
+          return new Response(JSON.stringify({ 
+            error: "Missing imageUrl parameter. OpenAI Vision requires an image URL (not PDF).",
+            text: "",
+            success: false,
+          }), {
+            status: 400,
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        // Validate that it's an image, not a PDF
+        const isImage = imageUrl.startsWith('data:image/') || 
+                        imageUrl.includes('.jpg') || 
+                        imageUrl.includes('.jpeg') || 
+                        imageUrl.includes('.png') || 
+                        imageUrl.includes('.gif') || 
+                        imageUrl.includes('.webp');
+        
+        if (!isImage && imageUrl.includes('application/pdf')) {
+          return new Response(JSON.stringify({ 
+            error: "OpenAI Vision does not support PDF files directly. Please convert to image first, or use cloud extraction.",
+            text: "",
+            success: false,
+          }), {
+            status: 400,
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        const visionSystemPrompt = "You are an OCR assistant. Extract ALL text from the image accurately. Preserve formatting and structure.";
+        const visionUserPrompt = prompt || "Extract all text from this image. Output only the extracted text.";
+        
+        try {
+          const visionResult = await callOpenAIVision(visionSystemPrompt, [imageUrl], visionUserPrompt, 4096);
+          
+          return new Response(JSON.stringify({ 
+            text: visionResult,
+            content: visionResult,
+            success: true,
+            userId: user.id,
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        } catch (visionError: any) {
+          console.error("[callOpenAIVision] Error:", visionError.message);
+          return new Response(JSON.stringify({ 
+            error: visionError.message || "Vision API failed",
+            text: "",
+            success: false,
+          }), {
+            status: 500,
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      case "youtube_search": {
+        // YouTube Data API v3 search for educational videos
+        const { query, language, maxResults } = body;
+        
+        if (!query) {
+          return new Response(JSON.stringify({ 
+            error: "Missing search query",
+            videos: [],
+          }), {
+            status: 400,
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        const YOUTUBE_API_KEY = Deno.env.get("YOUTUBE_API_KEY") || Deno.env.get("GOOGLE_API_KEY") || Deno.env.get("GOOGLE_CLOUD_API_KEY");
+        
+        if (!YOUTUBE_API_KEY) {
+          console.error("[youtube_search] No YouTube API key configured");
+          return new Response(JSON.stringify({ 
+            error: "YouTube search not configured",
+            videos: [],
+          }), {
+            status: 500,
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        try {
+          // Build search query - add "tutorial" or "lecture" for educational context
+          const educationalQuery = `${query} tutorial lecture educational`;
+          const relevanceLanguage = language || 'en';
+          const resultsCount = Math.min(maxResults || 10, 25);
+          
+          console.log(`[youtube_search] Searching: "${educationalQuery}" in ${relevanceLanguage}`);
+          
+          // Call YouTube Data API v3
+          const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
+          searchUrl.searchParams.set('part', 'snippet');
+          searchUrl.searchParams.set('q', educationalQuery);
+          searchUrl.searchParams.set('type', 'video');
+          searchUrl.searchParams.set('videoCaption', 'closedCaption'); // Only videos with captions
+          searchUrl.searchParams.set('relevanceLanguage', relevanceLanguage);
+          searchUrl.searchParams.set('maxResults', String(resultsCount));
+          searchUrl.searchParams.set('order', 'relevance');
+          searchUrl.searchParams.set('safeSearch', 'strict');
+          searchUrl.searchParams.set('videoEmbeddable', 'true'); // Only embeddable videos
+          searchUrl.searchParams.set('key', YOUTUBE_API_KEY);
+          
+          const searchResponse = await fetch(searchUrl.toString());
+          
+          if (!searchResponse.ok) {
+            const errorText = await searchResponse.text();
+            console.error('[youtube_search] API error:', errorText);
+            throw new Error('YouTube API request failed');
+          }
+          
+          const searchData = await searchResponse.json();
+          
+          // Map results to our format
+          const videos = (searchData.items || []).map((item: any) => ({
+            id: item.id?.videoId || '',
+            title: item.snippet?.title || 'Untitled',
+            description: (item.snippet?.description || '').substring(0, 200),
+            thumbnail: item.snippet?.thumbnails?.medium?.url || item.snippet?.thumbnails?.default?.url || '',
+            channelTitle: item.snippet?.channelTitle || 'Unknown',
+            publishedAt: item.snippet?.publishedAt || '',
+          })).filter((v: any) => v.id);
+          
+          console.log(`[youtube_search] Found ${videos.length} videos`);
+          
+          return new Response(JSON.stringify({ 
+            videos,
+            query: query,
+            userId: user.id,
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+          
+        } catch (ytError: any) {
+          console.error('[youtube_search] Error:', ytError.message);
+          return new Response(JSON.stringify({ 
+            error: ytError.message || 'YouTube search failed',
+            videos: [],
+          }), {
+            status: 500,
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      case "youtube_captions": {
+        // Get available caption tracks for a YouTube video
+        const { videoId, language } = body;
+        
+        if (!videoId) {
+          return new Response(JSON.stringify({ 
+            error: "Missing videoId",
+            available: [],
+          }), {
+            status: 400,
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        const YOUTUBE_API_KEY = Deno.env.get("YOUTUBE_API_KEY") || Deno.env.get("GOOGLE_API_KEY") || Deno.env.get("GOOGLE_CLOUD_API_KEY");
+        
+        if (!YOUTUBE_API_KEY) {
+          return new Response(JSON.stringify({ 
+            error: "YouTube API not configured",
+            available: [],
+          }), {
+            status: 500,
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+        
+        try {
+          // Get caption tracks for the video
+          const captionsUrl = new URL('https://www.googleapis.com/youtube/v3/captions');
+          captionsUrl.searchParams.set('part', 'snippet');
+          captionsUrl.searchParams.set('videoId', videoId);
+          captionsUrl.searchParams.set('key', YOUTUBE_API_KEY);
+          
+          const captionsResponse = await fetch(captionsUrl.toString());
+          
+          if (!captionsResponse.ok) {
+            console.error('[youtube_captions] API error for video:', videoId);
+            throw new Error('Could not fetch captions');
+          }
+          
+          const captionsData = await captionsResponse.json();
+          
+          // Map available caption tracks
+          const available = (captionsData.items || []).map((item: any) => ({
+            code: item.snippet?.language || 'unknown',
+            name: item.snippet?.name || item.snippet?.language || 'Unknown',
+            trackKind: item.snippet?.trackKind || 'standard',
+          }));
+          
+          console.log(`[youtube_captions] Video ${videoId} has ${available.length} caption tracks`);
+          
+          return new Response(JSON.stringify({ 
+            available,
+            videoId,
+            userId: user.id,
+          }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+          
+        } catch (captionError: any) {
+          console.error('[youtube_captions] Error:', captionError.message);
+          return new Response(JSON.stringify({ 
+            error: captionError.message || 'Could not fetch captions',
+            available: [],
+          }), {
+            status: 500,
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      default:
+        throw new Error(`Unknown action: ${action}`);
+    }
+
+  } catch (error) {
+    console.error("Error:", error);
+
+    const status = (error as any)?.status || 500;
+    const errorMessage = String(error);
+    if (errorMessage.includes('QUOTA_EXCEEDED') || errorMessage.includes('insufficient') || errorMessage.includes('billing')) {
+      return new Response(JSON.stringify({ 
+        error: "AI service temporarily unavailable. Please try again in a few minutes.",
+      }), {
+        status: 429,
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+    
+    return new Response(JSON.stringify({ 
+      error: errorMessage,
+      details: "Please try again. If the problem persists, contact support."
+    }), {
+      status,
+      headers: { ...cors, "Content-Type": "application/json" },
+    });
+  }
+});

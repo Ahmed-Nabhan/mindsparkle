@@ -296,7 +296,8 @@ export var VideoScreen: React.FC = function() {
   useEffect(function() {
     if (videoScript && videoScript.title && youtubeVideos.length === 0) {
       // Smart extract topic from document content
-      var documentContent = route.params?.content || route.params?.documentContent || '';
+      var paramsAny = route.params as any;
+      var documentContent = paramsAny?.content || paramsAny?.documentContent || '';
       var searchQuery = extractSmartSearchQuery(documentContent, videoScript.title);
       console.log('[YouTube] Smart search query:', searchQuery);
       searchYoutubeVideos(searchQuery);
@@ -820,18 +821,19 @@ export var VideoScreen: React.FC = function() {
         <TouchableOpacity 
           style={[styles.skipButton, { borderColor: selectedTeacher.color }]} 
           onPress={function() {
+            var paramsAny = route.params as any;
             // Skip generation and go directly to YouTube tab
             setIsLoading(false);
             setActiveTab('youtube');
             // Create a minimal video script so the screen doesn't error
             setVideoScript({
-              title: route.params?.documentName || 'Document',
+              title: paramsAny?.documentName || 'Document',
               introduction: '',
               conclusion: '',
               sections: []
             });
             // Trigger YouTube search with document name
-            var searchQuery = route.params?.documentName || route.params?.content?.substring(0, 100) || 'tutorial';
+            var searchQuery = paramsAny?.documentName || paramsAny?.content?.substring(0, 100) || 'tutorial';
             searchYoutubeVideos(searchQuery + ' tutorial');
           }}
         >

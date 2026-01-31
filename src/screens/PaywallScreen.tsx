@@ -9,6 +9,8 @@ import {
   Dimensions,
   Image,
   Alert,
+  Linking,
+  Platform,
 } from 'react-native';
 import { useRoute, useNavigation } from '@react-navigation/native';
 import { colors } from '../constants/colors';
@@ -22,15 +24,15 @@ type PaywallScreenProps = RootStackScreenProps<'Paywall'>;
 
 const FEATURES = [
   { icon: '📚', title: 'Unlimited Documents', free: '5 docs', pro: 'Unlimited' },
-  { icon: '🧠', title: 'Daily Quizzes', free: '3/day', pro: 'Unlimited' },
-  { icon: '📇', title: 'Flashcards', free: '20/doc', pro: 'Unlimited' },
-  { icon: '💬', title: 'AI Chat', free: '10 msgs', pro: 'Unlimited' },
-  { icon: '🎬', title: 'Video Summaries', free: '❌', pro: '✅' },
-  { icon: '🎧', title: 'Audio Summaries', free: '❌', pro: '✅' },
-  { icon: '📊', title: 'Advanced Analytics', free: '❌', pro: '✅' },
-  { icon: '☁️', title: 'Cloud Sync', free: '❌', pro: '✅' },
-  { icon: '📁', title: 'Folders', free: '❌', pro: '✅' },
-  { icon: '📤', title: 'Export to PDF', free: '❌', pro: '✅' },
+  { icon: '🧠', title: 'Daily Quizzes', free: 'Unlimited', pro: 'Unlimited' },
+  { icon: '📇', title: 'Flashcards', free: 'Unlimited', pro: 'Unlimited' },
+  { icon: '💬', title: 'AI Chat', free: '30 msgs', pro: 'Unlimited' },
+  { icon: '🎬', title: 'Video Summaries', free: '✅', pro: '✅' },
+  { icon: '🎧', title: 'Audio Summaries', free: '✅', pro: '✅' },
+  { icon: '📊', title: 'Advanced Analytics', free: '✅', pro: '✅' },
+  { icon: '☁️', title: 'Cloud Sync', free: '✅', pro: '✅' },
+  { icon: '📁', title: 'Folders', free: '✅', pro: '✅' },
+  { icon: '📤', title: 'Export to PDF', free: '✅', pro: '✅' },
 ];
 
 export const PaywallScreen: React.FC = () => {
@@ -40,13 +42,18 @@ export const PaywallScreen: React.FC = () => {
   const [selectedProduct, setSelectedProduct] = useState(PRODUCT_IDS.YEARLY);
   const [purchasing, setPurchasing] = useState(false);
 
+  const termsUrl =
+    Platform.OS === 'ios'
+      ? 'https://www.apple.com/legal/internet-services/itunes/dev/stdeula/'
+      : 'https://ahmed-nabhan.github.io/mindsparkle/terms.html';
+
   const featureRequested = route.params?.source;
 
   const handlePurchase = async () => {
     if (!purchasesAvailable) {
       Alert.alert(
         'Purchases Not Available',
-        'In-app purchases are not configured yet. The app developer needs to set up RevenueCat API keys in app.json. Please contact support.',
+        'Subscriptions are temporarily unavailable. Please try again later or restore purchases if you already subscribed.',
         [{ text: 'OK' }]
       );
       return;
@@ -68,10 +75,71 @@ export const PaywallScreen: React.FC = () => {
   const getProductDetails = (productId: string) => {
     return products.find(p => p.identifier === productId) || {
       identifier: productId,
-      priceString: productId === PRODUCT_IDS.MONTHLY ? '$4.99/mo' : '$29.99/yr',
+      priceString: '—',
       title: productId === PRODUCT_IDS.MONTHLY ? 'Monthly' : 'Yearly',
     };
   };
+
+  const selectedProductDetails = getProductDetails(selectedProduct);
+
+  const getBillingPeriodLabel = (productId: string): 'month' | 'year' => {
+    return productId === PRODUCT_IDS.MONTHLY ? 'month' : 'year';
+  };
+
+  const formatPriceWithPeriod = (priceString: string, period: 'month' | 'year') => {
+    const normalized = String(priceString || '').toLowerCase();
+    if (normalized.includes('per month') || normalized.includes('/month') || normalized.includes('monthly')) return priceString;
+    if (normalized.includes('per year') || normalized.includes('/year') || normalized.includes('yearly')) return priceString;
+    return `${priceString}/${period}`;
+  };
+
+  const formatDurationParts = (parts: Array<{ value: number; unit: 'year' | 'month' | 'week' | 'day' }>) => {
+    const nonZero = parts.filter(p => Number.isFinite(p.value) && p.value > 0);
+    if (nonZero.length === 0) return null;
+    const toWord = (value: number, unit: string) => `${value} ${unit}${value === 1 ? '' : 's'}`;
+    // Keep this short and reviewer-friendly (avoid long multi-unit strings).
+    const first = nonZero[0];
+    const second = nonZero[1];
+    if (!first) return null;
+    if (!second) return toWord(first.value, first.unit);
+    return `${toWord(first.value, first.unit)} ${toWord(second.value, second.unit)}`;
+  };
+
+  // NOTE: App Store Guideline 3.1.2 compliance hardening:
+  // Do not show any UI or copy referencing free trials or introductory offers.
+  const billingPeriod = getBillingPeriodLabel(selectedProduct);
+  const priceWithPeriod = formatPriceWithPeriod(selectedProductDetails.priceString, billingPeriod);
+
+  const getPriceWithPeriodForProduct = (productId: string) => {
+    const details = getProductDetails(productId);
+    const period = getBillingPeriodLabel(productId);
+    return formatPriceWithPeriod(details.priceString, period);
+  };
+
+  const billingDisclosure = `This is an auto-renewable subscription. Payment will be charged to your Apple ID account at confirmation of purchase. You will be charged ${priceWithPeriod} and the subscription automatically renews unless cancelled at least 24 hours before the end of the current period. Your account will be charged for renewal within 24 hours prior to the end of the current period. You can manage or cancel your subscription in Apple ID Account Settings at any time.`;
+
+  const getSavingsLabel = () => {
+    const monthly = getProductDetails(PRODUCT_IDS.MONTHLY) as any;
+    const yearly = getProductDetails(PRODUCT_IDS.YEARLY) as any;
+
+    const monthlyPrice = Number.parseFloat(monthly?.price);
+    const yearlyPrice = Number.parseFloat(yearly?.price);
+    const monthlyCurrency = monthly?.currencyCode;
+    const yearlyCurrency = yearly?.currencyCode;
+
+    if (!Number.isFinite(monthlyPrice) || !Number.isFinite(yearlyPrice)) return null;
+    if (!monthlyCurrency || !yearlyCurrency || monthlyCurrency !== yearlyCurrency) return null;
+    if (monthlyPrice <= 0 || yearlyPrice <= 0) return null;
+
+    const savings = 1 - yearlyPrice / (monthlyPrice * 12);
+    if (!Number.isFinite(savings)) return null;
+
+    const pct = Math.round(savings * 100);
+    if (pct <= 0 || pct >= 95) return null;
+    return `Save ${pct}%`;
+  };
+
+  const savingsLabel = getSavingsLabel();
 
   if (isPremium) {
     return (
@@ -154,7 +222,8 @@ export const PaywallScreen: React.FC = () => {
             <Text style={styles.planPrice}>
               {getProductDetails(PRODUCT_IDS.YEARLY).priceString}
             </Text>
-            <Text style={styles.planSaving}>Save 50%</Text>
+            <Text style={styles.planBilling}>{getPriceWithPeriodForProduct(PRODUCT_IDS.YEARLY)}</Text>
+            {!!savingsLabel && <Text style={styles.planSaving}>{savingsLabel}</Text>}
           </View>
           <View style={styles.radioOuter}>
             {selectedProduct === PRODUCT_IDS.YEARLY && (
@@ -176,7 +245,8 @@ export const PaywallScreen: React.FC = () => {
             <Text style={styles.planPrice}>
               {getProductDetails(PRODUCT_IDS.MONTHLY).priceString}
             </Text>
-            <Text style={styles.planDesc}>Cancel anytime</Text>
+            <Text style={styles.planBilling}>{getPriceWithPeriodForProduct(PRODUCT_IDS.MONTHLY)}</Text>
+            <Text style={styles.planDesc}>Cancel anytime in Apple ID settings</Text>
           </View>
           <View style={styles.radioOuter}>
             {selectedProduct === PRODUCT_IDS.MONTHLY && (
@@ -187,21 +257,23 @@ export const PaywallScreen: React.FC = () => {
 
       </View>
 
-      {/* Free Trial Badge */}
-      <View style={styles.trialBadge}>
-        <Text style={styles.trialText}>🎁 7-day free trial included</Text>
-      </View>
+      {/* Billing Disclosure (App Review Guideline 3.1.2) */}
+      <Text style={styles.billingDisclosure}>
+        {billingDisclosure}
+      </Text>
 
       {/* Purchase Button */}
       <TouchableOpacity
         style={[styles.purchaseButton, purchasing && styles.purchaseButtonDisabled]}
         onPress={handlePurchase}
-        disabled={purchasing}
+        disabled={purchasing || isLoading || !purchasesAvailable}
       >
         {purchasing ? (
           <ActivityIndicator color="#fff" />
         ) : (
-          <Text style={styles.purchaseButtonText}>Start Free Trial</Text>
+          <Text style={styles.purchaseButtonText}>
+            {`Subscribe • ${priceWithPeriod}`}
+          </Text>
         )}
       </TouchableOpacity>
 
@@ -216,15 +288,15 @@ export const PaywallScreen: React.FC = () => {
 
       {/* Terms */}
       <Text style={styles.terms}>
-        After the free trial, subscription will automatically renew. Cancel anytime in Settings.
+        {`Payment will be charged to your Apple ID account at confirmation of purchase. You will be charged ${priceWithPeriod} and the subscription automatically renews unless cancelled at least 24 hours before the end of the current period.`}
       </Text>
       
       <View style={styles.legalLinks}>
-        <TouchableOpacity>
-          <Text style={styles.legalLink}>Terms of Use</Text>
+        <TouchableOpacity onPress={() => Linking.openURL(termsUrl)}>
+          <Text style={styles.legalLink}>Terms of Use (EULA)</Text>
         </TouchableOpacity>
         <Text style={styles.legalDivider}>•</Text>
-        <TouchableOpacity>
+        <TouchableOpacity onPress={() => Linking.openURL('https://ahmed-nabhan.github.io/mindsparkle/privacy.html')}>
           <Text style={styles.legalLink}>Privacy Policy</Text>
         </TouchableOpacity>
       </View>
@@ -406,6 +478,11 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginTop: 2,
   },
+  planBilling: {
+    fontSize: 13,
+    color: colors.textLight,
+    marginTop: 2,
+  },
   planSaving: {
     fontSize: 13,
     color: colors.success,
@@ -431,16 +508,6 @@ const styles = StyleSheet.create({
     borderRadius: 7,
     backgroundColor: colors.primary,
   },
-  trialBadge: {
-    alignItems: 'center',
-    marginTop: 10,
-    marginBottom: 20,
-  },
-  trialText: {
-    fontSize: 14,
-    color: colors.accent,
-    fontWeight: '600',
-  },
   purchaseButton: {
     backgroundColor: colors.primary,
     marginHorizontal: 20,
@@ -455,6 +522,14 @@ const styles = StyleSheet.create({
   },
   purchaseButtonDisabled: {
     opacity: 0.7,
+  },
+  billingDisclosure: {
+    fontSize: 12,
+    color: colors.textLight,
+    textAlign: 'center',
+    paddingHorizontal: 28,
+    marginTop: 12,
+    lineHeight: 18,
   },
   purchaseButtonText: {
     color: '#fff',

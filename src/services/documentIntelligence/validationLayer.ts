@@ -290,7 +290,7 @@ export class ValidationLayer {
     }
 
     // Check for competitor terminology (potential confusion)
-    const competitors: Record<VendorId, string[]> = {
+    const competitors: Partial<Record<VendorId, string[]>> = {
       cisco: ['juniper', 'arista', 'huawei'],
       aws: ['azure', 'google cloud', 'gcp'],
       microsoft: ['aws', 'google cloud', 'gcp'],

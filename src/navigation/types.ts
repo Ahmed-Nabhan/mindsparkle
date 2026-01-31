@@ -7,6 +7,7 @@ import type { Flashcard } from '../services/flashcardService';
 export type RootStackParamList = {
   Welcome: undefined;
   Auth: { mode?: 'signin' | 'signup' };
+  ResetPassword: undefined;
   Main: undefined;
   Paywall: { source?: string };
 };
@@ -14,9 +15,18 @@ export type RootStackParamList = {
 export type MainDrawerParamList = {
   Home: undefined;
   Upload: undefined;
+  Agents: undefined;
   DocumentActions: { documentId: string };
   Summary: { documentId: string };
-  Study: { documentId: string };
+  DeepExplain: { documentId: string; initialPageIndex?: number };
+  AudioPlayer: {
+    content: string;
+    title?: string;
+    documentId?: string;
+  };
+  Guide: { documentId: string };
+  Whiteboard: { documentId: string };
+  Plan: { documentId: string };
   Video: { 
     documentId: string;
     content?: string;
@@ -24,7 +34,7 @@ export type MainDrawerParamList = {
     pdfCloudUrl?: string;
     extractedData?: any;
   };
-  Test: { documentId: string };
+  Test: { documentId?: string; focusTopics?: string[] } | undefined;
   Labs: { documentId: string };
   Performance: undefined;
   Exams: undefined;
@@ -35,17 +45,15 @@ export type MainDrawerParamList = {
     flashcards?: Flashcard[];
     documentTitle?: string;
   };
-  Chat: { 
+  ChatMind: undefined;
+  DocChat: {
     documentId: string;
     documentContent?: string;
     documentTitle?: string;
+    agentId?: string;
+    agentName?: string;
   };
   Achievements: undefined;
-  AudioPlayer: {
-    documentId: string;
-    content: string;
-    title: string;
-  };
   Folders: {
     selectMode?: boolean;
     documentId?: string;
@@ -55,6 +63,7 @@ export type MainDrawerParamList = {
     folderId: string;
   };
   Settings: undefined;
+  Presentation: { documentId?: string } | undefined;
 };
 
 export type RootStackScreenProps<T extends keyof RootStackParamList> = 

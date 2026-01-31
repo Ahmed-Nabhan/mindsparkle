@@ -10,6 +10,8 @@ import {
   ActivityIndicator,
   AppState,
   AppStateStatus,
+  Modal,
+  Dimensions,
 } from 'react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
@@ -76,7 +78,7 @@ interface UploadStats {
 export const UploadScreen: React.FC = () => {
   const navigation = useNavigation<UploadScreenProps['navigation']>();
   const { documents, uploadDocument, isLoading, uploadProgress, uploadMessage, refreshDocuments, removeDocument, removeAllDocuments } = useDocument();
-  const { isPremium, features } = usePremiumContext();
+  const { isPremium, features, dailyDocumentCount, incrementDocumentCount } = usePremiumContext();
   const { isAuthenticated, user } = useAuth();
   const { isRealtimeConnected } = useDocumentContext();
   
@@ -87,6 +89,7 @@ export const UploadScreen: React.FC = () => {
   const [uploadCancelled, setUploadCancelled] = useState(false);
   const [uploadStats, setUploadStats] = useState<UploadStats | null>(null);
   const [isBackgroundUpload, setIsBackgroundUpload] = useState(false);
+  const [isMinimized, setIsMinimized] = useState(false);
   
   // File preview state
   const [previewFile, setPreviewFile] = useState<{
@@ -100,7 +103,8 @@ export const UploadScreen: React.FC = () => {
   const progressAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const uploadAbortRef = useRef<AbortController | null>(null);
-  const statsIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const uploadCancelledRef = useRef(false);
+  const statsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastProgressRef = useRef({ progress: 0, time: Date.now() });
   
   // Real-time subscription ref - stored for cleanup
@@ -110,7 +114,7 @@ export const UploadScreen: React.FC = () => {
   const appState = useRef(AppState.currentState);
 
   // Check if user can upload more documents
-  const canUploadMore = isPremium || features.maxDocuments === -1 || documents.length < features.maxDocuments;
+  const canUploadMore = isPremium || features.maxDocuments === -1 || dailyDocumentCount < features.maxDocuments;
 
   // Refresh documents when screen is focused (only if authenticated)
   useFocusEffect(
@@ -325,6 +329,7 @@ export const UploadScreen: React.FC = () => {
           text: 'Cancel Upload', 
           style: 'destructive',
           onPress: () => {
+            uploadCancelledRef.current = true;
             setUploadCancelled(true);
             uploadAbortRef.current?.abort();
             resetUploadState();
@@ -341,7 +346,7 @@ export const UploadScreen: React.FC = () => {
     setCurrentMessage('');
     setUploadStats(null);
     setPreviewFile(null);
-    setUploadCancelled(false);
+    // Do not force-clear cancel flag here; the caller (new upload) will reset it.
     setIsBackgroundUpload(false);
     progressAnim.setValue(0);
     lastProgressRef.current = { progress: 0, time: Date.now() };
@@ -359,7 +364,7 @@ export const UploadScreen: React.FC = () => {
       console.log('[UploadScreen] Document limit reached');
       Alert.alert(
         '📚 Document Limit Reached',
-        `Free users can upload up to ${features.maxDocuments} documents. Upgrade to Pro for unlimited documents!`,
+        `Free users can upload up to ${features.maxDocuments} documents per day. Upgrade to Pro for unlimited documents!`,
         [
           { text: 'Maybe Later', style: 'cancel' },
           { text: 'Upgrade to Pro', onPress: () => navigation.navigate('Paywall', { source: 'documents' }) },
@@ -391,28 +396,31 @@ export const UploadScreen: React.FC = () => {
     
     lastProgressRef.current = { progress: 0, time: Date.now() };
     uploadAbortRef.current = new AbortController();
+    uploadCancelledRef.current = false;
     
     setIsUploading(true);
     setUploadCancelled(false);
     setCurrentProgress(0);
     setCurrentMessage('Starting upload...');
     
-    console.log('[UploadScreen] Calling uploadDocument...');
+    console.log(`[UploadScreen] Calling uploadDocument... (isPremium: ${isPremium})`);
     const uploadResult = await uploadDocument(
       file.name,
       file.uri,
       file.mimeType || 'application/octet-stream',
       fileSize,
       (progress, message) => {
-        if (!uploadCancelled) {
+        if (!uploadCancelledRef.current) {
           setCurrentProgress(progress);
           setCurrentMessage(message);
         }
-      }
+      },
+      isPremium, // Pass Pro status for premium Adobe OCR
+      uploadAbortRef.current?.signal
     );
     console.log('[UploadScreen] uploadDocument returned:', uploadResult.success ? 'success' : 'failed');
 
-    if (uploadCancelled) {
+    if (uploadCancelledRef.current) {
       console.log('[UploadScreen] Upload was cancelled');
       return;
     }
@@ -420,11 +428,36 @@ export const UploadScreen: React.FC = () => {
     resetUploadState();
 
     if (uploadResult.success) {
-      Alert.alert(
-        '✅ Upload Complete!', 
-        'Document uploaded and processed successfully. All features are now ready.',
-        [{ text: 'OK' }]
-      );
+      incrementDocumentCount();
+      const uploadedId = uploadResult.document?.id;
+      const uploadedTitle = uploadResult.document?.title;
+
+      // If folders are available, offer to save this document into a folder.
+      if (features.canCreateFolders && uploadedId && uploadedTitle) {
+        Alert.alert(
+          '✅ Upload Complete!',
+          'Save this document to a folder?',
+          [
+            { text: 'Not now', style: 'cancel' },
+            {
+              text: 'Choose Folder',
+              onPress: () => {
+                navigation.navigate('Folders', {
+                  selectMode: true,
+                  documentId: uploadedId,
+                  documentTitle: uploadedTitle,
+                });
+              },
+            },
+          ]
+        );
+      } else {
+        Alert.alert(
+          '✅ Upload Complete!',
+          'Document uploaded and processed successfully. All features are now ready.',
+          [{ text: 'OK' }]
+        );
+      }
     } else {
       Alert.alert('Upload Failed', uploadResult.error || 'Failed to upload document');
     }
@@ -504,6 +537,12 @@ export const UploadScreen: React.FC = () => {
               <>
                 <Text style={styles.metaDot}>•</Text>
                 <Text style={styles.processedBadge}>✓ Ready</Text>
+                {typeof item.extractedData.totalPages === 'number' && item.extractedData.totalPages > 1 && (
+                  <>
+                    <Text style={styles.metaDot}>•</Text>
+                    <Text style={styles.metaText}>{item.extractedData.totalPages} pages</Text>
+                  </>
+                )}
               </>
             )}
           </View>
@@ -520,108 +559,11 @@ export const UploadScreen: React.FC = () => {
     </Card>
   );
 
-  // Upload progress screen with enhanced UI
-  if (isUploading) {
-    const progressWidth = progressAnim.interpolate({
-      inputRange: [0, 100],
-      outputRange: ['0%', '100%'],
-    });
-
-    return (
-      <View style={styles.container}>
-        <Header title="Uploading Document" />
-        <View style={styles.uploadingContainer}>
-          {/* File Preview Card */}
-          {previewFile && (
-            <View style={styles.previewCard}>
-              <View style={[styles.previewIcon, { backgroundColor: getFileTypeColor(previewFile.type) + '20' }]}>
-                <Ionicons 
-                  name={getFileTypeIcon(previewFile.type) as any} 
-                  size={40} 
-                  color={getFileTypeColor(previewFile.type)} 
-                />
-              </View>
-              <View style={styles.previewInfo}>
-                <Text style={styles.previewName} numberOfLines={2}>{previewFile.name}</Text>
-                <Text style={styles.previewSize}>{formatFileSize(previewFile.size)}</Text>
-              </View>
-            </View>
-          )}
-
-          {/* Progress Card */}
-          <View style={styles.progressCard}>
-            <Animated.View style={[styles.uploadIconContainer, { transform: [{ scale: pulseAnim }] }]}>
-              <Ionicons 
-                name={isBackgroundUpload ? 'cloud-upload' : 'cloud-upload-outline'} 
-                size={48} 
-                color={colors.primary} 
-              />
-            </Animated.View>
-            
-            <Text style={styles.uploadingTitle}>
-              {isBackgroundUpload ? '☁️ Uploading in Background' : '📤 Uploading Document'}
-            </Text>
-            
-            {/* Status Message */}
-            <View style={styles.statusContainer}>
-              <ActivityIndicator size="small" color={colors.primary} style={styles.statusSpinner} />
-              <Text style={styles.uploadingMessage}>{currentMessage}</Text>
-            </View>
-            
-            {/* Progress Bar */}
-            <View style={styles.progressBarContainer}>
-              <Animated.View style={[styles.progressBar, { width: progressWidth }]} />
-            </View>
-            
-            {/* Progress Percentage */}
-            <Text style={styles.progressText}>{Math.round(currentProgress)}%</Text>
-            
-            {/* Upload Stats */}
-            {uploadStats && uploadStats.speed > 0 && (
-              <View style={styles.statsContainer}>
-                <View style={styles.statItem}>
-                  <Ionicons name="speedometer-outline" size={16} color={colors.textSecondary} />
-                  <Text style={styles.statText}>{formatSpeed(uploadStats.speed)}</Text>
-                </View>
-                {uploadStats.remainingTime > 0 && uploadStats.remainingTime < 86400 && (
-                  <View style={styles.statItem}>
-                    <Ionicons name="time-outline" size={16} color={colors.textSecondary} />
-                    <Text style={styles.statText}>{formatTimeRemaining(uploadStats.remainingTime)}</Text>
-                  </View>
-                )}
-                <View style={styles.statItem}>
-                  <Ionicons name="cloud-outline" size={16} color={colors.textSecondary} />
-                  <Text style={styles.statText}>
-                    {formatFileSize(uploadStats.bytesUploaded)} / {formatFileSize(uploadStats.totalBytes)}
-                  </Text>
-                </View>
-              </View>
-            )}
-            
-            {/* Background Upload Note */}
-            {isBackgroundUpload && (
-              <View style={styles.backgroundNote}>
-                <Ionicons name="information-circle-outline" size={16} color={colors.secondary} />
-                <Text style={styles.backgroundNoteText}>
-                  Upload continues in background. You can use other apps.
-                </Text>
-              </View>
-            )}
-
-            {/* Cancel Button */}
-            <TouchableOpacity style={styles.cancelButton} onPress={handleCancelUpload}>
-              <Ionicons name="close-circle-outline" size={20} color={colors.error} />
-              <Text style={styles.cancelButtonText}>Cancel Upload</Text>
-            </TouchableOpacity>
-          </View>
-          
-          <Text style={styles.uploadingNote}>
-            ✨ This one-time processing enables instant access to all features!
-          </Text>
-        </View>
-      </View>
-    );
-  }
+  // Calculate progress width for modal
+  const progressWidth = progressAnim.interpolate({
+    inputRange: [0, 100],
+    outputRange: ['0%', '100%'],
+  });
 
   // Don't show loading spinner - let users see the upload interface immediately
   // Documents will load in the background
@@ -643,7 +585,7 @@ export const UploadScreen: React.FC = () => {
           <View style={styles.limitBanner}>
             <Ionicons name="document-text-outline" size={16} color={colors.secondary} />
             <Text style={styles.limitText}>
-              {documents.length}/{features.maxDocuments} documents used
+              {dailyDocumentCount}/{features.maxDocuments} uploads today
               {!canUploadMore && ' • Upgrade for unlimited'}
             </Text>
           </View>
@@ -653,13 +595,17 @@ export const UploadScreen: React.FC = () => {
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionTitle}>My Documents</Text>
             <View style={styles.headerRight}>
-              <Text style={styles.documentCount}>{documents.length} files</Text>
               {documents.length > 0 && (
-                <TouchableOpacity onPress={handleDeleteAllDocuments} style={styles.deleteAllButton}>
-                  <Ionicons name="trash-outline" size={16} color="#E53935" />
+                <TouchableOpacity
+                  onPress={handleDeleteAllDocuments}
+                  style={styles.deleteAllButton}
+                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                >
+                  <Ionicons name="trash-outline" size={14} color="#E53935" />
                   <Text style={styles.deleteAllText}>Delete All</Text>
                 </TouchableOpacity>
               )}
+              <Text style={styles.documentCount}>{documents.length} files</Text>
             </View>
           </View>
           
@@ -964,5 +910,144 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     fontWeight: '500',
     marginLeft: 8,
+  },
+  // Modal styles for upload progress box
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  modalContent: {
+    backgroundColor: colors.surface,
+    borderRadius: 20,
+    padding: 24,
+    width: '100%',
+    maxWidth: 340,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  modalCloseButton: {
+    position: 'absolute',
+    top: 12,
+    right: 12,
+    padding: 4,
+    zIndex: 1,
+  },
+  modalPreview: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.background,
+    borderRadius: 12,
+    padding: 12,
+    width: '100%',
+    marginBottom: 16,
+  },
+  modalPreviewIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalPreviewInfo: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  modalPreviewName: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.text,
+  },
+  modalPreviewSize: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    marginTop: 2,
+  },
+  modalUploadIcon: {
+    marginBottom: 12,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: colors.text,
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  modalStatusContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 16,
+    paddingHorizontal: 8,
+  },
+  modalStatusText: {
+    fontSize: 13,
+    color: colors.textSecondary,
+    marginLeft: 10,
+    flex: 1,
+    textAlign: 'center',
+  },
+  modalProgressBarContainer: {
+    width: '100%',
+    height: 8,
+    backgroundColor: colors.border,
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  modalProgressBar: {
+    height: '100%',
+    backgroundColor: colors.primary,
+    borderRadius: 4,
+  },
+  modalProgressText: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: colors.primary,
+    marginTop: 12,
+  },
+  modalStatsContainer: {
+    marginTop: 12,
+    alignItems: 'center',
+  },
+  modalStatText: {
+    fontSize: 11,
+    color: colors.textSecondary,
+    textAlign: 'center',
+  },
+  modalCancelButton: {
+    marginTop: 20,
+    paddingVertical: 10,
+    paddingHorizontal: 24,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.error,
+  },
+  modalCancelText: {
+    fontSize: 14,
+    color: colors.error,
+    fontWeight: '500',
+  },
+  modalMinimizeButton: {
+    position: 'absolute',
+    right: 48,
+    top: 12,
+    zIndex: 20,
+  },
+  minimizedChip: {
+    backgroundColor: colors.cardBackground,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    alignSelf: 'center',
+    marginVertical: 8,
+  },
+  minimizedText: {
+    color: colors.text,
+    fontWeight: '600',
   },
 });

@@ -1,17 +1,21 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, Modal, TouchableOpacity, SafeAreaView, Image } from 'react-native';
 import { useRoute, useNavigation } from '@react-navigation/native';
+import { WebView } from 'react-native-webview';
 import { colors } from '../constants/colors';
 import { strings } from '../constants/strings';
 import { Header } from '../components/Header';
 import { Button } from '../components/Button';
-import { Card } from '../components/Card';
 import { LoadingSpinner } from '../components/LoadingSpinner';
+import ApiService from '../services/apiService';
 import { useDocument } from '../hooks/useDocument';
 import { useDocumentContext } from '../context/DocumentContext';
 import { usePremiumContext } from '../context/PremiumContext';
+import { VENDOR_CONFIGS, vendorDetector } from '../services/documentIntelligence/vendorDetector';
 import type { MainDrawerScreenProps } from '../navigation/types';
 import type { Document } from '../types/document';
+import { supabase } from '../services/supabase';
+import { buildVendorDisplay } from '../utils/qualityControls';
 
 /**
  * DocumentActionsScreen - Shows available actions for a document
@@ -30,7 +34,7 @@ export const DocumentActionsScreen:  React.FC = () => {
   const route = useRoute<DocumentActionsScreenProps['route']>();
   const navigation = useNavigation<DocumentActionsScreenProps['navigation']>();
   const { getDocument } = useDocument();
-  const { isPremium, features, canAccessFeature } = usePremiumContext();
+  const { isPremium } = usePremiumContext();
   
   // Get real-time context values
   const { 
@@ -45,6 +49,16 @@ export const DocumentActionsScreen:  React.FC = () => {
   
   const [document, setDocument] = useState<Document | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [showYoutube, setShowYoutube] = useState(false);
+  const [youtubeUrl, setYoutubeUrl] = useState('');
+  const [youtubeQueries, setYoutubeQueries] = useState<string[]>([]);
+  const [selectedYoutubeQueryIndex, setSelectedYoutubeQueryIndex] = useState(0);
+  const [vendorCandidates, setVendorCandidates] = useState<Array<{ name: string; confidence?: number }>>([]);
+  const [fallbackVendor, setFallbackVendor] = useState<{
+    vendorId?: string;
+    vendorName?: string;
+    vendorConfidence?: number;
+  } | null>(null);
 
   /**
    * Load document and subscribe to real-time updates on mount
@@ -55,51 +69,212 @@ export const DocumentActionsScreen:  React.FC = () => {
    */
   useEffect(() => {
     const documentId = route.params.documentId;
-    
-    // Load initial document data
-    loadDocument();
-    
+    let cancelled = false;
+
+    // Reset local state immediately so we never show the previous document while loading.
+    setIsLoading(true);
+    setDocument(null);
+    setVendorCandidates([]);
+    setFallbackVendor(null);
+
+    // Close any document-scoped modals when switching docs.
+    setShowYoutube(false);
+    setYoutubeUrl('');
+    setYoutubeQueries([]);
+    setSelectedYoutubeQueryIndex(0);
+
     // Subscribe to real-time updates for this document
-    // This creates a Supabase Realtime channel for document_analysis, ai_summaries, etc.
     subscribeToDocument(documentId);
-    
-    // Also load any existing AI data from Supabase
+    // Load any existing AI data from Supabase
     loadStoredAIData(documentId);
-    
-    // Cleanup: Unsubscribe when leaving this screen
-    // CRITICAL: Prevents memory leaks from orphaned WebSocket connections
+
+    // Load document content from local storage
+    (async () => {
+      const doc = await getDocument(documentId);
+      if (cancelled) return;
+      setDocument(doc);
+      setIsLoading(false);
+    })();
+
+    // Load document_insights vendor candidates (optional)
+    ;(async () => {
+      try {
+        const { data } = await supabase
+          .from('document_insights')
+          .select('vendor_candidates')
+          .eq('document_id', documentId)
+          .single();
+
+        if (cancelled) return;
+        const raw = (data as any)?.vendor_candidates;
+        const list = Array.isArray(raw) ? raw : [];
+        const cleaned = list
+          .map((v: any) => ({
+            name: String(v?.name || '').trim(),
+            confidence: typeof v?.confidence === 'number' ? v.confidence : undefined,
+          }))
+          .filter((v: any) => v.name.length > 0)
+          .slice(0, 3);
+        setVendorCandidates(cleaned);
+      } catch {
+        // ignore
+      }
+    })();
+
+    // Cleanup: runs on unmount AND when documentId changes.
     return () => {
+      cancelled = true;
       console.log('[DocumentActionsScreen] Cleaning up - unsubscribing from document');
       unsubscribeFromDocument();
     };
-  }, [route.params.documentId]);
+  }, [route.params.documentId, getDocument, loadStoredAIData, subscribeToDocument, unsubscribeFromDocument]);
 
-  const loadDocument = async () => {
-    const doc = await getDocument(route.params.documentId);
-    setDocument(doc);
-    setIsLoading(false);
-  };
+  // Fallback vendor detection for local/offline documents.
+  // Priority order:
+  // 1) Supabase document_analysis (documentAnalysis)
+  // 2) Supabase document_insights.vendor_candidates (vendorCandidates)
+  // 3) On-device heuristic vendor detector (vendorDetector)
+  useEffect(() => {
+    if (!document) return;
+
+    if (documentAnalysis?.vendorName) {
+      setFallbackVendor(null);
+      return;
+    }
+
+    if (vendorCandidates.length > 0) {
+      const top = vendorCandidates[0];
+      setFallbackVendor({
+        vendorName: top.name,
+        vendorConfidence: typeof top.confidence === 'number' ? top.confidence : undefined,
+      });
+      return;
+    }
+
+    const rawText = (document.content || document.extractedData?.text || '').trim();
+    if (!rawText) {
+      setFallbackVendor(null);
+      return;
+    }
+
+    const sample = rawText.slice(0, 20000);
+    const detected = vendorDetector.detect(sample, document.fileName || document.title);
+    if (detected.detected && detected.vendorId !== 'generic') {
+      setFallbackVendor({
+        vendorId: detected.vendorId,
+        vendorName: detected.vendorName,
+        vendorConfidence: detected.confidence,
+      });
+    } else {
+      setFallbackVendor(null);
+    }
+  }, [document, documentAnalysis?.vendorName, vendorCandidates]);
 
   const handleSummarize = () => {
     if (!document) return;
     navigation.navigate('Summary', { documentId: document.id });
   };
 
-  const handleStudy = () => {
+  const handleDeepExplain = () => {
     if (!document) return;
-    navigation.navigate('Study', { documentId: document.id });
+    navigation.navigate('DeepExplain', { documentId: document.id });
   };
 
-  const handleGenerateVideo = () => {
+  const handlePlan = () => {
     if (!document) return;
-    // Video generation is FREE for everyone!
-    navigation.navigate('Video', { 
-      documentId: document.id,
-      content: document.content || '',
-      fileUri: document.fileUri || '',
-      pdfCloudUrl: document.pdfCloudUrl,
-      extractedData: document.extractedData,
-    });
+    navigation.navigate('Plan', { documentId: document.id });
+  };
+
+  const handleGuide = () => {
+    if (!document) return;
+    navigation.navigate('Guide', { documentId: document.id });
+  };
+
+  const handleWhiteboard = () => {
+    if (!document) return;
+    navigation.navigate('Whiteboard', { documentId: document.id });
+  };
+
+  const handleWatchVideos = async () => {
+    if (!document) return;
+
+    // 1) Build a fallback query
+    const baseTitle = (document.title || '').trim();
+    const vendorHint = (documentAnalysis?.vendorName || '').trim();
+    const baseQuery = `${baseTitle || 'education'} ${vendorHint ? vendorHint + ' ' : ''}tutorial`;
+
+    // Open immediately (don't block UI on AI)
+    const arabicQuery = `شرح ${baseTitle || vendorHint || 'مادة تعليمية'}${vendorHint ? ' ' + vendorHint : ''}`.trim();
+    const initialQueries = [baseQuery, arabicQuery].filter(Boolean);
+    setYoutubeQueries(initialQueries);
+    setSelectedYoutubeQueryIndex(0);
+    setYoutubeUrl(`https://www.youtube.com/results?search_query=${encodeURIComponent(baseQuery)}`);
+    setShowYoutube(true);
+
+    // 2) Ask AI for a few YouTube search queries in multiple languages
+    // Keep it simple: return 3 short search queries, one per line.
+    // Non-blocking: if AI fails or returns junk (greetings), we keep the fallback queries.
+    let queries: string[] = initialQueries;
+    try {
+      const prompt = `You are helping a student find YouTube videos related to a document.
+
+Document title: "${baseTitle || 'Untitled'}"
+Detected topic/vendor: "${vendorHint || 'Unknown'}"
+
+Return 3 YouTube search queries (ONE per line):
+- Query 1: English
+- Query 2: Arabic
+- Query 3: Same language as the title if possible, otherwise English
+
+Rules:
+- No numbering, no quotes, no extra text.
+- Keep each query under 80 characters.`;
+
+      const aiText = await ApiService.chat(prompt);
+      const lines = String(aiText)
+        .split(/\r?\n/)
+        .map(l => l.trim())
+        .filter(l => l.length > 0);
+
+      // Heuristic validation: keep only query-like lines; drop generic assistant greetings.
+      const titleTokens = baseTitle
+        .toLowerCase()
+        .split(/[^a-z0-9\u0600-\u06FF]+/i)
+        .filter(Boolean)
+        .slice(0, 12);
+      const vendorTokens = vendorHint
+        .toLowerCase()
+        .split(/[^a-z0-9\u0600-\u06FF]+/i)
+        .filter(Boolean)
+        .slice(0, 6);
+      const stopPhrases = ['how can i assist', 'assist you', 'hello', 'hi,', 'hi ', 'مرحبا', 'كيف', 'ساعد'];
+
+      const looksValid = (q: string) => {
+        const s = q.toLowerCase();
+        if (stopPhrases.some(p => s.includes(p))) return false;
+        if (s.length < 6) return false;
+        // Prefer queries that overlap the title/vendor tokens
+        const hasOverlap = [...titleTokens, ...vendorTokens].some(t => t && s.includes(t));
+        return hasOverlap || (!!vendorHint && s.includes(vendorHint.toLowerCase())) || (!!baseTitle && s.includes(baseTitle.toLowerCase().slice(0, 10)));
+      };
+
+      const cleaned = lines
+        .map(l => l.replace(/^[-•\d\.)\s]+/, '').trim())
+        .filter(l => l.length > 0 && l.length <= 80)
+        .filter(looksValid);
+
+      if (cleaned.length > 0) {
+        queries = cleaned.slice(0, 3);
+      }
+    } catch (err) {
+      // Non-fatal: we'll fall back to baseQuery
+      console.warn('[YouTube] Failed to generate AI queries:', err);
+    }
+
+    // Update chips; keep current selection/url if user already switched.
+    if (queries.length > 0) {
+      setYoutubeQueries(queries);
+    }
   };
 
   const handleTest = () => {
@@ -120,29 +295,17 @@ export const DocumentActionsScreen:  React.FC = () => {
     });
   };
 
+  const handlePresentation = () => {
+    if (!document) return;
+    navigation.navigate('Presentation', { documentId: document.id });
+  };
+
   const handleChat = () => {
     if (!document) return;
-    if (!isPremium && features.maxChatMessages !== -1) {
-      navigation.navigate('Paywall', { source: 'chat' });
-      return;
-    }
-    navigation.navigate('Chat', { 
+    navigation.navigate('DocChat', {
       documentId: document.id,
       documentContent: document.content,
       documentTitle: document.title,
-    });
-  };
-
-  const handleAudio = () => {
-    if (!document) return;
-    if (!features.canUseAudioSummary) {
-      navigation.navigate('Paywall', { source: 'audio' });
-      return;
-    }
-    navigation.navigate('AudioPlayer', { 
-      documentId: document.id,
-      content: document.content || '',
-      title: document.title,
     });
   };
 
@@ -173,14 +336,51 @@ export const DocumentActionsScreen:  React.FC = () => {
         </View>
       )}
       
-      {/* Vendor Detection Badge - Shows when AI has analyzed the document */}
-      {documentAnalysis && documentAnalysis.vendorName && (
-        <View style={styles.vendorBadge}>
-          <Text style={styles.vendorLabel}>📚 Detected:</Text>
-          <Text style={styles.vendorName}>{documentAnalysis.vendorName}</Text>
-          {documentAnalysis.certificationDetected && (
-            <Text style={styles.certBadge}>{documentAnalysis.certificationDetected}</Text>
-          )}
+      {/* Vendor Detection Header - shows logo + detected vendor */}
+      {(!!documentAnalysis?.vendorName || vendorCandidates.length > 0 || !!fallbackVendor?.vendorName) && (
+        <View style={styles.vendorHeader}>
+          {(() => {
+            const vendorId = documentAnalysis?.vendorId || fallbackVendor?.vendorId;
+            const logo = (vendorId && (VENDOR_CONFIGS as any)[vendorId]?.logo) ? (VENDOR_CONFIGS as any)[vendorId].logo : '📚';
+            const isUrl = typeof logo === 'string' && /^https?:\/\//i.test(logo);
+            if (isUrl) {
+              return (
+                <Image
+                  source={{ uri: logo }}
+                  style={styles.vendorLogoImage}
+                  resizeMode="contain"
+                />
+              );
+            }
+            return <Text style={styles.vendorLogo}>{String(logo || '📚')}</Text>;
+          })()}
+          <View style={styles.vendorHeaderText}>
+            {(() => {
+              const vendorName = (documentAnalysis?.vendorName || fallbackVendor?.vendorName || '').trim();
+              const vendorConfidence = (typeof documentAnalysis?.vendorConfidence === 'number')
+                ? documentAnalysis.vendorConfidence
+                : (typeof fallbackVendor?.vendorConfidence === 'number' ? fallbackVendor.vendorConfidence : undefined);
+
+              const display = buildVendorDisplay({
+                vendorName,
+                vendorConfidence,
+                candidates: vendorCandidates,
+              });
+
+              return (
+                <>
+                  <Text style={styles.vendorLabel}>{display.showSingle ? 'Detected' : 'Detected (low confidence)'}</Text>
+                  <Text style={styles.vendorName}>{display.title}</Text>
+                  {display.subtitle ? (
+                    <Text style={styles.certBadge}>{display.subtitle}</Text>
+                  ) : null}
+                </>
+              );
+            })()}
+            {documentAnalysis?.certificationDetected && (
+              <Text style={styles.certBadge}>{documentAnalysis.certificationDetected}</Text>
+            )}
+          </View>
         </View>
       )}
       
@@ -194,93 +394,268 @@ export const DocumentActionsScreen:  React.FC = () => {
       )}
       
       <ScrollView style={styles.content}>
-        <Card style={styles.actionCard}>
-          <Text style={styles.actionIcon}>📝</Text>
-          <Text style={styles.actionTitle}>{strings.actions.summarize}</Text>
-          <Text style={styles.actionDescription}>
-            Get an AI-generated summary of your document
-          </Text>
-          <Button title={strings.actions.summarize} onPress={handleSummarize} />
-        </Card>
+        <View style={styles.actionsGrid}>
+          <TouchableOpacity style={styles.actionItem} onPress={handleSummarize} accessibilityRole="button" accessibilityLabel={strings.actions.summarize}>
+            <View style={styles.actionIconWrap}>
+              <Text style={styles.actionIcon}>📝</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>{strings.actions.summarize}</Text>
+          </TouchableOpacity>
 
-        <Card style={styles.actionCard}>
-          <Text style={styles.actionIcon}>📚</Text>
-          <Text style={styles.actionTitle}>{strings.actions.study}</Text>
-          <Text style={styles.actionDescription}>
-            Study with AI-assisted learning tools
-          </Text>
-          <Button title={strings.actions.study} onPress={handleStudy} />
-        </Card>
+          <TouchableOpacity style={styles.actionItem} onPress={handleDeepExplain} accessibilityRole="button" accessibilityLabel="Deep Explain">
+            <View style={styles.actionIconWrap}>
+              <Text style={styles.actionIcon}>🧠</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>Deep Explain</Text>
+          </TouchableOpacity>
 
-        <Card style={styles.actionCard}>
-          <Text style={styles.actionIcon}>🎥</Text>
-          <Text style={styles.actionTitle}>{strings.actions.generateVideo}</Text>
-          <Text style={styles.actionDescription}>
-            Create an AI video summary with narration
-          </Text>
-          <Button title={strings.actions.generateVideo} onPress={handleGenerateVideo} />
-        </Card>
+          <TouchableOpacity style={styles.actionItem} onPress={handlePlan} accessibilityRole="button" accessibilityLabel={strings.actions.study}>
+            <View style={styles.actionIconWrap}>
+              <Text style={styles.actionIcon}>🗓️</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>{strings.actions.study}</Text>
+          </TouchableOpacity>
 
-        <Card style={styles.actionCard}>
-          <Text style={styles.actionIcon}>✏️</Text>
-          <Text style={styles.actionTitle}>{strings.actions.test}</Text>
-          <Text style={styles.actionDescription}>
-            Take an AI-generated quiz
-          </Text>
-          <Button title={strings.actions.test} onPress={handleTest} />
-        </Card>
+          <TouchableOpacity style={styles.actionItem} onPress={handleGuide} accessibilityRole="button" accessibilityLabel="Guide">
+            <View style={styles.actionIconWrap}>
+              <Text style={styles.actionIcon}>🧭</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>Guide</Text>
+          </TouchableOpacity>
 
-        <Card style={styles.actionCard}>
-          <Text style={styles.actionIcon}>🔬</Text>
-          <Text style={styles.actionTitle}>{strings.actions.labs}</Text>
-          <Text style={styles.actionDescription}>
-            Access interactive labs and exercises
-          </Text>
-          <Button title={strings.actions.labs} onPress={handleLabs} />
-        </Card>
+          <TouchableOpacity style={styles.actionItem} onPress={handleWhiteboard} accessibilityRole="button" accessibilityLabel="Whiteboard">
+            <View style={styles.actionIconWrap}>
+              <Text style={styles.actionIcon}>🧑‍🏫</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>Whiteboard</Text>
+          </TouchableOpacity>
 
-        {/* New Feature Cards */}
-        <Card style={styles.actionCard}>
-          <View style={styles.cardHeader}>
-            <Text style={styles.actionIcon}>🃏</Text>
-            {!isPremium && <Text style={styles.proBadge}>Limited</Text>}
-          </View>
-          <Text style={styles.actionTitle}>Flashcards</Text>
-          <Text style={styles.actionDescription}>
-            Generate AI flashcards with spaced repetition
-          </Text>
-          <Button title="Create Flashcards" onPress={handleFlashcards} />
-        </Card>
+          <TouchableOpacity style={styles.actionItem} onPress={handleWatchVideos} accessibilityRole="button" accessibilityLabel="Watch Videos">
+            <View style={styles.actionIconWrap}>
+              <Text style={styles.actionIcon}>📺</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>Watch Videos</Text>
+          </TouchableOpacity>
 
-        <Card style={styles.actionCard}>
-          <View style={styles.cardHeader}>
-            <Text style={styles.actionIcon}>💬</Text>
-            {!isPremium && <Text style={styles.proBadge}>PRO</Text>}
-          </View>
-          <Text style={styles.actionTitle}>AI Chat</Text>
-          <Text style={styles.actionDescription}>
-            Ask questions about your document
-          </Text>
-          <Button title="Start Chat" onPress={handleChat} />
-        </Card>
+          <TouchableOpacity style={styles.actionItem} onPress={handleTest} accessibilityRole="button" accessibilityLabel={strings.actions.test}>
+            <View style={styles.actionIconWrap}>
+              <Text style={styles.actionIcon}>✏️</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>{strings.actions.test}</Text>
+          </TouchableOpacity>
 
-        <Card style={styles.actionCard}>
-          <View style={styles.cardHeader}>
-            <Text style={styles.actionIcon}>🎧</Text>
-            {!isPremium && <Text style={styles.proBadge}>PRO</Text>}
-          </View>
-          <Text style={styles.actionTitle}>Listen</Text>
-          <Text style={styles.actionDescription}>
-            Convert your document to audio
-          </Text>
-          <Button title="Listen Now" onPress={handleAudio} />
-        </Card>
+          <TouchableOpacity style={styles.actionItem} onPress={handleLabs} accessibilityRole="button" accessibilityLabel={strings.actions.labs}>
+            <View style={styles.actionIconWrap}>
+              <Text style={styles.actionIcon}>🔬</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>{strings.actions.labs}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity style={styles.actionItem} onPress={handleFlashcards} accessibilityRole="button" accessibilityLabel="Flashcards">
+            <View style={styles.actionIconWrap}>
+              {!isPremium && <Text style={styles.badgeText}>Limited</Text>}
+              <Text style={styles.actionIcon}>🃏</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>Flashcards</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity style={styles.actionItem} onPress={handleChat} accessibilityRole="button" accessibilityLabel="AI Chat (Doc)">
+            <View style={styles.actionIconWrap}>
+              {!isPremium && <Text style={styles.badgeText}>PRO</Text>}
+              <Image
+                source={require('../../assets/icon.png')}
+                style={styles.actionIconImage}
+                resizeMode="contain"
+              />
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>AI Chat (Doc)</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity style={styles.actionItem} onPress={handlePresentation} accessibilityRole="button" accessibilityLabel="AI Presentation">
+            <View style={styles.actionIconWrap}>
+              <Text style={styles.actionIcon}>📊</Text>
+            </View>
+            <Text style={styles.actionLabel} numberOfLines={2}>AI Presentation</Text>
+          </TouchableOpacity>
+        </View>
       </ScrollView>
+      
+      {/* YouTube Modal */}
+      <Modal
+        visible={showYoutube}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setShowYoutube(false)}
+      >
+        <SafeAreaView style={{ flex: 1, backgroundColor: colors.background }}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Related Videos</Text>
+            <TouchableOpacity onPress={() => setShowYoutube(false)} style={styles.closeButton}>
+              <Text style={styles.closeButtonText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+          {youtubeQueries.length > 1 && (
+            <View style={styles.queryRow}>
+              {youtubeQueries.map((q, idx) => {
+                const active = idx === selectedYoutubeQueryIndex;
+                return (
+                  <TouchableOpacity
+                    key={`${idx}-${q}`}
+                    onPress={() => {
+                      setSelectedYoutubeQueryIndex(idx);
+                      const encoded = encodeURIComponent(q);
+                      setYoutubeUrl(`https://www.youtube.com/results?search_query=${encoded}`);
+                    }}
+                    style={[styles.queryChip, active && styles.queryChipActive]}
+                  >
+                    <Text style={[styles.queryChipText, active && styles.queryChipTextActive]} numberOfLines={1}>
+                      {q}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
+          {youtubeUrl ? (
+            <WebView 
+              source={{ uri: youtubeUrl }} 
+              style={{ flex: 1 }}
+              startInLoadingState={true}
+              renderLoading={() => <LoadingSpinner />}
+            />
+          ) : null}
+        </SafeAreaView>
+      </Modal>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    backgroundColor: colors.cardBackground,
+  },
+  vendorHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 16,
+    marginTop: 8,
+    marginBottom: 8,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: colors.cardBackground,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  vendorLogo: {
+    fontSize: 28,
+    marginRight: 12,
+  },
+  vendorLogoImage: {
+    width: 84,
+    height: 28,
+    marginRight: 12,
+  },
+  vendorHeaderText: {
+    flex: 1,
+  },
+  tilesGrid: {
+    // deprecated: replaced by actionsGrid
+  },
+  actionsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    paddingBottom: 16,
+  },
+  actionItem: {
+    width: '25%',
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  actionIconWrap: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: colors.cardBackground,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+    position: 'relative',
+  },
+  badgeText: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    fontSize: 10,
+    fontWeight: '700',
+    color: colors.primary,
+  },
+  actionIcon: {
+    fontSize: 26,
+  },
+  actionIconImage: {
+    width: 28,
+    height: 28,
+  },
+  actionLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.text,
+    textAlign: 'center',
+    paddingHorizontal: 8,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: colors.text,
+  },
+  closeButton: {
+    padding: 8,
+  },
+  closeButtonText: {
+    color: colors.primary,
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  queryRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    backgroundColor: colors.cardBackground,
+    gap: 8,
+  },
+  queryChip: {
+    maxWidth: '100%',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+  },
+  queryChipActive: {
+    borderColor: colors.primary,
+    backgroundColor: colors.primary + '15',
+  },
+  queryChipText: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    maxWidth: 280,
+  },
+  queryChipTextActive: {
+    color: colors.primary,
+    fontWeight: '600',
+  },
   container: {
     flex: 1,
     backgroundColor: colors.background,
@@ -367,7 +742,7 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     overflow: 'hidden',
   },
-  actionIcon: {
+  actionIconLarge: {
     fontSize: 48,
     marginBottom:  12,
   },

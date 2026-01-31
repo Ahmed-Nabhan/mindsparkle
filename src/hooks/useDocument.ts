@@ -5,6 +5,7 @@ import { supabase } from '../services/supabase';
 import { canAccessDocument, verifyIsAdmin } from '../services/rbacService';
 import { uploadDocument as uploadDocumentService } from '../services/documentIntelligenceService';
 import { UserRole } from '../types/user';
+import * as FileSystem from 'expo-file-system';
 
 // Track documents with summary generation in progress (global state)
 const summaryGenerationInProgress = new Set<string>();
@@ -83,15 +84,22 @@ export const useDocument = () => {
     fileUri:  string,
     fileType: string,
     fileSize: number,
-    onProgress?: (progress: number, message: string) => void
+    onProgress?: (progress: number, message: string) => void,
+    isPro: boolean = false,
+    abortSignal?: AbortSignal
   ): Promise<DocumentUploadResult> => {
     try {
+      if (abortSignal?.aborted) {
+        return { success: false, error: 'Upload cancelled' };
+      }
+
       setIsLoading(true);
       setError(null);
       setUploadProgress(0);
       setUploadMessage('Starting upload...');
 
       const updateProgress = (progress: number, message: string) => {
+        if (abortSignal?.aborted) return;
         setUploadProgress(progress);
         setUploadMessage(message);
         if (onProgress) onProgress(progress, message);
@@ -103,15 +111,30 @@ export const useDocument = () => {
         throw new Error('Please sign in to upload documents');
       }
 
+      // Some providers (notably iCloud on iOS) may return fileSize as 0.
+      // Resolve size from the file URI so quota tracking + large-file heuristics are correct.
+      let resolvedFileSize = Number(fileSize) || 0;
+      try {
+        if (resolvedFileSize <= 0 && fileUri) {
+          const info = await FileSystem.getInfoAsync(fileUri, { size: true });
+          const candidate = Number((info as any)?.size) || 0;
+          if (candidate > 0) resolvedFileSize = candidate;
+        }
+      } catch (e: any) {
+        console.warn('[useDocument] Could not resolve file size from URI:', e?.message || e);
+      }
+
       // Call the unified upload service
       // This handles: upload → extract → analyze → store → trigger AI
       const result = await uploadDocumentService(
         fileName,
         fileUri,
         fileType,
-        fileSize,
+        resolvedFileSize,
         user.id,
-        updateProgress
+        updateProgress,
+        isPro, // Pass Pro status for premium Adobe OCR
+        abortSignal
       );
 
       if (!result.success) {
@@ -120,19 +143,21 @@ export const useDocument = () => {
 
       // Also save to local storage for offline access
       if (result.document) {
+        const extractedText = result.document.extractedText;
         const localDocument: Document = {
           id: result.documentId,
           title: result.document.title,
           fileName: fileName, // Required field for SQLite
           fileUri: fileUri, // Required field for SQLite
-          content: result.document.extractedText,
-          chunks: [result.document.extractedText],
+          content: extractedText,
+          chunks: [extractedText],
           totalChunks: 1,
-          isLargeFile: fileSize > 10 * 1024 * 1024,
+          isLargeFile: resolvedFileSize > 10 * 1024 * 1024,
           uploadedAt: new Date(),
           fileType: result.document.fileType,
           fileSize: result.document.fileSize,
           pdfCloudUrl: result.document.storagePath,
+          extractedData: result.document.extractedData,
           userId: user.id,
         };
         
@@ -188,10 +213,27 @@ export const useDocument = () => {
       if (!document) {
         return null;
       }
+
+      // Only treat documents as "cloud-only" if we don't have a local URI AND we also don't have
+      // local text content. Cloud-synced documents saved into SQLite often use an empty fileUri,
+      // but they should still be accessible offline.
+      const hasLocalText =
+        (typeof document.content === 'string' && document.content.trim().length > 0) ||
+        (typeof (document as any)?.extractedData?.text === 'string' && (document as any).extractedData.text.trim().length > 0);
+
+      const isCloudDocument = !document.fileUri && !hasLocalText;
       
       // RBAC: Validate document access for non-admin users
-      // Admins bypass this check as they have full access
-      if (userRole !== 'admin') {
+      // Admins bypass this check as they have full access.
+      // If the local row is already attributed to the current user, allow access to avoid
+      // false negatives from transient RPC/RLS issues.
+      if (isCloudDocument && userRole !== 'admin') {
+        const { data: { user } } = await supabase.auth.getUser();
+        const localOwnerId = (document as any)?.userId;
+        if (user?.id && localOwnerId && String(localOwnerId) === String(user.id)) {
+          return document;
+        }
+
         const hasAccess = await canAccessDocument(id);
         if (!hasAccess) {
           console.warn(`RBAC: Access denied to document ${id} for role ${userRole}`);

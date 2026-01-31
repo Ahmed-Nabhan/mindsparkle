@@ -63,7 +63,7 @@ const config = {
 // ============================================
 
 const logBuffer: AuditLogEntry[] = [];
-let flushTimeout: NodeJS.Timeout | null = null;
+let flushTimeout: ReturnType<typeof setTimeout> | null = null;
 const FLUSH_INTERVAL = 5000; // 5 seconds
 const MAX_BUFFER_SIZE = 10;
 

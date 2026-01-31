@@ -5,7 +5,7 @@ export const config = {
     description: 'AI-powered learning app',
   },
   animation: {
-    welcomeScreenDuration: 3000,
+    welcomeScreenDuration: 900,
     defaultTransitionDuration: 300,
   },
   limits: {

@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.DS_Store
+.git
+
+# Keep source files in build context (Dockerfile copies ./src)
+
+# Build outputs (Dockerfile produces dist in the image)
+dist
+*.map

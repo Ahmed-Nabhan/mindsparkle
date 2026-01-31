@@ -7,15 +7,22 @@ import { Card } from '../components/Card';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { Button } from '../components/Button';
 import { useDocument, isSummaryGenerating } from '../hooks/useDocument';
-import { generateSummary } from '../services/openai';
-import { updateDocumentSummary, getDocumentById } from '../services/storage';
+import { generateSummaryOutline, generateModuleForPage } from '../services/openai';
+import { updateDocumentSummaryPaged, getDocumentById } from '../services/storage';
+import DiagramRenderer from '../components/DiagramRenderer';
 import type { MainDrawerScreenProps } from '../navigation/types';
-import type { Document } from '../types/document';
+import type { Document, DocumentPagedSummary, PagedModule } from '../types/document';
 
 type SummaryScreenProps = MainDrawerScreenProps<'Summary'>;
 type SummaryLanguage = 'en' | 'ar';
 
+type SummaryPagerItem =
+  | { type: 'toc'; id: string }
+  | { type: 'page'; id: string; page: PagedModule };
+
 const SCREEN_WIDTH = Dimensions.get('window').width;
+// Account for outer screen padding (16*2) + Card padding (16*2)
+const PAGER_WIDTH = SCREEN_WIDTH - 64;
 
 export const SummaryScreen: React.FC = () => {
   const route = useRoute<SummaryScreenProps['route']>();
@@ -23,6 +30,7 @@ export const SummaryScreen: React.FC = () => {
   const { getDocument } = useDocument();
   const [document, setDocument] = useState<Document | null>(null);
   const [summary, setSummary] = useState<string>('');
+  const [summaryPaged, setSummaryPaged] = useState<DocumentPagedSummary | null>(null);
   const [summaryImage, setSummaryImage] = useState<string | null>(null);
   const [documentImages, setDocumentImages] = useState<{pageNum: number, url: string}[]>([]);
   const [displaySummary, setDisplaySummary] = useState<string>('');
@@ -32,18 +40,36 @@ export const SummaryScreen: React.FC = () => {
   const [progress, setProgress] = useState(0);
   const [progressMessage, setProgressMessage] = useState('');
   const [summaryLanguage, setSummaryLanguage] = useState<SummaryLanguage>('en');
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const generatingPagesRef = useRef<Set<number>>(new Set());
+  const [pageProgress, setPageProgress] = useState<Record<number, { progress: number; message: string }>>({});
 
+  // Reset state when documentId changes
   useEffect(() => {
+    // Clear previous state when document changes
+    setSummary('');
+    setDisplaySummary('');
+    setSummaryImage(null);
+    setSummaryPaged(null);
+    setDocument(null);
+    setIsLoading(true);
+    setIsGenerating(false);
+    setIsBackgroundGenerating(false);
+    setProgress(0);
+    setProgressMessage('');
+    setDocumentImages([]);
+    
+    // Load the new document
     loadDocumentAndSummary();
     
-    // Cleanup polling on unmount
+    // Cleanup polling on unmount or document change
     return () => {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
       }
     };
-  }, []);
+  }, [route.params.documentId]); // Re-run when documentId changes
 
   // Parse summary for images whenever it changes
   useEffect(() => {
@@ -87,6 +113,9 @@ export const SummaryScreen: React.FC = () => {
     if (doc?.summary && !isFakeSummary(doc.summary)) {
       // Summary already exists and is valid - show it instantly
       setSummary(doc.summary);
+      setIsLoading(false);
+    } else if (doc?.summaryPaged && doc.summaryPaged.modules && Array.isArray(doc.summaryPaged.modules) && doc.summaryPaged.modules.length > 0) {
+      setSummaryPaged(doc.summaryPaged as any);
       setIsLoading(false);
     } else if (doc?.summary && isFakeSummary(doc.summary)) {
       // Cached summary is fake (generated from help text) - clear it and show generate button
@@ -147,48 +176,116 @@ export const SummaryScreen: React.FC = () => {
   };
 
   const handleGenerateSummary = async () => {
-    if (!document) return;
+    const doc = document;
+    if (!doc) return;
     
     // ENHANCED: Try multiple sources for content
-    let contentToUse = document.content || '';
+    let contentToUse = '';
     
-    // Fallback 1: Try extracted data pages
-    if (!contentToUse && document.extractedData?.pages) {
-      contentToUse = document.extractedData.pages
-        .map(p => p.text || '')
-        .join('\n\n');
-    }
+    const extractedPagesText = (doc.extractedData?.pages && Array.isArray(doc.extractedData.pages))
+      ? doc.extractedData.pages.map((p: any) => p.text || '').join('\n\n')
+      : '';
+    const extractedFullText = String(
+      doc.extractedData?.text ||
+        (doc.extractedData as any)?.canonical?.content?.full_text ||
+        (doc.extractedData as any)?.canonical?.content?.fullText ||
+        (doc.extractedData as any)?.canonical?.content?.text ||
+        ''
+    );
+    const chunkedText = (doc.chunks && doc.chunks.length > 0) ? doc.chunks.join('\n\n') : '';
+    const directText = doc.content || '';
+
+    // Prefer the longest usable source to avoid truncated local content.
+    const candidates = [extractedFullText, extractedPagesText, chunkedText, directText]
+      .map((t) => String(t || ''))
+      .filter((t) => t.length > 100);
+    candidates.sort((a, b) => b.length - a.length);
+    contentToUse = candidates[0] || directText || '';
     
-    // Fallback 2: Try extracted data text
-    if (!contentToUse && document.extractedData?.text) {
-      contentToUse = document.extractedData.text;
-    }
-    
-    // Fallback 3: Try chunks
-    if (!contentToUse && document.chunks && document.chunks.length > 0) {
-      contentToUse = document.chunks.join('\n\n');
-    }
-    
+    const isPendingModule = (m: PagedModule | undefined | null) => {
+      if (!m) return true;
+      const blocks = m.content?.textBlocks;
+      return Array.isArray(blocks) && blocks.includes('__PENDING__');
+    };
+
+    const ensureModuleGenerated = async (pageIndex: number) => {
+      const currentDoc = document;
+      if (!currentDoc) return;
+      const currentSummary = summaryPaged;
+      if (!currentSummary || !Array.isArray(currentSummary.modules)) return;
+      if (pageIndex < 0 || pageIndex >= currentSummary.modules.length) return;
+      if (!isPendingModule(currentSummary.modules[pageIndex])) return;
+      if (generatingPagesRef.current.has(pageIndex)) return;
+
+      generatingPagesRef.current.add(pageIndex);
+      setPageProgress((prev) => ({
+        ...prev,
+        [pageIndex]: { progress: 0, message: summaryLanguage === 'ar' ? 'جاري التوليد...' : 'Generating...' },
+      }));
+
+      try {
+        const generated = await generateModuleForPage(
+          pageIndex,
+          contentToUse,
+          currentDoc.chunks,
+          (p: number, msg: string) => {
+            setPageProgress((prev) => ({
+              ...prev,
+              [pageIndex]: { progress: p, message: msg },
+            }));
+          },
+          currentDoc.fileUri,
+          currentDoc.fileType,
+          currentDoc.pdfCloudUrl,
+          currentDoc.extractedData,
+          summaryLanguage,
+          currentDoc.id
+        );
+
+        setSummaryPaged((prev) => {
+          if (!prev) return prev;
+          const next: DocumentPagedSummary = {
+            ...prev,
+            modules: prev.modules.map((m, i) => (i === pageIndex ? generated : m)),
+          };
+          updateDocumentSummaryPaged(currentDoc.id, next as any).catch((e) => console.warn('[Summary] Persist failed', e));
+          return next as any;
+        });
+      } finally {
+        generatingPagesRef.current.delete(pageIndex);
+        setPageProgress((prev) => {
+          const copy = { ...prev };
+          delete copy[pageIndex];
+          return copy;
+        });
+      }
+    };
+
     setIsGenerating(true);
     setProgress(0);
     setProgressMessage(summaryLanguage === 'ar' ? 'جاري البدء...' : 'Starting...');
 
     try {
-      // Pass existing extracted data to avoid re-uploading to cloud
-      const generatedSummary = await generateSummary(
+      // Phase 1: fast outline (placeholder pages)
+      const outline = await generateSummaryOutline(
         contentToUse,
-        document.chunks,
+        doc.chunks,
         handleProgress,
-        document.fileUri,
-        document.fileType,
-        document.pdfCloudUrl,  // Pass existing cloud URL
-        document.extractedData,  // Pass existing extracted data
-        summaryLanguage  // Pass selected language
+        doc.fileUri,
+        doc.fileType,
+        doc.pdfCloudUrl,
+        doc.extractedData,
+        summaryLanguage,
+        doc.id
       );
-      setSummary(generatedSummary);
-      
-      // Save summary to document for future instant access
-      await updateDocumentSummary(document.id, generatedSummary);
+      setSummaryPaged(outline as any);
+      await updateDocumentSummaryPaged(doc.id, outline as any);
+
+      // Phase 2: generate the first page immediately for perceived speed
+      setTimeout(() => {
+        ensureModuleGenerated(0).catch((e) => console.warn('[Summary] Failed generating first page', e));
+      }, 250);
+      return;
     } catch (error:  any) {
       console.error('Error generating summary:', error);
       setSummary(summaryLanguage === 'ar' 
@@ -238,7 +335,7 @@ export const SummaryScreen: React.FC = () => {
           </Card>
         )}
 
-        {!summary && !isGenerating && !isBackgroundGenerating && (
+        {!summary && !summaryPaged && !isGenerating && !isBackgroundGenerating && (
           <Card>
             {/* Check if document content is a help message */}
             {document.content && (
@@ -320,7 +417,250 @@ export const SummaryScreen: React.FC = () => {
           </Card>
         )}
 
-        {summary && ! isGenerating && (
+        {summaryPaged && summaryPaged.modules && summaryPaged.modules.length > 0 && !isGenerating && (
+          <Card>
+            <Text style={styles.sectionTitle}>AI Summary (Pages)</Text>
+            <Text style={styles.infoText}>Swipe left/right to change page.</Text>
+            <View style={{ width: PAGER_WIDTH, alignSelf: 'center' }}>
+              <FlatList
+                style={{ width: PAGER_WIDTH }}
+                data={([
+                  { type: 'toc', id: 'toc' },
+                  // Do NOT rely on model-provided moduleId for React keys (it may repeat).
+                  ...summaryPaged.modules.map((m, i) => ({ type: 'page', id: `page-${i + 1}`, page: m } as SummaryPagerItem)),
+                ] as SummaryPagerItem[])}
+                horizontal
+                pagingEnabled
+                showsHorizontalScrollIndicator={false}
+                keyExtractor={(item, idx) => `${item.type}:${item.id}:${idx}`}
+                onMomentumScrollEnd={(e) => {
+                  const x = e.nativeEvent.contentOffset.x;
+                  const idx = Math.round(x / PAGER_WIDTH);
+                  if (idx <= 0) return;
+                  const pageIndex = idx - 1;
+                  const m = summaryPaged.modules[pageIndex];
+                  const blocks = m?.content?.textBlocks;
+                  const pending = Array.isArray(blocks) && blocks.includes('__PENDING__');
+                  if (!pending) return;
+
+                  // Re-run the same content selection logic (must match generation) to avoid empty/truncated input.
+                  const extractedPagesText = (document.extractedData?.pages && Array.isArray(document.extractedData.pages))
+                    ? document.extractedData.pages.map((p: any) => p.text || '').join('\n\n')
+                    : '';
+                  const extractedFullText = String(
+                    document.extractedData?.text ||
+                      (document.extractedData as any)?.canonical?.content?.full_text ||
+                      (document.extractedData as any)?.canonical?.content?.fullText ||
+                      (document.extractedData as any)?.canonical?.content?.text ||
+                      ''
+                  );
+                  const chunkedText = (document.chunks && document.chunks.length > 0) ? document.chunks.join('\n\n') : '';
+                  const directText = document.content || '';
+                  const candidates = [extractedFullText, extractedPagesText, chunkedText, directText]
+                    .map((t) => String(t || ''))
+                    .filter((t) => t.length > 100);
+                  candidates.sort((a, b) => b.length - a.length);
+                  const contentToUse = candidates[0] || directText || '';
+
+                  if (generatingPagesRef.current.has(pageIndex)) return;
+                  generatingPagesRef.current.add(pageIndex);
+                  setPageProgress((prev) => ({
+                    ...prev,
+                    [pageIndex]: { progress: 0, message: summaryLanguage === 'ar' ? 'جاري التوليد...' : 'Generating...' },
+                  }));
+
+                  (async () => {
+                    try {
+                      const generated = await generateModuleForPage(
+                        pageIndex,
+                        contentToUse,
+                        document.chunks,
+                        (p: number, msg: string) => {
+                          setPageProgress((prev) => ({
+                            ...prev,
+                            [pageIndex]: { progress: p, message: msg },
+                          }));
+                        },
+                        document.fileUri,
+                        document.fileType,
+                        document.pdfCloudUrl,
+                        document.extractedData,
+                        summaryLanguage,
+                        document.id
+                      );
+                      setSummaryPaged((prev) => {
+                        if (!prev) return prev;
+                        const next: DocumentPagedSummary = {
+                          ...prev,
+                          modules: prev.modules.map((mm, i) => (i === pageIndex ? generated : mm)),
+                        };
+                        updateDocumentSummaryPaged(document.id, next as any).catch((e) => console.warn('[Summary] Persist failed', e));
+                        return next as any;
+                      });
+                    } catch (err) {
+                      console.warn('[Summary] Failed generating module', err);
+                    } finally {
+                      generatingPagesRef.current.delete(pageIndex);
+                      setPageProgress((prev) => {
+                        const copy = { ...prev };
+                        delete copy[pageIndex];
+                        return copy;
+                      });
+                    }
+                  })();
+                }}
+                renderItem={({ item, index }) => {
+                  if (item.type === 'toc') {
+                    return (
+                      <View style={[styles.modulePage, { width: PAGER_WIDTH }]}>
+                        <ScrollView style={styles.moduleScroll} showsVerticalScrollIndicator={true}>
+                          <Text style={styles.moduleIndex}>Table of contents</Text>
+                          <Text style={styles.moduleTitle}>Pages ({summaryPaged.totalPages})</Text>
+                          {summaryPaged.modules.map((m, i) => (
+                            <View key={`toc-${i}-${m.title}`} style={{ marginBottom: 10 }}>
+                              <Text style={styles.moduleBody}>
+                                Page {i + 1}. {m.title}
+                              </Text>
+                              {Array.isArray((m as any).toc) && (m as any).toc.length > 0 ? (
+                                (m as any).toc.slice(0, 5).map((t: string, j: number) => (
+                                  <Text key={`toc-item-${i}-${j}-${String(t).slice(0, 12)}`} style={styles.tocItem}>
+                                    • {t}
+                                  </Text>
+                                ))
+                              ) : null}
+                            </View>
+                          ))}
+                          <Text style={styles.moduleMeta}>Swipe left to start.</Text>
+                        </ScrollView>
+                      </View>
+                    );
+                  }
+
+                  const page = item.page;
+                  const pageIndex = Math.max(0, index - 1);
+                  const pageIsPending = Array.isArray(page.content?.textBlocks) && page.content.textBlocks.includes('__PENDING__');
+                  const pp = pageProgress[pageIndex];
+
+                  return (
+                    <View style={[styles.modulePage, { width: PAGER_WIDTH }]}>
+                      <ScrollView style={styles.moduleScroll} showsVerticalScrollIndicator={true}>
+                        <Text style={styles.moduleIndex}>Page {pageIndex + 1}/{summaryPaged.totalPages}</Text>
+                        <Text style={styles.moduleTitle}>{page.title}</Text>
+
+                        {page.content?.imageDataUrl ? (
+                          <Image
+                            source={{ uri: page.content.imageDataUrl }}
+                            style={styles.moduleImage}
+                            resizeMode="cover"
+                          />
+                        ) : null}
+
+                        {pageIsPending && (
+                          <View style={{ marginTop: 8, marginBottom: 12 }}>
+                            <Text style={styles.infoText}>
+                              {pp?.message || (summaryLanguage === 'ar' ? 'اسحب هنا لتوليد هذا القسم.' : 'Swipe here to generate this page.')}
+                            </Text>
+                            {pp && (
+                              <View style={styles.progressBarContainer}>
+                                <View style={[styles.progressBar, { width: `${pp.progress}%` }]} />
+                              </View>
+                            )}
+                          </View>
+                        )}
+
+                        <Text style={styles.moduleSectionHeading}>Executive summary</Text>
+                        {Array.isArray(page.content?.executiveSummary) && page.content.executiveSummary.length > 0 ? (
+                          page.content.executiveSummary.map((b, i) => (
+                            <Text key={`exec-${pageIndex}-${i}-${String(b).slice(0, 16)}`} style={styles.moduleBody}>• {b}</Text>
+                          ))
+                        ) : (
+                          <Text style={styles.moduleBody}>{pageIsPending ? '—' : 'Not specified.'}</Text>
+                        )}
+
+                        <Text style={styles.moduleSectionHeading}>Content</Text>
+                        {Array.isArray(page.content?.textBlocks) && page.content.textBlocks.length > 0 ? (
+                          page.content.textBlocks.map((t, i) => (
+                            <Text key={`blk-${pageIndex}-${i}-${String(t).slice(0, 16)}`} style={styles.moduleBody}>{t}</Text>
+                          ))
+                        ) : (
+                          <Text style={styles.moduleBody}>{pageIsPending ? '—' : 'Not specified.'}</Text>
+                        )}
+
+                        {Array.isArray(page.content?.tables) && page.content.tables.length > 0 ? (
+                          <>
+                            <Text style={styles.moduleSectionHeading}>Tables</Text>
+                            {page.content.tables.map((tbl, ti) => (
+                              <View key={`tbl-${pageIndex}-${ti}`} style={styles.tableContainer}>
+                                {Array.isArray(tbl.headers) && tbl.headers.length > 0 && (
+                                  <View style={styles.tableRow}>
+                                    {tbl.headers.slice(0, 6).map((h, hi) => (
+                                      <Text key={`th-${pageIndex}-${ti}-${hi}`} style={[styles.tableCell, styles.tableHeaderCell]} numberOfLines={2}>
+                                        {h}
+                                      </Text>
+                                    ))}
+                                  </View>
+                                )}
+                                {(tbl.rows || []).slice(0, 12).map((row, ri) => (
+                                  <View key={`tr-${pageIndex}-${ti}-${ri}`} style={styles.tableRow}>
+                                    {(row || []).slice(0, 6).map((c, ci) => (
+                                      <Text key={`tc-${pageIndex}-${ti}-${ri}-${ci}`} style={styles.tableCell} numberOfLines={3}>
+                                        {c}
+                                      </Text>
+                                    ))}
+                                  </View>
+                                ))}
+                              </View>
+                            ))}
+                          </>
+                        ) : null}
+
+                        {Array.isArray(page.content?.diagrams) && page.content.diagrams.length > 0 ? (
+                          <>
+                            <Text style={styles.moduleSectionHeading}>Diagrams</Text>
+                            {page.content.diagrams.map((dgm, di) => (
+                              <DiagramRenderer
+                                key={`dgm-${pageIndex}-${di}`}
+                                mermaidCode={String((dgm as any)?.code || '')}
+                                height={260}
+                                style={{ marginTop: 8 }}
+                              />
+                            ))}
+                          </>
+                        ) : null}
+
+                        {Array.isArray(page.content?.equations) && page.content.equations.length > 0 ? (
+                          <>
+                            <Text style={styles.moduleSectionHeading}>Equations</Text>
+                            {page.content.equations.map((eq, i) => (
+                              <Text key={`eq-${pageIndex}-${i}`} style={styles.moduleMono}>{eq}</Text>
+                            ))}
+                          </>
+                        ) : null}
+
+                        {Array.isArray(page.content?.visuals) && page.content.visuals.length > 0 ? (
+                          <>
+                            <Text style={styles.moduleSectionHeading}>Suggested visuals</Text>
+                            {page.content.visuals.map((v, i) => (
+                              <Text key={`vis-${pageIndex}-${i}-${String(v).slice(0, 16)}`} style={styles.moduleBody}>• {v}</Text>
+                            ))}
+                          </>
+                        ) : null}
+                      </ScrollView>
+                    </View>
+                  );
+                }}
+              />
+            </View>
+            <Button
+              title="Regenerate"
+              onPress={handleGenerateSummary}
+              variant="outline"
+              style={styles.button}
+            />
+          </Card>
+        )}
+
+        {summary && !summaryPaged && ! isGenerating && (
           <Card>
             <Text style={styles.sectionTitle}>
               {summary.includes('⚠️') || summary.includes('Unable to Generate') ? 'Notice' : 'AI Summary'}
@@ -346,7 +686,7 @@ export const SummaryScreen: React.FC = () => {
                   style={styles.imagesScroll}
                 >
                   {documentImages.map((img, index) => (
-                    <View key={index} style={styles.imageContainer}>
+                    <View key={`img-${img.pageNum}-${img.url}-${index}`} style={styles.imageContainer}>
                       <Image 
                         source={{ uri: img.url }} 
                         style={styles.documentImage} 
@@ -382,6 +722,14 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.background,
   },
+  moduleImage: {
+    width: '100%',
+    height: 180,
+    borderRadius: 12,
+    marginTop: 12,
+    marginBottom: 12,
+    backgroundColor: colors.cardBackground,
+  },
   content: {
     flex: 1,
     padding:  16,
@@ -404,6 +752,77 @@ const styles = StyleSheet.create({
     color: colors.text,
     lineHeight: 24,
     marginBottom: 16,
+  },
+  modulePage: {
+    paddingRight: 0,
+  },
+  moduleScroll: {
+    maxHeight: 520,
+  },
+  moduleIndex: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    marginBottom: 6,
+  },
+  moduleTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: colors.text,
+    marginBottom: 6,
+  },
+  moduleMeta: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    marginBottom: 12,
+  },
+  moduleSectionHeading: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.text,
+    marginTop: 12,
+    marginBottom: 6,
+  },
+  moduleBody: {
+    fontSize: 14,
+    color: colors.text,
+    lineHeight: 20,
+    marginBottom: 6,
+  },
+  tocItem: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    lineHeight: 18,
+    marginBottom: 4,
+    marginLeft: 10,
+  },
+  moduleMono: {
+    fontSize: 12,
+    color: colors.text,
+    lineHeight: 18,
+    fontFamily: 'Courier',
+    marginBottom: 8,
+  },
+  tableContainer: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 8,
+    overflow: 'hidden',
+    marginBottom: 12,
+  },
+  tableRow: {
+    flexDirection: 'row',
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+  },
+  tableCell: {
+    flex: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    fontSize: 12,
+    color: colors.text,
+  },
+  tableHeaderCell: {
+    fontWeight: '700',
   },
   imagesSection: {
     marginTop: 16,

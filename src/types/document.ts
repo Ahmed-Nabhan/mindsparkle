@@ -12,9 +12,67 @@ export interface Document {
   totalChunks?: number;
   isLargeFile?: boolean;
   summary?: string;
+  summaryModules?: SummaryModule[];
+  summaryPaged?: DocumentPagedSummary;
   userId?: string;
   pdfCloudUrl?: string;
   extractedData?: ExtractedData;
+}
+
+export type ModuleConfidence = 'LOW' | 'MEDIUM' | 'HIGH';
+
+export interface PagedModuleContent {
+  executiveSummary: string[];
+  textBlocks: string[];
+  imageDataUrl?: string;
+  tables: {
+    headers: string[];
+    rows: string[][];
+  }[];
+  diagrams: {
+    type: 'mermaid';
+    code: string;
+  }[];
+  equations: string[];
+  visuals: string[];
+}
+
+export interface PagedModule {
+  page: number;
+  moduleId: string;
+  title: string;
+  /** Short list of subtopics shown on the TOC page */
+  toc?: string[];
+  confidence: ModuleConfidence;
+  content: PagedModuleContent;
+}
+
+export interface DocumentPagedSummary {
+  documentId: string;
+  totalPages: number;
+  modules: PagedModule[];
+}
+
+export interface SummaryModule {
+  id: string;
+  title: string;
+  level?: number;
+  source?: {
+    pageStart?: number;
+    pageEnd?: number;
+    inputChars?: number;
+  };
+  executiveBullets: string[];
+  coreExplanation: string;
+  comparisonTableMarkdown: string;
+  mermaidDiagram: string;
+  keyEquationsLatex: string[];
+  visualAids: string;
+  validation?: {
+    confidence?: 'high' | 'medium' | 'low';
+    missingInfo?: string[];
+    inferredOrWeakClaims?: string[];
+  };
 }
 
 export interface ExtractedData {

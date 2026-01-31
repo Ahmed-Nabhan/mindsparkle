@@ -5,9 +5,19 @@ import axios from 'axios';
 import { Alert } from 'react-native';
 import Config from './config';
 import { supabase } from './supabase';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Maximum concurrent API calls - process 50 at a time for optimal speed
 var MAX_CONCURRENT = 50;
+
+var errorToString = (err: unknown): string => {
+  if (err instanceof Error) return err.message;
+  try {
+    return typeof err === 'string' ? err : JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+};
 
 // Helper: Process promises in batches of MAX_CONCURRENT for controlled parallelism
 var processBatched = async function<T>(
@@ -44,6 +54,28 @@ var apiClient = axios.create({
 
 // Cache the session to avoid repeated async calls
 var cachedSession: { token: string; expiry: number } | null = null;
+
+async function getSessionAccessToken(): Promise<string | null> {
+  try {
+    const now = Date.now();
+    if (cachedSession && cachedSession.expiry > now + 60000) {
+      return cachedSession.token;
+    }
+
+    const { data } = await supabase.auth.getSession();
+    const session = data?.session;
+    if (session?.access_token) {
+      cachedSession = {
+        token: session.access_token,
+        expiry: session.expires_at ? session.expires_at * 1000 : now + 3600000,
+      };
+      return session.access_token;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
 
 // Attach Supabase session token for auth-protected proxy
 apiClient.interceptors.request.use(async function (config) {
@@ -102,6 +134,15 @@ var handleAPIError = function(error: any): void {
 // Generic API call with error handling and retry
 export var callApi = async function(action: string, data: any, retries: number = 2): Promise<any> {
   var lastError: any = null;
+
+  // The openai-proxy Edge Function validates the user's JWT for nearly all actions.
+  // Avoid confusing "Invalid JWT" errors on fresh installs by failing fast.
+  if (action !== 'test') {
+    const token = await getSessionAccessToken();
+    if (!token) {
+      throw new Error('Please sign in to use AI features.');
+    }
+  }
   
   for (var attempt = 0; attempt <= retries; attempt++) {
     try {
@@ -111,7 +152,13 @@ export var callApi = async function(action: string, data: any, retries: number =
         await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt - 1)));
       }
       
-      console.log(`API Call: ${action}, data size: ${JSON.stringify(data).length} chars`);
+      let dataSize = -1;
+      try {
+        dataSize = JSON.stringify(data).length;
+      } catch {
+        // Ignore sizing failures (should be rare)
+      }
+      console.log(`API Call: ${action}, data size: ${dataSize} chars`);
       
       var response = await apiClient.post(Config.OPENAI_PROXY_URL, {
         action,
@@ -120,18 +167,38 @@ export var callApi = async function(action: string, data: any, retries: number =
       
       console.log(`API Response status: ${response.status}`);
       
-      if (response.data.error) {
+      // Normalize backend error shapes:
+      // - { error: string }
+      // - { code: number, message: string }
+      if (response.data?.error) {
         console.error(`API Error: ${response.data.error}`);
-        // Check if it's a credit error - show friendly message
         handleAPIError(response.data.error);
         throw new Error(response.data.error);
+      }
+      if (typeof response.data?.code === 'number' && response.data?.message && response.data.code >= 400) {
+        console.error(`API Error: ${response.data.code} ${response.data.message}`);
+        handleAPIError(response.data.message);
+        throw new Error(response.data.message);
       }
       
       return response.data;
     } catch (error: any) {
-      lastError = error;
-      console.error('API call failed:', error?.message || error);
-      console.error('Error details:', JSON.stringify(error?.response?.data || {}));
+      const respData = error?.response?.data;
+      const serverMsg = typeof respData?.message === 'string' && respData.message.trim().length > 0
+        ? respData.message
+        : (typeof respData?.error === 'string' && respData.error.trim().length > 0 ? respData.error : null);
+
+      if (serverMsg) {
+        const wrapped: any = new Error(serverMsg);
+        wrapped.response = error?.response;
+        wrapped.status = error?.response?.status;
+        lastError = wrapped;
+      } else {
+        lastError = error;
+      }
+
+      console.error('API call failed:', serverMsg || error?.message || error);
+      console.error('Error details:', JSON.stringify(respData || {}));
       
       // Don't retry on certain errors
       var status = error.response?.status;
@@ -178,6 +245,19 @@ var splitIntoChunks = function(content: string, maxSize: number): string[] {
   
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i];
+
+    // If a single line exceeds maxSize, split it to avoid oversized chunks
+    if (line.length > maxSize) {
+      if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+        currentChunk = '';
+      }
+      for (var j = 0; j < line.length; j += maxSize) {
+        chunks.push(line.slice(j, j + maxSize));
+      }
+      continue;
+    }
+
     if (currentChunk.length + line.length > maxSize && currentChunk.length > 0) {
       chunks.push(currentChunk);
       currentChunk = line;
@@ -281,15 +361,29 @@ export var summarize = async function(
   return summaryTexts.join('\n\n---\n\n');
 };
 
+export var summarizeModule = async function(
+  content: string,
+  params: { title: string; source?: { pageStart?: number; pageEnd?: number; inputChars?: number }; language?: 'en' | 'ar' }
+): Promise<any> {
+  const res = await callApi('summarizeModule', {
+    content,
+    title: params.title,
+    source: params.source,
+    language: params.language || 'en',
+  });
+  return res?.module;
+};
+
 // Generate quiz questions - handles large content with PARALLEL processing (50 concurrent)
-export var generateQuiz = async function(content: string, questionCount?: number): Promise<any[]> {
+export var generateQuiz = async function(content: string, questionCount?: number, focusTopics?: string[]): Promise<any[]> {
   var totalQuestions = questionCount || 10;
   
   // For small content, single request
   if (content.length <= Config.MAX_CONTENT_LENGTH) {
     var response = await callApi('quiz', {
       content: (content || '').substring(0, Config.MAX_CONTENT_LENGTH),
-      questionCount: totalQuestions,
+      count: totalQuestions,
+      focusTopics: Array.isArray(focusTopics) && focusTopics.length > 0 ? focusTopics : undefined,
     });
     return response.questions || [];
   }
@@ -302,8 +396,9 @@ export var generateQuiz = async function(content: string, questionCount?: number
   var results = await processBatched(chunks, function(chunk, i) {
     return callApi('quiz', {
       content: chunk,
-      questionCount: questionsPerChunk,
+      count: questionsPerChunk,
       chunkInfo: 'Part ' + (i + 1) + ' of ' + chunks.length,
+      focusTopics: Array.isArray(focusTopics) && focusTopics.length > 0 ? focusTopics : undefined,
     }).then(function(response) {
       console.log('Completed quiz chunk', i + 1);
       return { index: i, questions: response.questions || [] };
@@ -367,11 +462,67 @@ export var generateInterview = async function(content: string, questionCount?: n
     var prompt = 'Based on this document content, generate ' + totalQuestions + ' interview questions. ' + typeFilter + '\n\nDocument content:\n' + content.substring(0, Config.MAX_CONTENT_LENGTH) + '\n\nReturn a JSON array with: [{"question":"...","type":"technical|conceptual|behavioral","sampleAnswer":"...","tips":["..."]}]';
     
     var response = await callApi('interview', { content: prompt, temperature: 0.3 });
+    // New format: edge function may return { questions: [...] }
+    if (response && response.questions && Array.isArray(response.questions) && response.questions.length > 0) {
+      return response.questions;
+    }
+
     var responseText = response.response || response;
     var jsonMatch = typeof responseText === 'string' ? responseText.match(/\[[\s\S]*\]/) : null;
     if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      } catch (err) {
+        console.error('Interview parse error:', err);
+      }
     }
+
+    // If we didn't get a JSON array, try to parse line-based output as a fallback
+    const tryParseLines = (text: string) => {
+      if (!text || typeof text !== 'string') return [] as any[];
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      const items: any[] = [];
+      let currentQ: any = null;
+      for (const line of lines) {
+        // Matches patterns like "1. What is..." or "- Question: ..."
+        const m = line.match(/^\s*(?:\d+\.|-|•)?\s*(?:Q\:|Question\:)?\s*(.+)\?*$/i);
+        if (m && m[1]) {
+          if (currentQ) items.push(currentQ);
+          currentQ = { question: m[1].trim(), type: 'conceptual', sampleAnswer: '', tips: [] };
+        } else if (currentQ && line.length > 20 && !currentQ.sampleAnswer) {
+          currentQ.sampleAnswer = line;
+        } else if (currentQ && line.startsWith('-')) {
+          currentQ.tips = currentQ.tips || [];
+          currentQ.tips.push(line.replace(/^-\s*/, ''));
+        }
+      }
+      if (currentQ) items.push(currentQ);
+      return items;
+    };
+
+    try {
+      const parsedFromLines = tryParseLines(responseText);
+      if (parsedFromLines && parsedFromLines.length > 0) return parsedFromLines;
+    } catch (err) {
+      console.warn('Interview fallback line-parse failed:', err);
+    }
+
+    // Fallback: try a combined direct interview request without the wrapper prompt
+    try {
+      console.warn('Interview: primary response empty/invalid, attempting fallback combined request');
+      const fallback = await callApi('interview', { content: content.substring(0, Config.MAX_CONTENT_LENGTH), count: totalQuestions, temperature: 0.35 });
+      if (fallback && (fallback as any).questions && Array.isArray((fallback as any).questions) && (fallback as any).questions.length > 0) {
+        return (fallback as any).questions;
+      }
+      if (Array.isArray(fallback) && fallback.length > 0) return fallback;
+      const fallbackText = (fallback as any).response || fallback;
+      const fbMatch = typeof fallbackText === 'string' ? fallbackText.match(/\[[\s\S]*\]/) : null;
+      if (fbMatch) return JSON.parse(fbMatch[0]);
+    } catch (err) {
+      console.error('Interview fallback failed:', errorToString(err));
+    }
+
     return [];
   }
   
@@ -382,23 +533,55 @@ export var generateInterview = async function(content: string, questionCount?: n
   
   var results = await processBatched(chunks, function(chunk, i) {
     var typeFilter = questionType === 'all' || !questionType ? '' : 'Focus on ' + questionType + ' questions.';
-    var prompt = 'Based on this content, generate ' + questionsPerChunk + ' interview questions. ' + typeFilter + '\n\nContent:\n' + chunk + '\n\nReturn JSON: [{"question":"...","type":"...","sampleAnswer":"...","tips":["..."]}]';
-    
-    return callApi('interview', { content: prompt, temperature: 0.3 }).then(function(response) {
+    return callApi('interview', { content: chunk, count: questionsPerChunk, temperature: 0.3 }).then(function(response) {
       console.log('Completed interview chunk', i + 1);
-      var text = response.response || response;
-      var match = typeof text === 'string' ? text.match(/\[[\s\S]*\]/) : null;
-      var questions = match ? JSON.parse(match[0]) : [];
-      return { index: i, questions: questions };
+      try {
+        // New format: response.questions array
+        if (response.questions && Array.isArray(response.questions)) {
+          return { index: i, questions: response.questions };
+        }
+        // Legacy format fallback
+        var text = response.response || response;
+        var match = typeof text === 'string' ? text.match(/\[[\s\S]*\]/) : null;
+        var questions = match ? JSON.parse(match[0]) : [];
+        return { index: i, questions: questions };
+      } catch (parseErr) {
+        console.error('Interview chunk', i + 1, 'parse error:', errorToString(parseErr));
+        return { index: i, questions: [] };
+      }
     }).catch(function(err) {
-      console.error('Interview chunk', i + 1, 'failed:', err.message);
+      console.error('Interview chunk', i + 1, 'failed:', errorToString(err));
       return { index: i, questions: [] };
     });
   });
   
   // Combine all questions
   var allQuestions = results.flatMap(function(r: any) { return r.questions; });
+  // If chunked generation returned nothing, try fallback combined request
+  if (!allQuestions || allQuestions.length === 0) {
+    console.warn('Interview: chunked generation returned no questions, attempting fallback combined request');
+    try {
+      const fallback = await callApi('interview', { content: content.substring(0, Config.MAX_CONTENT_LENGTH), count: totalQuestions, temperature: 0.35 });
+      if (Array.isArray(fallback) && fallback.length > 0) return fallback.slice(0, totalQuestions);
+      const fallbackText = fallback.response || fallback;
+      const fbMatch = typeof fallbackText === 'string' ? fallbackText.match(/\[[\s\S]*\]/) : null;
+      if (fbMatch) return JSON.parse(fbMatch[0]).slice(0, totalQuestions);
+    } catch (err) {
+      console.error('Interview fallback failed:', errorToString(err));
+    }
+  }
+
   return allQuestions.slice(0, totalQuestions);
+};
+
+// Generate a study plan table (topic + hours)
+export var generateStudyPlan = async function(content: string, options?: { language?: 'en' | 'ar' }): Promise<{ plan: { topic: string; hours: number }[] }> {
+  var language = options?.language || 'en';
+  var response = await callApi('studyPlan', {
+    content: (content || '').substring(0, Config.MAX_CONTENT_LENGTH),
+    language,
+  });
+  return { plan: response.plan || [] };
 };
 
 // Generate study guide - handles large content with PARALLEL processing
@@ -424,9 +607,25 @@ export var generateStudyGuide = async function(
     var response = await callApi('studyGuide', {
       content: content,
     });
+    // If the response is empty or too short, attempt a stronger combined request
+    // Backend returns { guide: ... } but we also check for summary/studyGuide for backward compat
+    var text = response.guide || response.summary || (typeof response.studyGuide === 'string' ? response.studyGuide : JSON.stringify(response.studyGuide)) || '';
+    
+    if (!text || text === 'null' || text.length < 50) {
+      console.warn('StudyGuide: initial response too short, retrying with combined prompt');
+      try {
+        const retry = await callApi('studyGuide', {
+          content: content,
+          isCombine: true,
+        });
+        text = retry.guide || retry.summary || (typeof retry.studyGuide === 'string' ? retry.studyGuide : JSON.stringify(retry.studyGuide)) || text;
+      } catch (err) {
+        console.error('StudyGuide retry failed:', err);
+      }
+    }
     return {
       structured: response.studyGuide || null,
-      text: response.summary || JSON.stringify(response.studyGuide) || ''
+      text: text,
     };
   }
   
@@ -440,7 +639,8 @@ export var generateStudyGuide = async function(
       content: chunk,
       chunkInfo: 'Part ' + (i + 1) + ' of ' + chunks.length,
     }).then(function(response) {
-      return { index: i, text: response.summary || JSON.stringify(response.studyGuide) || '' };
+      var chunkText = response.guide || response.summary || (typeof response.studyGuide === 'string' ? response.studyGuide : JSON.stringify(response.studyGuide)) || '';
+      return { index: i, text: chunkText };
     }).catch(function(err) {
       console.error('Study guide chunk', i + 1, 'failed:', err.message);
       return { index: i, text: '' };
@@ -449,6 +649,29 @@ export var generateStudyGuide = async function(
   results.sort(function(a, b) { return a.index - b.index; });
   var allGuides = results.filter(function(r) { return r.text.length > 0; }).map(function(r) { return r.text; });
   
+  // If chunking produced no useful output, try a combined fallback request
+  if (allGuides.length === 0) {
+    console.warn('Study guide: chunking returned no content, attempting fallback combined request');
+    try {
+      const fallbackResponse = await callApi('studyGuide', { content: content.substring(0, Config.MAX_CONTENT_LENGTH) });
+      const fallbackText = fallbackResponse.guide || fallbackResponse.summary || (typeof fallbackResponse.studyGuide === 'string' ? fallbackResponse.studyGuide : JSON.stringify(fallbackResponse.studyGuide)) || '';
+      if (fallbackText && fallbackText.length > 20) {
+        return { structured: fallbackResponse.studyGuide || null, text: fallbackText };
+      }
+      // As a last attempt, call combine flag to force aggregation on server
+      const finalAttempt = await callApi('studyGuide', { content: content.substring(0, Config.MAX_CONTENT_LENGTH), isCombine: true });
+      const finalText = finalAttempt.guide || finalAttempt.summary || (typeof finalAttempt.studyGuide === 'string' ? finalAttempt.studyGuide : JSON.stringify(finalAttempt.studyGuide)) || '';
+      if (finalText && finalText.length > 20) {
+        return { structured: finalAttempt.studyGuide || null, text: finalText };
+      }
+    } catch (err) {
+      console.error('Study guide fallback failed:', errorToString(err));
+    }
+
+    // Last resort: return helpful message
+    return { structured: null, text: 'Unable to generate study guide for this document. Try reducing document size or re-uploading.' };
+  }
+
   return { structured: null, text: allGuides.join('\n\n---\n\n') };
 };
 
@@ -601,17 +824,403 @@ export var generateVideoScript = async function(
 };
 
 // Chat with document context
+const normalizeSseText = (raw: any): string => {
+  const s = typeof raw === 'string' ? raw : raw == null ? '' : String(raw);
+  if (!s) return '';
+  if (!s.includes('data:')) return s;
+
+  const out: string[] = [];
+  const lines = s.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const payload = trimmed.replace(/^data:\s*/, '');
+    if (!payload || payload === '[DONE]') continue;
+    try {
+      const obj = JSON.parse(payload);
+      const t = typeof obj?.text === 'string' ? obj.text : '';
+      if (t) out.push(t);
+    } catch {
+      out.push(payload);
+    }
+  }
+
+  return out.length > 0 ? out.join('') : s;
+};
+
 export var chat = async function(
   message: string,
   context?: string,
-  history?: { role: string; content: string }[]
+  history?: { role: string; content: string }[],
+  agentId?: string
 ): Promise<string> {
   var response = await callApi('chat', {
-    message: message,
-    context: (context || '').substring(0, Config.MAX_CONTENT_LENGTH),
+    question: message,
+    content: (context || '').substring(0, Config.MAX_CONTENT_LENGTH),
     history: history?.slice(-10), // Keep last 10 messages for context
+    agentId: agentId,
   });
-  return response.response || response.message || '';
+
+  if (typeof response === 'string') return normalizeSseText(response);
+  const text = response?.response ?? response?.message ?? '';
+  return normalizeSseText(text);
+};
+
+// Chat Mind (no document context) - separate backend action for isolation
+export var chatMind = async function(
+  message: string,
+  history?: { role: string; content: string }[],
+  agentId?: string,
+  options?: { mode?: 'general' | 'study' | 'work' | 'health'; memoryEnabled?: boolean }
+): Promise<string> {
+  const guestId = await getGuestId();
+  var response = await callApi('chatMind', {
+    question: message,
+    history: history?.slice(-10),
+    agentId: agentId,
+    guestId,
+    chatMindMode: options?.mode,
+    memory: {
+      enabled: Boolean(options?.memoryEnabled),
+    },
+  });
+
+  if (typeof response === 'string') return normalizeSseText(response);
+  const text = response?.response ?? response?.message ?? '';
+  return normalizeSseText(text);
+};
+
+// Document chat - separate backend action for isolation
+export var docChat = async function(
+  message: string,
+  context?: string,
+  history?: { role: string; content: string }[],
+  agentId?: string
+): Promise<string> {
+  var response = await callApi('docChat', {
+    question: message,
+    content: (context || '').substring(0, Config.MAX_CONTENT_LENGTH),
+    history: history?.slice(-10),
+    agentId: agentId,
+  });
+
+  if (typeof response === 'string') return normalizeSseText(response);
+  const text = response?.response ?? response?.message ?? '';
+  return normalizeSseText(text);
+};
+
+async function buildAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    apikey: Config.SUPABASE_ANON_KEY,
+    Authorization: 'Bearer ' + Config.SUPABASE_ANON_KEY,
+  };
+
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data?.session?.access_token;
+    if (token) {
+      headers.Authorization = 'Bearer ' + token;
+    }
+  } catch {
+    // Best-effort; fall back to anon.
+  }
+
+  return headers;
+}
+
+async function getGuestId(): Promise<string> {
+  const key = 'guestId';
+  try {
+    const existing = await AsyncStorage.getItem(key);
+    if (existing && existing.trim()) return existing;
+    const created = `guest_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    await AsyncStorage.setItem(key, created);
+    return created;
+  } catch {
+    return `guest_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+export var chatStream = async function(
+  message: string,
+  context: string | undefined,
+  history: { role: string; content: string }[] | undefined,
+  agentId: string | undefined,
+  onDelta: (deltaText: string) => void,
+  onDone?: () => void,
+  onError?: (err: any) => void
+): Promise<void> {
+  return chatStreamWithAction(
+    'chatStream',
+    {
+      question: message,
+      content: (context || '').substring(0, Config.MAX_CONTENT_LENGTH),
+      history: history?.slice(-10),
+      agentId: agentId,
+    },
+    onDelta,
+    onDone,
+    onError
+  );
+};
+
+async function chatStreamWithAction(
+  action: string,
+  body: any,
+  onDelta: (deltaText: string) => void,
+  onDone?: () => void,
+  onError?: (err: any) => void
+): Promise<void> {
+  // Streaming endpoints are backed by openai-proxy which requires a user JWT.
+  if (action !== 'test') {
+    const token = await getSessionAccessToken();
+    if (!token) {
+      const err: any = new Error('Please sign in to use AI chat.');
+      err.status = 401;
+      throw err;
+    }
+  }
+
+  const headers = await buildAuthHeaders();
+  const res = await fetch(Config.OPENAI_PROXY_URL, {
+    method: 'POST',
+    headers: {
+      ...headers,
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify({
+      action,
+      ...body,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    const err: any = new Error(text || `chatStream failed (HTTP ${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+
+  // Some runtimes (notably Expo Go) may not expose a streaming body.
+  // In that case, parse the full SSE payload as text and emit deltas.
+  if (!res.body) {
+    const text = await res.text().catch(() => '');
+    if (!text) {
+      onDone?.();
+      return;
+    }
+
+    let buffer = text;
+    while (true) {
+      const idxLF = buffer.indexOf('\n\n');
+      const idxCRLF = buffer.indexOf('\r\n\r\n');
+      const hasLF = idxLF !== -1;
+      const hasCRLF = idxCRLF !== -1;
+      if (!hasLF && !hasCRLF) break;
+
+      const idx = hasLF && hasCRLF ? Math.min(idxLF, idxCRLF) : (hasLF ? idxLF : idxCRLF);
+      const sepLen = idx === idxCRLF ? 4 : 2;
+
+      const frame = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + sepLen);
+
+      const lines = frame.split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.replace(/^data:\s*/, '');
+        if (!payload) continue;
+        if (payload === '[DONE]') {
+          onDone?.();
+          return;
+        }
+        try {
+          const obj = JSON.parse(payload);
+          const delta = String(obj?.text || '');
+          if (delta) onDelta(delta);
+        } catch {
+          onDelta(payload);
+        }
+      }
+    }
+
+    onDone?.();
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Parse SSE frames separated by blank line.
+      while (true) {
+        const idxLF = buffer.indexOf('\n\n');
+        const idxCRLF = buffer.indexOf('\r\n\r\n');
+        const hasLF = idxLF !== -1;
+        const hasCRLF = idxCRLF !== -1;
+        if (!hasLF && !hasCRLF) break;
+
+        const idx = hasLF && hasCRLF ? Math.min(idxLF, idxCRLF) : (hasLF ? idxLF : idxCRLF);
+        const sepLen = idx === idxCRLF ? 4 : 2;
+
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + sepLen);
+
+        const lines = frame.split(/\r?\n/);
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.replace(/^data:\s*/, '');
+          if (!payload) continue;
+
+          if (payload === '[DONE]') {
+            onDone?.();
+            return;
+          }
+
+          try {
+            const obj = JSON.parse(payload);
+            const delta = String(obj?.text || '');
+            if (delta) onDelta(delta);
+          } catch {
+            // If backend ever sends raw text.
+            onDelta(payload);
+          }
+        }
+      }
+    }
+
+    onDone?.();
+  } catch (e: any) {
+    onError?.(e);
+    throw e;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // ignore
+    }
+  }
+};
+
+// Chat Mind streaming - separate backend action for isolation
+export var chatMindStream = async function(
+  message: string,
+  _context: string | undefined,
+  history: { role: string; content: string }[] | undefined,
+  agentId: string | undefined,
+  onDelta: (deltaText: string) => void,
+  onDone?: () => void,
+  onError?: (err: any) => void,
+  options?: { mode?: 'general' | 'study' | 'work' | 'health'; memoryEnabled?: boolean }
+): Promise<void> {
+  const guestId = await getGuestId();
+  return chatStreamWithAction(
+    'chatMindStream',
+    {
+      question: message,
+      history: history?.slice(-10),
+      agentId: agentId,
+      guestId,
+      chatMindMode: options?.mode,
+      memory: {
+        enabled: Boolean(options?.memoryEnabled),
+      },
+    },
+    onDelta,
+    onDone,
+    onError
+  );
+};
+
+export var chatMindMemoryClear = async function(): Promise<void> {
+  await callApi('chatMindMemory', { op: 'clear' });
+};
+
+// Doc chat streaming - separate backend action for isolation
+export var docChatStream = async function(
+  message: string,
+  context: string | undefined,
+  history: { role: string; content: string }[] | undefined,
+  agentId: string | undefined,
+  onDelta: (deltaText: string) => void,
+  onDone?: () => void,
+  onError?: (err: any) => void
+): Promise<void> {
+  return chatStreamWithAction(
+    'docChatStream',
+    {
+      question: message,
+      content: (context || '').substring(0, Config.MAX_CONTENT_LENGTH),
+      history: history?.slice(-10),
+      agentId: agentId,
+    },
+    onDelta,
+    onDone,
+    onError
+  );
+};
+
+export var exportFile = async function(params: {
+  kind: 'notes' | 'study_guide' | 'flashcards_csv' | 'quiz_json' | 'report';
+  message?: string;
+  context?: string;
+  history?: { role: string; content: string }[];
+  agentId?: string;
+}): Promise<{ url: string; filename: string; mimeType: string }> {
+  var response = await callApi('exportFile', {
+    kind: params.kind,
+    message: params.message,
+    content: (params.context || '').substring(0, Config.MAX_CONTENT_LENGTH),
+    history: params.history?.slice(-10),
+    agentId: params.agentId,
+  });
+
+  if (!response?.url) throw new Error('Export failed: missing download url');
+  return {
+    url: String(response.url),
+    filename: String(response.filename || 'export.txt'),
+    mimeType: String(response.mimeType || 'text/plain'),
+  };
+};
+
+// Fetch available chat agents (personas) from the backend
+export var listAgents = async function(): Promise<{ id: string; name: string; description?: string }[]> {
+  var response = await callApi('listAgents', {});
+  return Array.isArray(response.agents) ? response.agents : [];
+};
+
+// Generate an image for a paged summary module (returns a data URL)
+export var generateModuleImage = async function(
+  title: string,
+  bullets: string[],
+  language?: 'en' | 'ar'
+): Promise<string> {
+  var response = await callApi('generateModuleImage', {
+    title: title,
+    bullets: Array.isArray(bullets) ? bullets.slice(0, 8) : [],
+    language: language || 'en',
+  });
+  return response.imageDataUrl || '';
+};
+
+// Generate a general image from a prompt (returns a data URL)
+export var generateImage = async function(
+  prompt: string,
+  options?: { imageMode?: 'default' | 'realism' | 'premium' }
+): Promise<string> {
+  var response = await callApi('generateImage', {
+    prompt: String(prompt || '').slice(0, 1200),
+    image_mode: options?.imageMode,
+  });
+  return response.imageDataUrl || '';
 };
 
 // YouTube video search - finds educational videos based on document topic
@@ -675,10 +1284,22 @@ export var getYoutubeSubtitles = async function(
 export default {
   callApi,
   summarize,
+  summarizeModule,
   generateQuiz,
+  generateStudyPlan,
   generateStudyGuide,
   generateVideoScript,
   chat,
+  chatMind,
+  docChat,
+  chatStream,
+  chatMindStream,
+  chatMindMemoryClear,
+  docChatStream,
+  listAgents,
+  generateModuleImage,
+  generateImage,
+  exportFile,
   searchYoutubeVideos,
   getYoutubeSubtitles,
 };

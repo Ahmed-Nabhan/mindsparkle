@@ -72,9 +72,9 @@ import { callApi } from './apiService';
 import { supabase } from './supabase';
 import Config from './config';
 import * as CloudStorage from './cloudStorageService';
-import * as PdfService from './pdfService';
 import { parseDocument } from './documentParser';
 import { generateId } from '../utils/helpers';
+import * as FileSystem from 'expo-file-system';
 import {
   createDocumentIntelligence,
   DocumentIntelligence,
@@ -192,6 +192,7 @@ export interface UploadResult {
     fileSize: number;
     storagePath?: string;
     extractedText: string;
+    extractedData?: ExtractedData;
     vendor?: VendorDetectionResult;
   };
   aiProcessingQueued: boolean;
@@ -420,6 +421,7 @@ export function getRecommendedModel(
  * @param fileSize - Size in bytes
  * @param userId - User ID from auth
  * @param onProgress - Progress callback (0-100)
+ * @param isPro - Whether user has Pro subscription (for premium OCR)
  * @returns UploadResult with document metadata and AI processing status
  */
 export async function uploadDocument(
@@ -428,20 +430,45 @@ export async function uploadDocument(
   fileType: string,
   fileSize: number,
   userId: string,
-  onProgress?: (progress: number, message: string) => void
+  onProgress?: (progress: number, message: string) => void,
+  isPro: boolean = false,
+  abortSignal?: AbortSignal
 ): Promise<UploadResult> {
   const documentId = generateId();
+
+  // Some iOS providers return `size` as 0/undefined from DocumentPicker.
+  // Resolve the actual on-disk size from the URI so cloud quota + processing heuristics are correct.
+  let resolvedFileSize = Number(fileSize) || 0;
+  try {
+    if (resolvedFileSize <= 0 && fileUri) {
+      const info = await FileSystem.getInfoAsync(fileUri, { size: true });
+      const candidate = Number((info as any)?.size) || 0;
+      if (candidate > 0) resolvedFileSize = candidate;
+    }
+  } catch (e: any) {
+    console.warn('[DocIntelligenceService] Could not resolve file size from URI:', e?.message || e);
+  }
+
+  console.log(`[DocIntelligenceService] Starting upload: ${fileName} (${(resolvedFileSize / 1024 / 1024).toFixed(1)}MB)`);
   
-  console.log(`[DocIntelligenceService] Starting upload: ${fileName} (${(fileSize / 1024 / 1024).toFixed(1)}MB)`);
-  
+  const throwIfAborted = () => {
+    if (abortSignal?.aborted) {
+      const err: any = new Error('Upload cancelled');
+      err.name = 'AbortError';
+      throw err;
+    }
+  };
+
   const updateProgress = (progress: number, message: string) => {
+    if (abortSignal?.aborted) return;
     updateStatus({ progress, message });
     onProgress?.(progress, message);
   };
 
   try {
+    throwIfAborted();
     // ========================================
-    // STEP 1: DETERMINE PROCESSING STRATEGY
+    // STEP 1: FILE TYPE DETECTION
     // ========================================
     updateProgress(5, 'Analyzing file...');
     
@@ -452,32 +479,35 @@ export async function uploadDocument(
                    fileNameLower.endsWith('.pptx') || fileNameLower.endsWith('.ppt');
     const isDocx = fileTypeLower.includes('word') || fileTypeLower.includes('document') ||
                    fileNameLower.endsWith('.docx') || fileNameLower.endsWith('.doc');
+    const isTxt = fileTypeLower.includes('text/plain') || fileNameLower.endsWith('.txt');
     
-    const useCloudProcessing = CloudStorage.shouldUseCloudProcessing(fileSize);
-    
-    console.log(`[DocIntelligenceService] File type: isPdf=${isPdf}, isPptx=${isPptx}, isDocx=${isDocx}, useCloud=${useCloudProcessing}`);
+    console.log(`[DocIntelligenceService] File type: isPdf=${isPdf}, isPptx=${isPptx}, isDocx=${isDocx}, isTxt=${isTxt}`);
     
     let extractedText = '';
     let storagePath: string | undefined;
     let extractedData: ExtractedData | undefined;
     
     // ========================================
-    // STEP 2: UPLOAD TO CLOUD STORAGE (if large file)
+    // STEP 2: ALWAYS UPLOAD TO CLOUD
+    // (No local parsing - Cloud Document Intelligence handles everything)
     // ========================================
-    if (useCloudProcessing) {
-      updateProgress(10, 'Uploading to cloud storage...');
-      
-      const cloudResult = await CloudStorage.uploadLargeFile(
+    updateProgress(10, 'Uploading to cloud...');
+
+    throwIfAborted();
+    
+    const cloudResult = await CloudStorage.uploadLargeFile(
         userId,
         documentId,
         fileUri,
         fileName,
         fileType,
-        fileSize,
+        resolvedFileSize,
         (progress, message) => {
           const scaledProgress = 10 + (progress * 0.4); // 10-50%
           updateProgress(scaledProgress, message);
-        }
+        },
+        isPro, // Pass Pro status for premium Adobe OCR
+        abortSignal
       );
       
       if (!cloudResult.success) {
@@ -485,123 +515,64 @@ export async function uploadDocument(
       }
       
       storagePath = cloudResult.storagePath;
-      updateProgress(55, 'Waiting for text extraction...');
       
-      // Wait for server-side extraction
-      const cloudDoc = await CloudStorage.waitForProcessing(
-        cloudResult.cloudDocumentId!,
-        90000, // 90 second timeout
-        1500   // Poll every 1.5 seconds
-      );
-      
-      if (!cloudDoc || cloudDoc.status === 'error' || !cloudDoc.extractedText) {
-        console.warn('[DocIntelligenceService] Cloud extraction failed, falling back to local processing...');
-        updateProgress(60, 'Cloud extraction unavailable, trying local...');
+      // Prefer extraction returned from uploadLargeFile to avoid re-fetch/poll issues (RLS / eventual consistency)
+      if (cloudResult.cloudDocumentId) {
+        throwIfAborted();
+        if (cloudResult.extractedText && cloudResult.extractedText.length > 10) {
+          console.log(`[DocIntelligenceService] Using extracted text from upload result (${cloudResult.extractedText.length} chars)`);
+          extractedText = cloudResult.extractedText;
+          // If page-aware extraction is available, keep it (enables deterministic completeness)
+          if (cloudResult.extractedData && cloudResult.extractedData.totalPages) {
+            extractedData = cloudResult.extractedData;
+          }
+        } else {
+        // First, check immediately without waiting
+        let cloudDoc = await CloudStorage.getCloudDocument(cloudResult.cloudDocumentId);
         
-        // For large PDFs (>25MB), try Google Docs OCR directly from client
-        const fileSizeMB = fileSize / (1024 * 1024);
-        if (isPdf && fileSizeMB > 25) {
-          console.log(`[DocIntelligenceService] Large PDF (${fileSizeMB.toFixed(1)}MB), trying Google Docs OCR...`);
-          updateProgress(62, 'Large file - using Google Docs OCR...');
-          try {
-            const { processWithGoogleDocsOCR } = await import('./googleDocsOCR');
-            extractedText = await processWithGoogleDocsOCR(fileUri, fileSize, (progress) => {
-              const scaledProgress = 62 + (progress * 0.18); // 62-80%
-              updateProgress(scaledProgress, 'Google Docs OCR processing...');
-            });
-            console.log(`[DocIntelligenceService] Google Docs OCR extracted: ${extractedText?.length || 0} chars`);
-          } catch (gDocsError: any) {
-            console.error('[DocIntelligenceService] Google Docs OCR failed:', gDocsError.message);
-            // Continue to local fallback
+        // If status is already 'ready', use it immediately
+        if (cloudDoc && (cloudDoc.status === 'ready' || cloudDoc.status === 'completed') && cloudDoc.extractedText) {
+          console.log(`[DocIntelligenceService] Document already extracted (${cloudDoc.extractedText.length} chars)`);
+          extractedText = cloudDoc.extractedText;
+        } else {
+          // Otherwise wait for processing
+          // Large PDFs can take much longer than 3 minutes to extract.
+          // If we time out, do NOT fail the upload—save the document and let extraction complete in the background.
+          const fileSizeMb = Math.max(1, Math.round((resolvedFileSize || 0) / (1024 * 1024)));
+          const maxWaitMs = Math.min(
+            30 * 60 * 1000, // cap at 30 minutes
+            Math.max(3 * 60 * 1000, fileSizeMb * 30 * 1000) // 30s per MB, min 3 minutes
+          );
+
+          updateProgress(55, `Waiting for text extraction... (up to ${Math.round(maxWaitMs / 60000)} min)`);
+          cloudDoc = await CloudStorage.waitForProcessing(
+            cloudResult.cloudDocumentId,
+            maxWaitMs,
+            3000,
+            abortSignal
+          );
+
+          if (!cloudDoc) {
+            console.warn('[DocIntelligenceService] Cloud document not found while waiting for extraction');
+            extractedText = '__CLOUD_PROCESSING__';
+          } else if (cloudDoc.status === 'error') {
+            console.error('[DocIntelligenceService] Cloud extraction failed:', cloudDoc.processingError);
+            throw new Error(cloudDoc.processingError || 'Document extraction failed. Please try uploading again or use a different file format.');
+          } else if (!cloudDoc.extractedText || cloudDoc.extractedText.length < 10) {
+            // Timed out or still processing
+            console.warn('[DocIntelligenceService] Extraction not ready yet; continuing in background');
+            extractedText = '__CLOUD_PROCESSING__';
+          } else {
+            extractedText = cloudDoc.extractedText || '';
           }
         }
-        
-        // Fall back to local PDF processing if Google Docs OCR didn't work
-        if (isPdf && (!extractedText || extractedText.length < 100)) {
-          try {
-            const processedDoc = await PdfService.processDocumentWithOcrFallback(fileUri, (progress, message) => {
-              const scaledProgress = 60 + (progress * 0.2); // 60-80%
-              updateProgress(scaledProgress, message);
-            });
-            extractedText = processedDoc.fullText;
-            console.log(`[DocIntelligenceService] Local fallback extracted: ${extractedText?.length || 0} chars`);
-          } catch (localError: any) {
-            console.error('[DocIntelligenceService] Local fallback also failed:', localError.message);
-            // Continue with empty text - will be caught by validation
-          }
         }
       } else {
-        extractedText = cloudDoc.extractedText || '';
+        throw new Error('Cloud upload did not return document ID');
       }
-      
-      extractedData = {
-        text: extractedText,
-        pages: [{ pageNumber: 1, text: extractedText, images: [], tables: [] }],
-        images: [],
-        tables: [],
-        equations: [],
-        totalPages: 1,
-      };
-      
-    } else {
-      // ========================================
-      // STEP 2B: LOCAL TEXT EXTRACTION
-      // ========================================
-      updateProgress(10, 'Extracting text...');
-      
-      if (isPdf) {
-        console.log('[DocIntelligenceService] Processing PDF locally...');
-        try {
-          const processedDoc = await PdfService.processDocumentWithOcrFallback(fileUri, (progress, message) => {
-            const scaledProgress = 10 + (progress * 0.5); // 10-60%
-            updateProgress(scaledProgress, message);
-          });
-          
-          console.log(`[DocIntelligenceService] PDF processed: ${processedDoc.pageCount} pages, ${processedDoc.fullText?.length || 0} chars`);
-          
-          extractedText = processedDoc.fullText;
-          storagePath = processedDoc.pdfUrl;
-        extractedData = {
-          text: extractedText,
-          pages: processedDoc.pages.map((p, idx) => ({
-            pageNumber: p.pageNum,
-            text: p.text,
-            images: p.imageUrl ? [{ id: `img-${idx}`, url: p.imageUrl, caption: '', pageNumber: p.pageNum, type: 'figure' as const }] : [],
-            tables: [],
-          })),
-          images: processedDoc.pages.filter(p => p.imageUrl).map((p, idx) => ({
-            id: `img-${idx}`,
-            url: p.imageUrl!,
-            caption: '',
-            pageNumber: p.pageNum,
-            type: 'figure' as const,
-          })),
-          tables: [],
-          equations: [],
-          totalPages: processedDoc.pageCount,
-        };
-        } catch (pdfError: any) {
-          console.error('[DocIntelligenceService] PDF processing error:', pdfError.message);
-          throw new Error(`PDF processing failed: ${pdfError.message}`);
-        }
-        
-      } else if (isPptx || isDocx) {
-        updateProgress(30, `Parsing ${isPptx ? 'PowerPoint' : 'Word'} document...`);
-        const parsed = await parseDocument(fileUri, fileType);
-        extractedText = parsed.content;
-        extractedData = {
-          text: extractedText,
-          pages: [{ pageNumber: 1, text: extractedText, images: [], tables: [] }],
-          images: [],
-          tables: [],
-          equations: [],
-          totalPages: 1,
-        };
-        
-      } else {
-        // Try generic parsing
-        const parsed = await parseDocument(fileUri, fileType);
-        extractedText = parsed.content;
+
+      // Ensure we always have extractedData (even if page-aware extraction isn't available)
+      if (!extractedData) {
         extractedData = {
           text: extractedText,
           pages: [{ pageNumber: 1, text: extractedText, images: [], tables: [] }],
@@ -611,12 +582,16 @@ export async function uploadDocument(
           totalPages: 1,
         };
       }
-    }
     
     console.log(`[DocIntelligenceService] Extracted text length: ${extractedText?.length || 0} chars`);
     
     if (!extractedText || extractedText.length < 10) {
       throw new Error('Could not extract text from document. The file may be empty, scanned, or password protected.');
+    }
+
+    if (extractedText.includes('__CLOUD_PROCESSING__')) {
+      // Allow upload to succeed; extraction will complete later.
+      updateProgress(65, 'Extraction still processing in background. You can open the document later to generate summaries once ready.');
     }
     
     // Warn if text is very short but continue
@@ -628,6 +603,8 @@ export async function uploadDocument(
     // STEP 3: DETECT VENDOR & ANALYZE
     // ========================================
     updateProgress(65, 'Analyzing content...');
+
+    throwIfAborted();
     
     const vendor = vendorDetector.detect(extractedText, fileName);
     const analysis = getDocumentIntelligence().analyze(extractedText, fileName);
@@ -638,6 +615,8 @@ export async function uploadDocument(
     // STEP 4: INSERT METADATA INTO SUPABASE (Optional - may fail if table doesn't exist)
     // ========================================
     updateProgress(75, 'Saving document...');
+
+    throwIfAborted();
     
     let insertedDoc: any = null;
     
@@ -645,28 +624,69 @@ export async function uploadDocument(
     // This is optional - local storage will still work
     // NOTE: Only insert columns that exist in the database schema
     try {
-      const { data, error: insertError } = await supabase
-        .from('documents')
-        .insert({
-          id: documentId,
-          user_id: userId,
-          title: fileName.replace(/\.[^/.]+$/, ''), // Remove extension
-          content: extractedText.substring(0, 100000), // Limit for DB  
-          file_type: fileType,
-          file_size: fileSize,
-          file_uri: storagePath,
-          summary: vendor.vendorName ? `Detected: ${vendor.vendorName}` : null,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .select()
-        .single();
-      
-      if (insertError) {
-        console.warn('[DocIntelligenceService] DB insert failed (continuing with local only):', insertError.message);
+      const title = fileName.replace(/\.[^/.]+$/, ''); // Remove extension
+      const nowIso = new Date().toISOString();
+
+      // Prefer canonical backend schema (storage_path + extraction_status + optional fields)
+      const canonicalInsert: Record<string, any> = {
+        id: documentId,
+        user_id: userId,
+        title,
+        file_type: fileType,
+        file_size: resolvedFileSize,
+        storage_path: storagePath,
+        // Keep legacy field too for backwards compatibility / debugging
+        file_uri: storagePath,
+        // Keep content as a preview; canonical pipeline will populate extracted_text/pages/chunks
+        content: extractedText.substring(0, 100000),
+        summary: vendor.vendorName ? `Detected: ${vendor.vendorName}` : null,
+        extraction_status: 'pending',
+        has_text: false,
+        created_at: nowIso,
+        updated_at: nowIso,
+      };
+
+      const legacyInsert: Record<string, any> = {
+        id: documentId,
+        user_id: userId,
+        title,
+        content: extractedText.substring(0, 100000), // Limit for DB
+        file_type: fileType,
+        file_size: resolvedFileSize,
+        file_uri: storagePath,
+        summary: vendor.vendorName ? `Detected: ${vendor.vendorName}` : null,
+        created_at: nowIso,
+        updated_at: nowIso,
+      };
+
+      let insertResult = await supabase.from('documents').insert(canonicalInsert).select().single();
+
+      if (insertResult.error) {
+        // Fall back to legacy schema if canonical columns don't exist.
+        console.warn('[DocIntelligenceService] Canonical DB insert failed (trying legacy):', insertResult.error.message);
+        insertResult = await supabase.from('documents').insert(legacyInsert).select().single();
+      }
+
+      if (insertResult.error) {
+        console.warn('[DocIntelligenceService] DB insert failed (continuing with local only):', insertResult.error.message);
       } else {
-        insertedDoc = data;
+        insertedDoc = insertResult.data;
         console.log('[DocIntelligenceService] Document saved to cloud:', documentId);
+
+        // Trigger server-side extraction (fire-and-forget). This populates document_pages/chunks
+        // which Deep Explain relies on for grounding + coverage.
+        supabase.functions
+          .invoke('extract-text', {
+            body: { documentId },
+          })
+          .then(({ error }) => {
+            if (error) {
+              console.warn('[DocIntelligenceService] Failed to enqueue extract_text job:', error.message);
+            }
+          })
+          .catch((err) => {
+            console.warn('[DocIntelligenceService] Failed to enqueue extract_text job:', err?.message || String(err));
+          });
       }
     } catch (dbError: any) {
       console.warn('[DocIntelligenceService] DB operation failed (continuing with local only):', dbError.message);
@@ -688,12 +708,11 @@ export async function uploadDocument(
     // ========================================
     // STEP 5: QUEUE AI PIPELINE (Background)
     // ========================================
-    updateProgress(90, 'Queuing AI processing...');
+    updateProgress(90, 'Finalizing...');
     
-    // Fire-and-forget AI processing - pass insertedDoc to determine if cloud storage should be used
-    queueAIProcessing(documentId, extractedText, userId, !!insertedDoc).catch(err => {
-      console.error('[DocIntelligenceService] Background AI processing failed:', err);
-    });
+    // DISABLED: AI processing was freezing the app
+    // Users can generate summaries/quizzes on-demand from the document actions screen
+    console.log('[DocIntelligenceService] AI processing disabled - use on-demand generation');
     
     updateProgress(100, 'Upload complete!');
     
@@ -710,6 +729,7 @@ export async function uploadDocument(
         fileSize,
         storagePath,
         extractedText,
+        extractedData,
         vendor,
       },
       aiProcessingQueued: true,
@@ -757,6 +777,12 @@ async function queueAIProcessing(
   saveToCloud: boolean = false
 ): Promise<void> {
   console.log(`[DocIntelligenceService] Queuing AI processing for: ${documentId}`);
+  
+  // Check if content is valid (not a placeholder or too short)
+  if (!content || content.length < 100 || content.includes('__CLOUD_PROCESSING__')) {
+    console.log(`[DocIntelligenceService] Skipping AI processing - content invalid or pending cloud extraction`);
+    return;
+  }
   
   // Small delay to let upload complete
   await new Promise(resolve => setTimeout(resolve, 500));

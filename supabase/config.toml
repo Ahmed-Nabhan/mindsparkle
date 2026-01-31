@@ -145,9 +145,13 @@ max_indexes = 5
 enabled = true
 # The base URL of your website. Used as an allow-list for redirects and for constructing URLs used
 # in emails.
-site_url = "http://127.0.0.1:3000"
+site_url = "https://ahmed-nabhan.github.io/mindsparkle"
 # A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
-additional_redirect_urls = ["https://127.0.0.1:3000"]
+additional_redirect_urls = [
+	"https://ahmed-nabhan.github.io/mindsparkle",
+	"mindsparkle://auth/callback",
+	"mindsparkle://auth/callback/"
+]
 # How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 (1 week).
 jwt_expiry = 3600
 # JWT issuer URL. If not set, defaults to the local API URL (http://127.0.0.1:<port>/auth/v1).
@@ -359,8 +363,15 @@ inspector_port = 8083
 # The Deno major version to use.
 deno_version = 2
 
-# [edge_runtime.secrets]
-# secret_key = "env(SECRET_VALUE)"
+[edge_runtime.secrets]
+OPENAI_API_KEY = "env(OPENAI_API_KEY)"
+MIDJOURNEY_API_KEY = "env(MIDJOURNEY_API_KEY)"
+MIDJOURNEY_API_URL = "env(MIDJOURNEY_API_URL)"
+STABILITY_API_KEY = "env(STABILITY_API_KEY)"
+STABILITY_IMAGE_MODEL = "env(STABILITY_IMAGE_MODEL)"
+STABILITY_API_URL = "env(STABILITY_API_URL)"
+IMAGE_PROVIDER_ORDER = "env(IMAGE_PROVIDER_ORDER)"
+FREE_CHATMIND_DAILY_LIMIT_GUEST = "env(FREE_CHATMIND_DAILY_LIMIT_GUEST)"
 
 [analytics]
 enabled = true

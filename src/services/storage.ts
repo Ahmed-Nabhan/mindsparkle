@@ -4,11 +4,11 @@ import { TestResult } from '../types/performance';
 import { Folder } from '../types/folder';
 
 const dbPromise = SQLite.openDatabaseAsync('mindsparkle.db');
-const getDb = async () => dbPromise;
+let schemaInitPromise: Promise<void> | null = null;
 
-export const initDatabase = async (): Promise<void> => {
+const initializeSchema = async (): Promise<void> => {
+  const db = await dbPromise;
   try {
-    const db = await getDb();
     await db.execAsync(`
       CREATE TABLE IF NOT EXISTS documents (
         id TEXT PRIMARY KEY,
@@ -20,6 +20,8 @@ export const initDatabase = async (): Promise<void> => {
         uploadedAt TEXT NOT NULL,
         content TEXT,
         summary TEXT,
+        summaryModulesJson TEXT,
+        summaryPagedJson TEXT,
         userId TEXT,
         pdfCloudUrl TEXT,
         extractedDataJson TEXT
@@ -34,6 +36,18 @@ export const initDatabase = async (): Promise<void> => {
 
     try {
       await db.execAsync('ALTER TABLE documents ADD COLUMN extractedDataJson TEXT;');
+    } catch (error) {
+      // Column already exists
+    }
+
+    try {
+      await db.execAsync('ALTER TABLE documents ADD COLUMN summaryModulesJson TEXT;');
+    } catch (error) {
+      // Column already exists
+    }
+
+    try {
+      await db.execAsync('ALTER TABLE documents ADD COLUMN summaryPagedJson TEXT;');
     } catch (error) {
       // Column already exists
     }
@@ -68,13 +82,76 @@ export const initDatabase = async (): Promise<void> => {
   }
 };
 
+const getDb = async () => {
+  if (!schemaInitPromise) {
+    schemaInitPromise = initializeSchema();
+  }
+  await schemaInitPromise;
+  return await dbPromise;
+};
+
+export const initDatabase = async (): Promise<void> => {
+  await getDb();
+};
+
 export const saveDocument = async (document: Document): Promise<void> => {
   try {
     const db = await getDb();
-    const extractedDataJson = document.extractedData ? JSON.stringify(document.extractedData) : '';
+    // extractedData can be extremely large (full per-page text). Keep local storage lightweight
+    // to avoid slow DB reads and JSON parsing during navigation.
+    let extractedDataJson = '';
+    if (document.extractedData) {
+      const MAX_EXTRACTED_TEXT = 200_000;
+      const MAX_PAGE_TEXT = 5_000;
+      const MAX_PAGES_TEXT_TOTAL = 250_000;
+      const MAX_IMAGES = 50;
+      const MAX_TABLES = 50;
+      const MAX_EQUATIONS = 200;
+
+      let totalPageChars = 0;
+      const safePages = Array.isArray(document.extractedData.pages)
+        ? document.extractedData.pages
+            .map(p => ({
+              pageNumber: p.pageNumber,
+              text: String(p.text || '').slice(0, MAX_PAGE_TEXT),
+              images: Array.isArray(p.images) ? p.images.slice(0, 10) : [],
+              tables: Array.isArray(p.tables) ? p.tables.slice(0, 5) : [],
+            }))
+            .filter(p => {
+              if (!p.text) return false;
+              if (totalPageChars >= MAX_PAGES_TEXT_TOTAL) return false;
+              totalPageChars += p.text.length;
+              return true;
+            })
+        : [];
+
+      const safeExtractedData: ExtractedData = {
+        ...document.extractedData,
+        text: String(document.extractedData.text || '').slice(0, MAX_EXTRACTED_TEXT),
+        pages: safePages as any,
+        images: Array.isArray(document.extractedData.images) ? document.extractedData.images.slice(0, MAX_IMAGES) : [],
+        tables: Array.isArray(document.extractedData.tables) ? document.extractedData.tables.slice(0, MAX_TABLES) : [],
+        equations: Array.isArray(document.extractedData.equations) ? document.extractedData.equations.slice(0, MAX_EQUATIONS) : [],
+      };
+
+      try {
+        extractedDataJson = JSON.stringify(safeExtractedData);
+        // Hard cap to protect SQLite and navigation performance.
+        const MAX_EXTRACTED_JSON = 900_000;
+        if (extractedDataJson.length > MAX_EXTRACTED_JSON) {
+          console.warn(`extractedDataJson too large (${extractedDataJson.length} chars). Dropping for local storage.`);
+          extractedDataJson = '';
+        }
+      } catch {
+        extractedDataJson = '';
+      }
+    }
+    const summaryModulesJson = document.summaryModules ? JSON.stringify(document.summaryModules) : '';
+    const summaryPagedJson = document.summaryPaged ? JSON.stringify(document.summaryPaged) : '';
 
     let contentToSave = document.content || '';
-    const MAX_LOCAL_CONTENT = 200000; // ~200k chars to avoid memory pressure
+    // Allow larger documents to be usable offline; the app should still chunk for AI calls.
+    const MAX_LOCAL_CONTENT = 2 * 1024 * 1024; // ~2MB chars
     if (contentToSave.length > MAX_LOCAL_CONTENT) {
       console.warn(`Document content too large (${contentToSave.length} chars). Truncating for local storage.`);
       contentToSave = `${contentToSave.substring(0, MAX_LOCAL_CONTENT)}... [TRUNCATED]`;
@@ -82,8 +159,8 @@ export const saveDocument = async (document: Document): Promise<void> => {
 
     // Use INSERT OR REPLACE to handle re-sync of existing documents
     await db.runAsync(
-      `INSERT OR REPLACE INTO documents (id, title, fileName, fileUri, fileType, fileSize, uploadedAt, content, summary, userId, pdfCloudUrl, extractedDataJson)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+      `INSERT OR REPLACE INTO documents (id, title, fileName, fileUri, fileType, fileSize, uploadedAt, content, summary, summaryModulesJson, summaryPagedJson, userId, pdfCloudUrl, extractedDataJson)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
       [
         document.id,
         document.title,
@@ -94,6 +171,8 @@ export const saveDocument = async (document: Document): Promise<void> => {
         document.uploadedAt.toISOString(),
         contentToSave,
         document.summary || '',
+        summaryModulesJson,
+        summaryPagedJson,
         document.userId || '',
         document.pdfCloudUrl || '',
         extractedDataJson,
@@ -133,10 +212,35 @@ export const updateDocumentSummary = async (documentId: string, summary: string)
   }
 };
 
+export const updateDocumentSummaryModules = async (documentId: string, summaryModules: any[]): Promise<void> => {
+  try {
+    const db = await getDb();
+    const json = summaryModules ? JSON.stringify(summaryModules) : '';
+    await db.runAsync('UPDATE documents SET summaryModulesJson = ? WHERE id = ?;', [json, documentId]);
+  } catch (error) {
+    console.error('Error updating summary modules:', error);
+    throw error;
+  }
+};
+
+export const updateDocumentSummaryPaged = async (documentId: string, summaryPaged: any): Promise<void> => {
+  try {
+    const db = await getDb();
+    const json = summaryPaged ? JSON.stringify(summaryPaged) : '';
+    await db.runAsync('UPDATE documents SET summaryPagedJson = ? WHERE id = ?;', [json, documentId]);
+  } catch (error) {
+    console.error('Error updating paged summary:', error);
+    throw error;
+  }
+};
+
 export const getAllDocuments = async (): Promise<Document[]> => {
   try {
     const db = await getDb();
-    const rows = await db.getAllAsync<any>('SELECT * FROM documents ORDER BY uploadedAt DESC;');
+    // Avoid loading large fields (content/extractedData/summary JSON) in lists.
+    const rows = await db.getAllAsync<any>(
+      'SELECT id, title, fileName, fileUri, fileType, fileSize, uploadedAt, summary, userId, pdfCloudUrl FROM documents ORDER BY uploadedAt DESC;'
+    );
     return rows.map(row => ({
       ...row,
       uploadedAt: new Date(row.uploadedAt),
@@ -157,10 +261,39 @@ export const getDocumentById = async (id: string): Promise<Document | null> => {
 
     let extractedData: ExtractedData | undefined;
     if (row.extractedDataJson) {
+      // Guard: old rows may contain huge extractedDataJson which can freeze UI on parse.
+      const MAX_PARSE_JSON = 900_000;
+      if (String(row.extractedDataJson).length <= MAX_PARSE_JSON) {
+        try {
+          extractedData = JSON.parse(row.extractedDataJson);
+        } catch (error) {
+          console.log('Error parsing extractedDataJson:', error);
+        }
+      } else {
+        console.warn(`Skipping extractedDataJson parse (${String(row.extractedDataJson).length} chars) for performance.`);
+      }
+    }
+
+    let summaryModules: any[] | undefined;
+    if (row.summaryModulesJson) {
       try {
-        extractedData = JSON.parse(row.extractedDataJson);
+        // Keep this reasonably sized; if huge, skip parsing.
+        if (String(row.summaryModulesJson).length < 2_000_000) {
+          summaryModules = JSON.parse(row.summaryModulesJson);
+        }
       } catch (error) {
-        console.log('Error parsing extractedDataJson:', error);
+        console.log('Error parsing summaryModulesJson:', error);
+      }
+    }
+
+    let summaryPaged: any | undefined;
+    if (row.summaryPagedJson) {
+      try {
+        if (String(row.summaryPagedJson).length < 2_000_000) {
+          summaryPaged = JSON.parse(row.summaryPagedJson);
+        }
+      } catch (error) {
+        console.log('Error parsing summaryPagedJson:', error);
       }
     }
 
@@ -169,6 +302,8 @@ export const getDocumentById = async (id: string): Promise<Document | null> => {
       uploadedAt: new Date(row.uploadedAt),
       pdfCloudUrl: row.pdfCloudUrl || undefined,
       extractedData,
+      summaryModules,
+      summaryPaged,
     };
   } catch (error) {
     console.error('Error fetching document:', error);

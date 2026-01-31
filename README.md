@@ -13,6 +13,29 @@ AI-powered learning app for iOS and Android. Study large documents through AI su
 - **[PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)** - Architecture and design decisions
 - **[COMPLETION_SUMMARY.md](COMPLETION_SUMMARY.md)** - Project delivery summary
 
+## 🌐 Web
+
+This repo includes:
+
+- **Marketing site (static HTML):** served from `docs/` (entry: `docs/index.html`)
+- **Web version of the app (Expo Web):** exported to `docs/app/` (entry: `docs/app/index.html`)
+
+### Run the web app locally
+
+```bash
+npm run web
+```
+
+### Export a static web build for hosting
+
+```bash
+# Export to dist/
+npm run export:web
+
+# Export to docs/app/ (recommended if using GitHub Pages via /docs)
+npm run export:web:docs
+```
+
 ---
 
 ## 🌟 Features
