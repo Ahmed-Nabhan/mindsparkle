@@ -1,7 +1,7 @@
 /*
- * Expo web export (docs/app) is hosted under a sub-path (/app/).
+ * Expo web export (docs) is hosted at the domain root.
  * The default export currently emits absolute URLs like /_expo/... and /favicon.ico,
- * which break when the app isn't served from the domain root.
+ * which we normalize to relative paths for safer hosting.
  *
  * This script rewrites those absolute paths to relative paths so the web export works
  * when hosted at https://example.com/<something>/app/.
@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 
 const projectRoot = path.resolve(__dirname, '..');
-const webRoot = path.join(projectRoot, 'docs', 'app');
+const webRoot = path.join(projectRoot, 'docs');
 
 function replaceInFile(filePath, replacements) {
   let content = fs.readFileSync(filePath, 'utf8');
@@ -65,7 +65,7 @@ function main() {
     ]);
   }
 
-  console.log('Fixed web export paths for sub-path hosting (docs/app).');
+  console.log('Fixed web export paths for root hosting (docs).');
 }
 
 main();
