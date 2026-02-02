@@ -2,6 +2,31 @@
   "cleanUrls": true,
   "rewrites": [
     {
+      "source": "/landing",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/landing/index.html"
+    },
+    {
+      "source": "/landing/(.*)",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/landing/index.html"
+    },
+    {
+      "source": "/privacy",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/privacy.html"
+    },
+    {
+      "source": "/terms",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/terms.html"
+    },
+    {
+      "source": "/support",
+      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
+      "destination": "/support.html"
+    },
+    {
       "source": "/app/(.*)",
       "has": [{ "type": "host", "value": "mindsparkleai.com" }],
       "destination": "/app/$1"
@@ -25,6 +50,31 @@
       "source": "/(.*)",
       "has": [{ "type": "host", "value": "mindsparkleai.com" }],
       "destination": "/app/index.html"
+    },
+    {
+      "source": "/landing",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/landing/index.html"
+    },
+    {
+      "source": "/landing/(.*)",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/landing/index.html"
+    },
+    {
+      "source": "/privacy",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/privacy.html"
+    },
+    {
+      "source": "/terms",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/terms.html"
+    },
+    {
+      "source": "/support",
+      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
+      "destination": "/support.html"
     },
     {
       "source": "/app/(.*)",
