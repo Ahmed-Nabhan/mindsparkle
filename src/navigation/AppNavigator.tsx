@@ -1,4 +1,5 @@
 import React from 'react';
+import { Platform } from 'react-native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createDrawerNavigator } from '@react-navigation/drawer';
 import { Sidebar } from '../components/Sidebar';
@@ -243,6 +244,7 @@ const MainDrawer = () => {
 
 export const AppNavigator = () => {
   const { isAuthenticated, isLoading } = useAuth();
+  const isWeb = Platform.OS === 'web';
 
   // Ensure the first screen is Login when logged out.
   if (isLoading) {
@@ -254,8 +256,9 @@ export const AppNavigator = () => {
       screenOptions={{
         headerShown: false,
       }}
+      initialRouteName={isWeb ? 'Main' : 'Welcome'}
     >
-      <Stack.Screen name="Welcome" component={WelcomeScreen} />
+      {!isWeb && <Stack.Screen name="Welcome" component={WelcomeScreen} />}
       <Stack.Screen name="Main" component={MainDrawer} />
       <Stack.Screen name="Auth" component={AuthScreen} />
       <Stack.Screen name="ResetPassword" component={ResetPasswordScreen} />

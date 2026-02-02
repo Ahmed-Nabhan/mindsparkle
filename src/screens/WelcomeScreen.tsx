@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { View, StyleSheet, Image } from 'react-native';
+import { View, StyleSheet, Image, Platform } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { colors } from '../constants/colors';
 import { config } from '../constants/config';
@@ -11,6 +11,10 @@ export const WelcomeScreen: React.FC = () => {
   const navigation = useNavigation<WelcomeScreenProps['navigation']>();
 
   useEffect(() => {
+    if (Platform.OS === 'web') {
+      navigation.replace('Main');
+      return;
+    }
     const timer = setTimeout(() => {
       navigation.replace('Main');
     }, config.animation.welcomeScreenDuration);
