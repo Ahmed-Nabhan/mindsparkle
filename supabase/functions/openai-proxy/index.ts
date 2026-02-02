@@ -2228,7 +2228,7 @@ Capabilities:
   // Web sources (best-effort). If available, we will include them and require citations.
   // If enabled but unavailable, we will still add a Sources section explaining that.
   let sources: WebSource[] = [];
-  const wantsSources = shouldUseWebSearchForChat(question);
+  const wantsSources = isChatMindRequest ? false : shouldUseWebSearchForChat(question);
   if (wantsSources) {
     try {
       sources = await webSearch(question, 5);
@@ -2250,7 +2250,7 @@ Capabilities:
     ...(sources.length > 0
       ? [{ role: 'user', content: `SOURCES (use for citations):\n\n${formatSourcesForPrompt(sources)}` }]
       : []),
-    ...(Array.isArray(history) ? history.slice(-8) : []),
+    ...(Array.isArray(history) ? history.slice(isChatMindRequest ? -4 : -8) : []),
     { role: "user", content: question || "Hello" }
   ];
 
@@ -2317,7 +2317,9 @@ Capabilities:
     modelOverrides.anthropic = (Deno.env.get('ANTHROPIC_CHAT_MODEL_CREATIVE') || modelOverrides.anthropic || '').trim();
   }
 
-  const answer = await callOpenAI(messages, 900, 0.35, modelOverrides.openai || "gpt-5.2", meta, providerOrder, modelOverrides);
+  const maxTokens = isChatMindRequest ? 700 : 900;
+  const temp = isChatMindRequest ? 0.25 : 0.35;
+  const answer = await callOpenAI(messages, maxTokens, temp, modelOverrides.openai || "gpt-5.2", meta, providerOrder, modelOverrides);
 
   // Optional verify pass (best-effort) to improve accuracy for general chat.
   // Disabled by default; enable via env var to avoid doubling cost for all chats.
@@ -2827,7 +2829,7 @@ Capabilities:
         const memoryBlock = memorySummary ? `\n\nUser memory (opt-in; may be empty/partial):\n- ${memorySummary}` : '';
 
         let sources: WebSource[] = [];
-        if (shouldUseWebSearchForChat(q)) {
+        if (!isChatMindStream && shouldUseWebSearchForChat(q)) {
           try {
             sources = await webSearch(q, 5);
           } catch {
@@ -2852,7 +2854,7 @@ Citations:
           ...(sources.length > 0
             ? [{ role: 'user', content: `SOURCES (use for citations):\n\n${formatSourcesForPrompt(sources)}` }]
             : []),
-          ...(Array.isArray(history) ? history.slice(-8) : []),
+          ...(Array.isArray(history) ? history.slice(isChatMindStream ? -4 : -8) : []),
           { role: 'user', content: q },
         ];
 
@@ -2871,7 +2873,9 @@ Citations:
         }
 
         try {
-          const upstream = await callOpenAIInternalStream(messages, 900, 0.35, openAiModel);
+          const maxTokens = isChatMindStream ? 700 : 900;
+          const temp = isChatMindStream ? 0.25 : 0.35;
+          const upstream = await callOpenAIInternalStream(messages, maxTokens, temp, openAiModel);
           const encoder = new TextEncoder();
           const decoder = new TextDecoder();
 
