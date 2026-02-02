@@ -247,6 +247,10 @@ export const AppNavigator = () => {
   const isWeb = Platform.OS === 'web';
 
   // Ensure the first screen is Login when logged out.
+  if (isLoading && isWeb) {
+    return <MainDrawer />;
+  }
+
   if (isLoading) {
     return <LoadingSpinner message="Loading…" />;
   }
