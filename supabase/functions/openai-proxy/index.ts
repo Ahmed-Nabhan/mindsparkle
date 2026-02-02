@@ -476,11 +476,29 @@ async function ensembleChatMindAnswer(params: {
 }): Promise<string> {
   const { messages, meta, modelOverrides, maxTokens, temperature } = params;
 
-  const [openaiText, geminiText, anthropicText] = await Promise.all([
+  const results = await Promise.allSettled([
     callProviderOnce(messages, maxTokens, temperature, 'openai', meta, modelOverrides),
     callProviderOnce(messages, maxTokens, temperature, 'gemini', meta, modelOverrides),
     callProviderOnce(messages, maxTokens, temperature, 'anthropic', meta, modelOverrides),
   ]);
+
+  const drafts: string[] = [];
+  const labels: string[] = [];
+  const providers: LlmProvider[] = ['openai', 'gemini', 'anthropic'];
+
+  results.forEach((r, idx) => {
+    if (r.status === 'fulfilled' && String(r.value || '').trim()) {
+      drafts.push(String(r.value));
+      labels.push(providers[idx]);
+    }
+  });
+
+  if (drafts.length === 0) {
+    throw new Error('All AI providers failed to respond.');
+  }
+  if (drafts.length === 1) {
+    return drafts[0];
+  }
 
   const synthSystem = `You are an expert editor creating the best possible final answer.
 Rules:
@@ -489,7 +507,9 @@ Rules:
 - Keep it concise but information-dense.
 - Output plain text only. No markdown symbols, no links, no citations, no Sources section.`;
 
-  const synthUser = `Draft A (OpenAI):\n${openaiText}\n\nDraft B (Gemini):\n${geminiText}\n\nDraft C (Anthropic):\n${anthropicText}\n\nReturn the single best final answer.`;
+  const synthUser = drafts
+    .map((d, i) => `Draft ${i + 1} (${labels[i]}):\n${d}`)
+    .join('\n\n') + '\n\nReturn the single best final answer.';
 
   const synthMeta: LlmCallMeta | undefined = meta
     ? { ...meta, requestType: `${String(meta.requestType)}_ensemble` }
