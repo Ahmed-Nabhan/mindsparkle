@@ -411,6 +411,33 @@ export const ChatScreen: React.FC = () => {
   const clearChatMind = async () => {
     if (!isChatMind) return;
 
+    const performClear = async () => {
+      try {
+        setIsLoading(false);
+        setInputText('');
+        Keyboard.dismiss();
+
+        // Remove persisted history first so it doesn't immediately restore.
+        await AsyncStorage.removeItem(CHAT_MIND_STORAGE_KEY);
+
+        const welcomeMessage: Message = {
+          id: 'welcome',
+          role: 'assistant',
+          content: `👋 Hi! I'm your AI assistant${activeAgentName ? ` (${activeAgentName})` : ''}.\n\nAsk me anything about your study topics, exam prep, or concepts you want to learn.\n\nWhat are you working on today?`,
+          timestamp: new Date(),
+        };
+        setMessages([welcomeMessage]);
+      } catch {
+        // Even if storage fails, at least clear in-memory state.
+        setMessages([]);
+      }
+    };
+
+    if (Platform.OS === 'web') {
+      await performClear();
+      return;
+    }
+
     Alert.alert(
       'Clear chat?',
       'This will remove the current Chat Mind conversation on this device.',
@@ -419,27 +446,7 @@ export const ChatScreen: React.FC = () => {
         {
           text: 'Clear',
           style: 'destructive',
-          onPress: async () => {
-            try {
-              setIsLoading(false);
-              setInputText('');
-              Keyboard.dismiss();
-
-              // Remove persisted history first so it doesn't immediately restore.
-              await AsyncStorage.removeItem(CHAT_MIND_STORAGE_KEY);
-
-              const welcomeMessage: Message = {
-                id: 'welcome',
-                role: 'assistant',
-                content: `👋 Hi! I'm your AI assistant${activeAgentName ? ` (${activeAgentName})` : ''}.\n\nAsk me anything about your study topics, exam prep, or concepts you want to learn.\n\nWhat are you working on today?`,
-                timestamp: new Date(),
-              };
-              setMessages([welcomeMessage]);
-            } catch {
-              // Even if storage fails, at least clear in-memory state.
-              setMessages([]);
-            }
-          },
+          onPress: performClear,
         },
       ]
     );
