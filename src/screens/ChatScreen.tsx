@@ -415,10 +415,18 @@ export const ChatScreen: React.FC = () => {
       try {
         setIsLoading(false);
         setInputText('');
+        setReplyTo(null);
         Keyboard.dismiss();
 
         // Remove persisted history first so it doesn't immediately restore.
         await AsyncStorage.removeItem(CHAT_MIND_STORAGE_KEY);
+        if (Platform.OS === 'web') {
+          try {
+            window?.localStorage?.removeItem(CHAT_MIND_STORAGE_KEY);
+          } catch {
+            // ignore
+          }
+        }
 
         const welcomeMessage: Message = {
           id: 'welcome',
