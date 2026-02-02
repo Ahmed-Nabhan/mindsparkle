@@ -28,29 +28,24 @@
       "destination": "/support.html"
     },
     {
-      "source": "/app/(.*)",
-      "has": [{ "type": "host", "value": "mindsparkleai.com" }],
-      "destination": "/app/$1"
-    },
-    {
       "source": "/assets/(.*)",
       "has": [{ "type": "host", "value": "mindsparkleai.com" }],
-      "destination": "/app/assets/$1"
+      "destination": "/assets/$1"
     },
     {
       "source": "/_expo/(.*)",
       "has": [{ "type": "host", "value": "mindsparkleai.com" }],
-      "destination": "/app/_expo/$1"
+      "destination": "/_expo/$1"
     },
     {
       "source": "/favicon.ico",
       "has": [{ "type": "host", "value": "mindsparkleai.com" }],
-      "destination": "/app/favicon.ico"
+      "destination": "/favicon.ico"
     },
     {
       "source": "/(.*)",
       "has": [{ "type": "host", "value": "mindsparkleai.com" }],
-      "destination": "/app/index.html"
+      "destination": "/index.html"
     },
     {
       "source": "/landing",
@@ -78,29 +73,24 @@
       "destination": "/support.html"
     },
     {
-      "source": "/app/(.*)",
-      "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
-      "destination": "/app/$1"
-    },
-    {
       "source": "/assets/(.*)",
       "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
-      "destination": "/app/assets/$1"
+      "destination": "/assets/$1"
     },
     {
       "source": "/_expo/(.*)",
       "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
-      "destination": "/app/_expo/$1"
+      "destination": "/_expo/$1"
     },
     {
       "source": "/favicon.ico",
       "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
-      "destination": "/app/favicon.ico"
+      "destination": "/favicon.ico"
     },
     {
       "source": "/(.*)",
       "has": [{ "type": "host", "value": "www.mindsparkleai.com" }],
-      "destination": "/app/index.html"
+      "destination": "/index.html"
     },
     {
       "source": "/assets/(.*)",

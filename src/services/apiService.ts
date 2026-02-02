@@ -137,7 +137,7 @@ export var callApi = async function(action: string, data: any, retries: number =
 
   // The openai-proxy Edge Function validates the user's JWT for nearly all actions.
   // Avoid confusing "Invalid JWT" errors on fresh installs by failing fast.
-  const guestAllowedActions = new Set(['test', 'chatMind', 'listAgents', 'chatMindMemory']);
+  const guestAllowedActions = new Set(['test', 'chatMind', 'listAgents', 'chatMindMemory', 'config', 'feedback', 'retry']);
   if (!guestAllowedActions.has(action)) {
     const token = await getSessionAccessToken();
     if (!token) {
@@ -873,7 +873,7 @@ export var chatMind = async function(
   history?: { role: string; content: string }[],
   agentId?: string,
   options?: { mode?: 'general' | 'study' | 'work' | 'health'; memoryEnabled?: boolean }
-): Promise<string> {
+): Promise<{ text: string; messageId?: string }> {
   const guestId = await getGuestId();
   var response = await callApi('chatMind', {
     question: message,
@@ -886,9 +886,12 @@ export var chatMind = async function(
     },
   });
 
-  if (typeof response === 'string') return normalizeSseText(response);
+  if (typeof response === 'string') {
+    return { text: normalizeSseText(response) };
+  }
   const text = response?.response ?? response?.message ?? '';
-  return normalizeSseText(text);
+  const messageId = typeof response?.messageId === 'string' ? response.messageId : undefined;
+  return { text: normalizeSseText(text), messageId };
 };
 
 // Document chat - separate backend action for isolation
@@ -897,7 +900,7 @@ export var docChat = async function(
   context?: string,
   history?: { role: string; content: string }[],
   agentId?: string
-): Promise<string> {
+): Promise<{ text: string; messageId?: string }> {
   var response = await callApi('docChat', {
     question: message,
     content: (context || '').substring(0, Config.MAX_CONTENT_LENGTH),
@@ -905,9 +908,12 @@ export var docChat = async function(
     agentId: agentId,
   });
 
-  if (typeof response === 'string') return normalizeSseText(response);
+  if (typeof response === 'string') {
+    return { text: normalizeSseText(response) };
+  }
   const text = response?.response ?? response?.message ?? '';
-  return normalizeSseText(text);
+  const messageId = typeof response?.messageId === 'string' ? response.messageId : undefined;
+  return { text: normalizeSseText(text), messageId };
 };
 
 async function buildAuthHeaders(): Promise<Record<string, string>> {
@@ -950,7 +956,8 @@ export var chatStream = async function(
   agentId: string | undefined,
   onDelta: (deltaText: string) => void,
   onDone?: () => void,
-  onError?: (err: any) => void
+  onError?: (err: any) => void,
+  onMeta?: (meta: { messageId?: string }) => void
 ): Promise<void> {
   return chatStreamWithAction(
     'chatStream',
@@ -962,7 +969,8 @@ export var chatStream = async function(
     },
     onDelta,
     onDone,
-    onError
+    onError,
+    onMeta
   );
 };
 
@@ -971,7 +979,8 @@ async function chatStreamWithAction(
   body: any,
   onDelta: (deltaText: string) => void,
   onDone?: () => void,
-  onError?: (err: any) => void
+  onError?: (err: any) => void,
+  onMeta?: (meta: { messageId?: string }) => void
 ): Promise<void> {
   // Streaming endpoints are backed by openai-proxy. Allow guest for ChatMind.
   if (action !== 'test' && action !== 'chatMindStream') {
@@ -1039,6 +1048,8 @@ async function chatStreamWithAction(
         try {
           const obj = JSON.parse(payload);
           const delta = String(obj?.text || '');
+          const messageId = typeof obj?.messageId === 'string' ? obj.messageId : undefined;
+          if (messageId) onMeta?.({ messageId });
           if (delta) onDelta(delta);
         } catch {
           onDelta(payload);
@@ -1089,6 +1100,8 @@ async function chatStreamWithAction(
           try {
             const obj = JSON.parse(payload);
             const delta = String(obj?.text || '');
+            const messageId = typeof obj?.messageId === 'string' ? obj.messageId : undefined;
+            if (messageId) onMeta?.({ messageId });
             if (delta) onDelta(delta);
           } catch {
             // If backend ever sends raw text.
@@ -1120,7 +1133,8 @@ export var chatMindStream = async function(
   onDelta: (deltaText: string) => void,
   onDone?: () => void,
   onError?: (err: any) => void,
-  options?: { mode?: 'general' | 'study' | 'work' | 'health'; memoryEnabled?: boolean }
+  options?: { mode?: 'general' | 'study' | 'work' | 'health'; memoryEnabled?: boolean },
+  onMeta?: (meta: { messageId?: string }) => void
 ): Promise<void> {
   const guestId = await getGuestId();
   return chatStreamWithAction(
@@ -1137,7 +1151,8 @@ export var chatMindStream = async function(
     },
     onDelta,
     onDone,
-    onError
+    onError,
+    onMeta
   );
 };
 
@@ -1153,7 +1168,8 @@ export var docChatStream = async function(
   agentId: string | undefined,
   onDelta: (deltaText: string) => void,
   onDone?: () => void,
-  onError?: (err: any) => void
+  onError?: (err: any) => void,
+  onMeta?: (meta: { messageId?: string }) => void
 ): Promise<void> {
   return chatStreamWithAction(
     'docChatStream',
@@ -1165,7 +1181,8 @@ export var docChatStream = async function(
     },
     onDelta,
     onDone,
-    onError
+    onError,
+    onMeta
   );
 };
 
@@ -1282,6 +1299,27 @@ export var getYoutubeSubtitles = async function(
   }
 };
 
+export var getRemoteConfig = async function(): Promise<Record<string, { enabled: boolean; settings?: any }>> {
+  var response = await callApi('config', {});
+  if (response?.flags && typeof response.flags === 'object') return response.flags;
+  if (response && typeof response === 'object') return response;
+  return {};
+};
+
+export var sendChatFeedback = async function(messageId: string, feedbackType: 'like' | 'dislike'): Promise<void> {
+  const guestId = await getGuestId();
+  await callApi('feedback', { messageId, feedbackType, guestId });
+};
+
+export var retryChatMessage = async function(messageId: string): Promise<{ response: string; messageId?: string }> {
+  const guestId = await getGuestId();
+  var response = await callApi('retry', { messageId, guestId });
+  return {
+    response: String(response?.response || response?.text || ''),
+    messageId: typeof response?.messageId === 'string' ? response.messageId : undefined,
+  };
+};
+
 export default {
   callApi,
   summarize,
@@ -1303,4 +1341,7 @@ export default {
   exportFile,
   searchYoutubeVideos,
   getYoutubeSubtitles,
+  getRemoteConfig,
+  sendChatFeedback,
+  retryChatMessage,
 };

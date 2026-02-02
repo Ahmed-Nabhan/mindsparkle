@@ -192,3 +192,4 @@ ios/.xcode.env.local
 *~
 .tmp/
 google-service-account.json
+.vercel

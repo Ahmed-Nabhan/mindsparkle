@@ -1,185 +1,109 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Support - MindSparkle</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 16px;
-            padding: 40px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-        }
-        .logo {
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .logo h1 {
-            font-size: 2.5em;
-            background: linear-gradient(135deg, #6C63FF, #9D4EDD);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-        .logo span {
-            font-size: 1.2em;
-        }
-        h1.title {
-            color: #333;
-            margin-bottom: 30px;
-            font-size: 2em;
-            text-align: center;
-        }
-        h2 {
-            color: #6C63FF;
-            margin: 30px 0 15px 0;
-            padding-bottom: 10px;
-            border-bottom: 2px solid #f0f0f0;
-        }
-        p {
-            margin-bottom: 15px;
-        }
-        .contact-card {
-            background: linear-gradient(135deg, #6C63FF, #9D4EDD);
-            color: white;
-            padding: 30px;
-            border-radius: 12px;
-            margin: 30px 0;
-            text-align: center;
-        }
-        .contact-card h3 {
-            margin-bottom: 15px;
-            font-size: 1.5em;
-        }
-        .contact-card a {
-            color: white;
-            font-size: 1.2em;
-            text-decoration: none;
-            display: inline-block;
-            background: rgba(255,255,255,0.2);
-            padding: 10px 25px;
-            border-radius: 25px;
-            margin-top: 10px;
-        }
-        .contact-card a:hover {
-            background: rgba(255,255,255,0.3);
-        }
-        .faq {
-            margin: 20px 0;
-        }
-        .faq-item {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 15px;
-        }
-        .faq-item h4 {
-            color: #6C63FF;
-            margin-bottom: 10px;
-        }
-        ul {
-            margin: 10px 0 15px 20px;
-        }
-        li {
-            margin-bottom: 8px;
-        }
-        .footer {
-            margin-top: 40px;
-            padding-top: 20px;
-            border-top: 2px solid #f0f0f0;
-            text-align: center;
-            color: #666;
-        }
-        a {
-            color: #6C63FF;
-            text-decoration: none;
-        }
-        a:hover {
-            text-decoration: underline;
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Support - MindSparkle</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      line-height: 1.6;
+      color: #333;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      background: #fff;
+      border-radius: 16px;
+      padding: 40px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+    }
+    .logo { text-align: center; margin-bottom: 30px; }
+    .logo h1 {
+      font-size: 2.5em;
+      background: linear-gradient(135deg, #6C63FF, #9D4EDD);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .logo span { font-size: 1.1em; }
+    h1.title { margin-bottom: 10px; font-size: 2em; }
+    .subtitle { color: #666; margin-bottom: 30px; }
+    h2 { color: #6C63FF; margin: 30px 0 15px; padding-bottom: 10px; border-bottom: 2px solid #f0f0f0; }
+    h3 { color: #444; margin: 20px 0 10px; }
+    p { margin-bottom: 15px; }
+    ul { margin: 10px 0 15px 20px; }
+    li { margin-bottom: 8px; }
+    .contact-box {
+      background: #f8f9ff;
+      border: 2px solid #6C63FF;
+      border-radius: 12px;
+      padding: 20px;
+      margin: 20px 0;
+      text-align: center;
+    }
+    .contact-box a { color: #6C63FF; font-weight: bold; text-decoration: none; }
+    .contact-box a:hover { text-decoration: underline; }
+    .faq { background: #f8f9ff; border-radius: 12px; padding: 20px; margin: 20px 0; }
+    a { color: #6C63FF; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .footer {
+      margin-top: 40px;
+      padding-top: 20px;
+      border-top: 2px solid #f0f0f0;
+      text-align: center;
+      color: #666;
+    }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <div class="logo">
-            <h1>🧠 MindSparkle</h1>
-            <span>AI Study Companion</span>
-        </div>
-        
-        <h1 class="title">Support Center</h1>
-
-        <div class="contact-card">
-            <h3>Need Help?</h3>
-            <p>Our support team is here to assist you</p>
-            <a href="mailto:support@mindsparkle.cloud">📧 support@mindsparkle.cloud</a>
-        </div>
-
-        <h2>Frequently Asked Questions</h2>
-        
-        <div class="faq">
-            <div class="faq-item">
-                <h4>How do I upload a document?</h4>
-                <p>Tap the "+" button on the home screen, then select "Upload Document". You can choose PDF files from your device or iCloud.</p>
-            </div>
-            
-            <div class="faq-item">
-                <h4>What file types are supported?</h4>
-                <p>MindSparkle currently supports PDF documents. We're working on adding support for more file types including Word documents and images.</p>
-            </div>
-            
-            <div class="faq-item">
-                <h4>How do I cancel my subscription?</h4>
-                <p>To cancel your subscription, go to Settings > Manage Subscription, or manage it directly through your App Store settings.</p>
-            </div>
-            
-            <div class="faq-item">
-                <h4>Is my data secure?</h4>
-                <p>Yes! Your documents are encrypted and processed securely. We use industry-standard security measures to protect your data. Read our <a href="privacy.html">Privacy Policy</a> for more details.</p>
-            </div>
-            
-            <div class="faq-item">
-                <h4>How do I delete my account?</h4>
-                <p>Go to Settings > Account > Delete Account. This will permanently remove all your data within 30 days.</p>
-            </div>
-            
-            <div class="faq-item">
-                <h4>The AI summary doesn't look right. What should I do?</h4>
-                <p>Try regenerating the summary by tapping the refresh button. If the issue persists, the document may have complex formatting. Contact support for assistance.</p>
-            </div>
-        </div>
-
-        <h2>Report a Bug</h2>
-        <p>Found a bug? Please email us at <a href="mailto:support@mindsparkle.cloud">support@mindsparkle.cloud</a> with:</p>
-        <ul>
-            <li>Your device model and iOS version</li>
-            <li>Description of the issue</li>
-            <li>Steps to reproduce the bug</li>
-            <li>Screenshots if possible</li>
-        </ul>
-
-        <h2>Feature Requests</h2>
-        <p>Have an idea to make MindSparkle better? We'd love to hear from you! Email us your suggestions at <a href="mailto:support@mindsparkle.cloud">support@mindsparkle.cloud</a>.</p>
-
-        <div class="footer">
-            <p>© 2026 MindSparkle. All rights reserved.</p>
-            <p><a href="index.html">Home</a> | <a href="privacy.html">Privacy Policy</a> | <a href="terms.html">Terms of Service</a></p>
-        </div>
+  <div class="container">
+    <div class="logo">
+      <h1>🧠 MindSparkle</h1>
+      <span>AI Study Companion</span>
     </div>
+
+    <h1 class="title">Support Center</h1>
+    <p class="subtitle">We’re here to help you succeed in your learning journey.</p>
+
+    <div class="contact-box">
+      <h2>Contact Support</h2>
+      <p>Email: <a href="mailto:support@mindsparkle.cloud">support@mindsparkle.cloud</a></p>
+    </div>
+
+    <h2>Frequently Asked Questions</h2>
+    <div class="faq">
+      <h3>How do I upload documents?</h3>
+      <p>Tap the Upload button in Documents and choose your file.</p>
+    </div>
+    <div class="faq">
+      <h3>What file types are supported?</h3>
+      <p>PDF, DOCX, and TXT. Images are supported for OCR.</p>
+    </div>
+    <div class="faq">
+      <h3>How do I create flashcards?</h3>
+      <p>Upload a document and choose Generate Flashcards, or create manually.</p>
+    </div>
+    <div class="faq">
+      <h3>Can I study offline?</h3>
+      <p>Yes. Downloaded materials and flashcards are available offline.</p>
+    </div>
+    <div class="faq">
+      <h3>How do I cancel my subscription?</h3>
+      <p>Manage subscriptions through the App Store or Google Play.</p>
+    </div>
+
+    <h2>Feature Requests</h2>
+    <p>Email <a href="mailto:feedback@mindsparkle.cloud">feedback@mindsparkle.cloud</a>.</p>
+
+    <div class="footer">
+      <p>© 2026 MindSparkle. All rights reserved.</p>
+      <p><a href="/">Home</a> | <a href="/privacy.html">Privacy Policy</a> | <a href="/terms.html">Terms of Service</a></p>
+    </div>
+  </div>
 </body>
 </html>

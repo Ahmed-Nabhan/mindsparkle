@@ -511,6 +511,68 @@ Rules:
   return synthesized;
 }
 
+async function ensembleMultiProviderAnswer(params: {
+  messages: any[];
+  meta?: LlmCallMeta;
+  modelOverrides?: Partial<Record<LlmProvider, string>>;
+  maxTokens: number;
+  temperature: number;
+}): Promise<string> {
+  const { messages, meta, modelOverrides, maxTokens, temperature } = params;
+
+  const results = await Promise.allSettled([
+    callProviderOnce(messages, maxTokens, temperature, 'openai', meta, modelOverrides),
+    callProviderOnce(messages, maxTokens, temperature, 'gemini', meta, modelOverrides),
+    callProviderOnce(messages, maxTokens, temperature, 'anthropic', meta, modelOverrides),
+  ]);
+
+  const drafts: string[] = [];
+  const labels: string[] = [];
+  const providers: LlmProvider[] = ['openai', 'gemini', 'anthropic'];
+
+  results.forEach((r, idx) => {
+    if (r.status === 'fulfilled' && String(r.value || '').trim()) {
+      drafts.push(String(r.value));
+      labels.push(providers[idx]);
+    }
+  });
+
+  if (drafts.length === 0) {
+    throw new Error('All AI providers failed to respond.');
+  }
+  if (drafts.length === 1) return drafts[0];
+
+  const synthSystem = `You are an expert editor creating the best possible final answer.
+Rules:
+- Merge and refine the best parts of all drafts.
+- Fix any inaccuracies or weak reasoning.
+- Keep it concise but information-dense.
+- Output plain text only. No markdown symbols, no links, no citations, no Sources section.`;
+
+  const synthUser = drafts
+    .map((d, i) => `Draft ${i + 1} (${labels[i]}):\n${d}`)
+    .join('\n\n') + '\n\nReturn the single best final answer.';
+
+  const synthMeta: LlmCallMeta | undefined = meta
+    ? { ...meta, requestType: `${String(meta.requestType)}_ensemble` }
+    : undefined;
+
+  const synthesized = await callOpenAI(
+    [
+      { role: 'system', content: synthSystem },
+      { role: 'user', content: synthUser },
+    ],
+    Math.min(900, Math.max(400, Math.floor(maxTokens * 0.8))),
+    0.2,
+    modelOverrides?.openai || 'gpt-5.2',
+    synthMeta,
+    ['openai'],
+    modelOverrides,
+  );
+
+  return synthesized;
+}
+
 function chunkTextSse(text: string): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   const t = String(text || '');
@@ -532,6 +594,108 @@ function chunkTextSse(text: string): ReadableStream<Uint8Array> {
       push();
     },
   });
+}
+
+function chunkTextSseWithMeta(text: string, meta?: { messageId?: string }): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const t = String(text || '');
+  const chunkSize = 48;
+  let i = 0;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (meta?.messageId) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ messageId: meta.messageId })}\n\n`));
+      }
+      function push() {
+        if (i >= t.length) {
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+          return;
+        }
+        const next = t.slice(i, i + chunkSize);
+        i += chunkSize;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: next })}\n\n`));
+        setTimeout(push, 0);
+      }
+      push();
+    },
+  });
+}
+
+type FeatureFlag = { enabled: boolean; settings?: Record<string, unknown> | null };
+type FeatureFlags = Record<string, FeatureFlag>;
+
+const DEFAULT_FEATURE_FLAGS: FeatureFlags = {
+  streaming: { enabled: true },
+  multi_model: { enabled: true, settings: { models: ['claude', 'gpt', 'gemini'] } },
+  retry_button: { enabled: true },
+  like_dislike: { enabled: true },
+  dark_mode: { enabled: false },
+  guest_mode: { enabled: true, settings: { message_limit: 10, history_retention_hours: 24 } },
+};
+
+let featureFlagsCache: { ts: number; flags: FeatureFlags } | null = null;
+
+async function getFeatureFlags(supabase: any): Promise<FeatureFlags> {
+  const now = Date.now();
+  if (featureFlagsCache && now - featureFlagsCache.ts < 30000) return featureFlagsCache.flags;
+  try {
+    if (!supabase) return DEFAULT_FEATURE_FLAGS;
+    const { data, error } = await supabase.from('feature_flags').select('feature_name, enabled, settings');
+    if (error) throw error;
+    const flags: FeatureFlags = { ...DEFAULT_FEATURE_FLAGS };
+    (data || []).forEach((row: any) => {
+      const key = String(row?.feature_name || '').trim();
+      if (!key) return;
+      flags[key] = { enabled: Boolean(row?.enabled), settings: row?.settings || null };
+    });
+    featureFlagsCache = { ts: now, flags };
+    return flags;
+  } catch {
+    return DEFAULT_FEATURE_FLAGS;
+  }
+}
+
+async function createChatMessage(params: {
+  db: any;
+  userId?: string;
+  guestId?: string;
+  documentId?: string;
+  chatType: 'chat' | 'docchat' | 'chatmind';
+  prompt: string;
+  response?: string;
+}): Promise<string | null> {
+  try {
+    if (!params.db) return null;
+    const { data, error } = await params.db
+      .from('chat_messages')
+      .insert({
+        user_id: params.userId || null,
+        guest_id: params.guestId || null,
+        document_id: params.documentId || null,
+        chat_type: params.chatType,
+        prompt: params.prompt,
+        response: params.response || null,
+      })
+      .select('id')
+      .single();
+    if (error) throw error;
+    return data?.id ? String(data.id) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function updateChatMessageResponse(params: { db: any; messageId: string; response: string }): Promise<void> {
+  try {
+    if (!params.db) return;
+    await params.db
+      .from('chat_messages')
+      .update({ response: params.response, updated_at: new Date().toISOString() })
+      .eq('id', params.messageId);
+  } catch {
+    // ignore
+  }
 }
 
 function sanitizeChatMindOutput(text: string): string {
@@ -2261,7 +2425,7 @@ async function chat(
   history: any[] = [],
   meta?: LlmCallMeta,
   agentId?: string,
-  opts?: { chatMindMode?: ChatMindMode; chatMindMemorySummary?: string; chatMindMemoryEnabled?: boolean }
+  opts?: { chatMindMode?: ChatMindMode; chatMindMemorySummary?: string; chatMindMemoryEnabled?: boolean; multiModelEnabled?: boolean }
 ): Promise<string> {
   // Handle undefined content gracefully
   if (!content || typeof content !== 'string') {
@@ -2403,6 +2567,7 @@ Capabilities:
 
   const maxTokens = isChatMindRequest ? 1100 : 900;
   const temp = isChatMindRequest ? 0.2 : 0.35;
+  const multiModelEnabled = Boolean(opts?.multiModelEnabled);
   let answer = isChatMindRequest
     ? await ensembleChatMindAnswer({
         messages,
@@ -2411,7 +2576,15 @@ Capabilities:
         maxTokens,
         temperature: temp,
       })
-    : await callOpenAI(messages, maxTokens, temp, modelOverrides.openai || "gpt-5.2", meta, providerOrder, modelOverrides);
+    : (multiModelEnabled
+        ? await ensembleMultiProviderAnswer({
+            messages,
+            meta,
+            modelOverrides,
+            maxTokens,
+            temperature: temp,
+          })
+        : await callOpenAI(messages, maxTokens, temp, modelOverrides.openai || "gpt-5.2", meta, providerOrder, modelOverrides));
   if (isChatMindRequest) {
     answer = sanitizeChatMindOutput(answer);
   }
@@ -2613,6 +2786,7 @@ Deno.serve(async (req) => {
     }
     
     const isChatMindAction = ['chatMind', 'chatMindStream'].includes(String(action));
+    const isPublicAction = ['chatMind', 'chatMindStream', 'config', 'feedback', 'retry'].includes(String(action));
     const auth = req.headers.get("authorization");
 
     // Verify JWT (if provided). Allow guest ChatMind if auth is missing/invalid.
@@ -2625,7 +2799,7 @@ Deno.serve(async (req) => {
     let guestId = '';
 
     if (!auth) {
-      if (!isChatMindAction) {
+      if (!isPublicAction) {
         return new Response(JSON.stringify({ code: 401, message: "Missing authorization header" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
       isGuest = true;
@@ -2639,7 +2813,7 @@ Deno.serve(async (req) => {
       user = authedUser;
 
       if (authError || !user) {
-        if (!isChatMindAction) {
+        if (!isPublicAction) {
           return new Response(JSON.stringify({ code: 401, message: "Invalid JWT" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
         }
         isGuest = true;
@@ -2648,10 +2822,13 @@ Deno.serve(async (req) => {
 
     if (isGuest) {
       guestId = String(body?.guestId || body?.deviceId || '').trim();
-      if (!guestId) {
+      if (!guestId && String(action) !== 'config') {
         return new Response(JSON.stringify({ code: 401, message: "Guest ID required" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
     }
+
+    const dbClient = supabase || (supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null);
+    const featureFlags = await getFeatureFlags(dbClient || supabase);
 
     // Best-effort burst limiting (optional; set AI_BURST_REQUESTS_PER_MINUTE).
     const burst = checkBurstLimit(isGuest ? `guest:${guestId}` : user.id);
@@ -2692,7 +2869,8 @@ Deno.serve(async (req) => {
     // Free-tier daily chat caps (server-side backstop).
     // Client already enforces this, but server-side prevents bypass via reinstall/clearing storage.
     if (isGuest) {
-      const guestLimit = parseOptionalNumberEnv('FREE_CHATMIND_DAILY_LIMIT_GUEST') || parseOptionalNumberEnv('FREE_CHATMIND_DAILY_LIMIT') || 30;
+      const guestLimitFromFlags = Number(featureFlags?.guest_mode?.settings?.message_limit || 0) || undefined;
+      const guestLimit = guestLimitFromFlags || parseOptionalNumberEnv('FREE_CHATMIND_DAILY_LIMIT_GUEST') || parseOptionalNumberEnv('FREE_CHATMIND_DAILY_LIMIT') || 30;
       if (isChatMindAction) {
         const ok = checkGuestDailyLimit(`guest:${guestId}`, guestLimit);
         if (!ok.ok) {
@@ -2820,6 +2998,65 @@ Deno.serve(async (req) => {
         }
         break;
       }
+      case "config":
+        result = { flags: featureFlags };
+        break;
+      case "feedback": {
+        const messageId = String(body?.messageId || '').trim();
+        const feedbackType = String(body?.feedbackType || '').trim().toLowerCase();
+        if (!messageId || (feedbackType !== 'like' && feedbackType !== 'dislike')) {
+          return new Response(JSON.stringify({ code: 400, message: 'Invalid feedback request' }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        }
+        const feedbackPayload: any = {
+          message_id: messageId,
+          feedback_type: feedbackType,
+        };
+        if (!isGuest && user?.id) feedbackPayload.user_id = user.id;
+        if (isGuest) feedbackPayload.guest_id = String(body?.guestId || guestId || '').trim() || null;
+        if (!dbClient) {
+          return new Response(JSON.stringify({ code: 500, message: 'Server config error' }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        }
+        const { error } = await dbClient.from('chat_feedback').insert(feedbackPayload);
+        if (error) {
+          return new Response(JSON.stringify({ code: 500, message: 'Could not save feedback' }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        }
+        result = { ok: true };
+        break;
+      }
+      case "retry": {
+        const messageId = String(body?.messageId || '').trim();
+        const guestKey = String(body?.guestId || guestId || '').trim();
+        if (!messageId) {
+          return new Response(JSON.stringify({ code: 400, message: 'Missing messageId' }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        }
+        if (!dbClient) {
+          return new Response(JSON.stringify({ code: 500, message: 'Server config error' }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        }
+
+        let query = dbClient.from('chat_messages').select('*').eq('id', messageId).limit(1);
+        if (!isGuest && user?.id) query = query.eq('user_id', user.id);
+        if (isGuest && guestKey) query = query.eq('guest_id', guestKey);
+        const { data } = await query;
+        const original = Array.isArray(data) ? data[0] : null;
+        if (!original?.prompt) {
+          return new Response(JSON.stringify({ code: 404, message: 'Message not found' }), { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        }
+
+        const multiModelEnabled = featureFlags?.multi_model?.enabled !== false;
+        const regenerated = await chat('', String(original.prompt), [], meta, agentId, { multiModelEnabled });
+        const newMessageId = await createChatMessage({
+          db: dbClient,
+          userId: !isGuest && user?.id ? user.id : undefined,
+          guestId: isGuest ? guestKey : undefined,
+          documentId: original?.document_id || undefined,
+          chatType: String(original?.chat_type || 'chatmind') as any,
+          prompt: String(original.prompt),
+          response: regenerated,
+        });
+
+        result = { response: regenerated, messageId: newMessageId };
+        break;
+      }
       case "summarize":
         result = { summary: await summarize(contentCompat, language, meta) };
         break;
@@ -2838,14 +3075,38 @@ Deno.serve(async (req) => {
       case "flashcards":
         result = { flashcards: await generateFlashcards(contentCompat, count || 20, language, meta) };
         break;
-      case "chat":
-        result = { response: await chat(contentCompat, questionCompat, history || [], meta, agentId) };
+      case "chat": {
+        const multiModelEnabled = featureFlags?.multi_model?.enabled !== false;
+        const responseText = await chat(contentCompat, questionCompat, history || [], meta, agentId, { multiModelEnabled });
+        const messageId = await createChatMessage({
+          db: dbClient,
+          userId: !isGuest && user?.id ? user.id : undefined,
+          guestId: isGuest ? guestId : undefined,
+          documentId: (typeof body?.documentId === 'string' ? body.documentId : undefined),
+          chatType: 'chat',
+          prompt: questionCompat,
+          response: responseText,
+        });
+        result = { response: responseText, messageId };
         break;
+      }
 
-      case "docChat":
+      case "docChat": {
         // Explicit document chat action (isolated from Chat Mind)
-        result = { response: await chat(contentCompat, questionCompat, history || [], meta, agentId) };
+        const multiModelEnabled = featureFlags?.multi_model?.enabled !== false;
+        const responseText = await chat(contentCompat, questionCompat, history || [], meta, agentId, { multiModelEnabled });
+        const messageId = await createChatMessage({
+          db: dbClient,
+          userId: !isGuest && user?.id ? user.id : undefined,
+          guestId: isGuest ? guestId : undefined,
+          documentId: (typeof body?.documentId === 'string' ? body.documentId : undefined),
+          chatType: 'docchat',
+          prompt: questionCompat,
+          response: responseText,
+        });
+        result = { response: responseText, messageId };
         break;
+      }
 
       case "chatMind":
         // Chat Mind should not receive document context.
@@ -2857,10 +3118,13 @@ Deno.serve(async (req) => {
           }
           const memorySummary = memoryEnabled ? await getChatMindMemorySummary(supabase, user.id) : '';
 
+          const multiModelEnabled = featureFlags?.multi_model?.enabled !== false;
+
           const responseText = await chat('', questionCompat, history || [], meta, agentId, {
             chatMindMode: chatMode,
             chatMindMemoryEnabled: memoryEnabled,
             chatMindMemorySummary: memorySummary,
+            multiModelEnabled,
           });
 
           if (!isGuest && memoryEnabled && shouldUpdateChatMindMemory(questionCompat)) {
@@ -2873,7 +3137,17 @@ Deno.serve(async (req) => {
             });
           }
 
-          result = { response: responseText };
+          const messageId = await createChatMessage({
+            db: dbClient,
+            userId: !isGuest && user?.id ? user.id : undefined,
+            guestId: isGuest ? guestId : undefined,
+            documentId: (typeof body?.documentId === 'string' ? body.documentId : undefined),
+            chatType: 'chatmind',
+            prompt: questionCompat,
+            response: responseText,
+          });
+
+          result = { response: responseText, messageId };
         }
         break;
 
@@ -2911,6 +3185,9 @@ Capabilities:
         const includeDocContext = action !== 'chatMindStream';
         const truncatedCtx = includeDocContext ? String(contentCompat || '').slice(0, 25000) : '';
         const q = String(questionCompat || '').trim() || 'Hello';
+        const chatType: 'chat' | 'docchat' | 'chatmind' = isChatMindStream
+          ? 'chatmind'
+          : (action === 'docChatStream' ? 'docchat' : 'chat');
 
         const detectedLang = detectLanguageFromText(q);
         const languageGuidance = languageInstruction(detectedLang);
@@ -2965,6 +3242,16 @@ Citations:
 
         const providerOrder = chooseChatProviderOrder({ question: q, context: truncatedCtx, history });
         const primaryProvider = providerOrder[0] || 'openai';
+        const multiModelEnabled = featureFlags?.multi_model?.enabled !== false;
+
+        const messageId = await createChatMessage({
+          db: dbClient,
+          userId: !isGuest && user?.id ? user.id : undefined,
+          guestId: isGuest ? guestId : undefined,
+          documentId: (typeof body?.documentId === 'string' ? body.documentId : undefined),
+          chatType,
+          prompt: q,
+        });
 
         if (isChatMindStream) {
           const txt = await ensembleChatMindAnswer({
@@ -2979,12 +3266,26 @@ Citations:
             temperature: 0.2,
           });
           const sanitized = sanitizeChatMindOutput(txt);
-          return new Response(chunkTextSse(sanitized), { headers: sseHeaders() });
+          if (messageId) await updateChatMessageResponse({ db: dbClient, messageId, response: sanitized });
+          return new Response(chunkTextSseWithMeta(sanitized, { messageId: messageId || undefined }), { headers: sseHeaders() });
         }
 
-        if (primaryProvider !== 'openai') {
-          const txt = await callOpenAI(messages, 900, 0.35, undefined, meta, [primaryProvider]);
-          return new Response(chunkTextSse(txt), { headers: sseHeaders() });
+        if (primaryProvider !== 'openai' || multiModelEnabled) {
+          const txt = multiModelEnabled
+            ? await ensembleMultiProviderAnswer({
+                messages,
+                meta,
+                modelOverrides: {
+                  openai: smartModel,
+                  gemini: (Deno.env.get('GEMINI_CHAT_MODEL') || Deno.env.get('GEMINI_TEXT_MODEL') || '').trim(),
+                  anthropic: (Deno.env.get('ANTHROPIC_CHAT_MODEL') || Deno.env.get('ANTHROPIC_TEXT_MODEL') || 'claude-3-5-sonnet-latest').trim(),
+                },
+                maxTokens: 900,
+                temperature: 0.35,
+              })
+            : await callOpenAI(messages, 900, 0.35, undefined, meta, [primaryProvider]);
+          if (messageId) await updateChatMessageResponse({ db: dbClient, messageId, response: txt });
+          return new Response(chunkTextSseWithMeta(txt, { messageId: messageId || undefined }), { headers: sseHeaders() });
         }
 
         try {
@@ -2997,6 +3298,9 @@ Citations:
           const stream = new ReadableStream<Uint8Array>({
             async start(controller) {
               try {
+                if (messageId) {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ messageId })}\n\n`));
+                }
                 const reader = upstream.body?.getReader();
                 if (!reader) {
                   controller.enqueue(encoder.encode('data: [DONE]\n\n'));
@@ -3031,6 +3335,9 @@ Citations:
                             userMessage: q,
                             assistantMessage: assistantAcc,
                           });
+                        }
+                        if (messageId && assistantAcc.trim()) {
+                          await updateChatMessageResponse({ db: dbClient, messageId, response: assistantAcc });
                         }
                         controller.enqueue(encoder.encode('data: [DONE]\n\n'));
                         controller.close();

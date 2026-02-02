@@ -21,6 +21,7 @@ import { colors } from '../constants/colors';
 import ApiService from '../services/apiService';
 import { supabase } from '../services/supabase';
 import { usePremiumContext } from '../context/PremiumContext';
+import { useFeatureFlags } from '../context/FeatureFlagContext';
 import { useDocument } from '../hooks/useDocument';
 import type { MainDrawerScreenProps } from '../navigation/types';
 
@@ -28,6 +29,8 @@ interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  serverMessageId?: string;
+  promptText?: string;
   imageDataUrl?: string;
   fileUrl?: string;
   fileName?: string;
@@ -44,6 +47,7 @@ export const ChatScreen: React.FC = () => {
   const navigation = useNavigation<ChatMindScreenProps['navigation']>();
   const { documentId, documentContent, documentTitle, agentId, agentName } = (route as any).params || {};
   const { isPremium, features, dailyChatCount, incrementChatCount, showPaywall } = usePremiumContext();
+  const { flags } = useFeatureFlags();
   const { getDocument } = useDocument();
 
   const [activeAgentId, setActiveAgentId] = useState<string>(agentId || 'general');
@@ -52,17 +56,40 @@ export const ChatScreen: React.FC = () => {
   const [isAgentPickerOpen, setIsAgentPickerOpen] = useState(false);
   const [isAgentsLoading, setIsAgentsLoading] = useState(false);
 
+      {!isAuthed && guestModeEnabled && (
+        <View style={styles.guestBanner}>
+          <Text style={styles.guestBannerText}>
+            Sign in to save your conversations and get unlimited messages.
+          </Text>
+          <TouchableOpacity
+            style={styles.guestBannerButton}
+            onPress={() => navigation.navigate('Auth', { mode: 'signin' } as any)}
+          >
+            <Text style={styles.guestBannerButtonText}>Sign in</Text>
+          </TouchableOpacity>
+        </View>
+      )}
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [replyTo, setReplyTo] = useState<Message | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [content, setContent] = useState(documentContent || '');
+  const [isAuthed, setIsAuthed] = useState(false);
   const flatListRef = useRef<FlatList>(null);
 
   const [chatMindMode, setChatMindMode] = useState<'general' | 'study' | 'work' | 'health'>('general');
   const [chatMindMemoryEnabled, setChatMindMemoryEnabled] = useState(false);
 
-  const isChatMind = !documentId;
+  const routeName = (route as any)?.name;
+  const isChatMind = routeName === 'ChatMind' || !documentId;
+  const streamingEnabled = flags?.streaming?.enabled !== false;
+  const showRetry = flags?.retry_button?.enabled !== false;
+  const showLikeDislike = flags?.like_dislike?.enabled !== false;
+  const guestModeEnabled = flags?.guest_mode?.enabled !== false;
+  const guestLimitCandidate = Number(flags?.guest_mode?.settings?.message_limit);
+  const guestMessageLimit = Number.isFinite(guestLimitCandidate)
+    ? guestLimitCandidate
+    : features.maxChatMessages;
   const CHAT_MIND_STORAGE_KEY = 'chatMind:v1';
   const DOC_CHAT_STORAGE_PREFIX = 'docChat:v1';
 
@@ -289,6 +316,22 @@ export const ChatScreen: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (!cancelled) setIsAuthed(Boolean(data?.session?.access_token));
+      } catch {
+        if (!cancelled) setIsAuthed(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Persist chat history whenever it changes (separate keys).
   useEffect(() => {
     if (!storageKey) return;
@@ -403,7 +446,7 @@ export const ChatScreen: React.FC = () => {
 
   const canSendMessage = (): boolean => {
     if (isPremium) return true;
-    const limit = features.maxChatMessages;
+    const limit = !isAuthed && guestModeEnabled ? guestMessageLimit : features.maxChatMessages;
     if (limit === -1) return true;
     return dailyChatCount < limit;
   };
@@ -483,23 +526,27 @@ export const ChatScreen: React.FC = () => {
     ]);
   };
 
-  const sendMessage = async () => {
-    if (!inputText.trim()) return;
+  const sendMessage = async (overrideText?: string) => {
+    const rawInput = typeof overrideText === 'string' ? overrideText : inputText;
+    if (!rawInput.trim()) return;
 
-    let isAuthed = false;
+    let isAuthedNow = false;
     try {
       const { data } = await supabase.auth.getSession();
-      isAuthed = Boolean(data?.session?.access_token);
+      isAuthedNow = Boolean(data?.session?.access_token);
+      setIsAuthed(isAuthedNow);
     } catch {
-      isAuthed = false;
+      isAuthedNow = false;
+      setIsAuthed(false);
     }
     
     // Check limit for free users
     if (!canSendMessage()) {
-      if (!isAuthed) {
+      const limit = !isAuthedNow && guestModeEnabled ? guestMessageLimit : features.maxChatMessages;
+      if (!isAuthedNow) {
         Alert.alert(
           '💬 Chat limit reached',
-          `You reached today's free limit (${features.maxChatMessages}). Sign in to unlock Pro and get unlimited chats.`,
+          `You reached today's free limit (${limit}). Sign in to unlock Pro and get unlimited chats.`,
           [
             { text: 'Not now', style: 'cancel' },
             { text: 'Sign in', onPress: () => navigation.navigate('Auth', { mode: 'signin' } as any) },
@@ -508,7 +555,7 @@ export const ChatScreen: React.FC = () => {
       } else {
         Alert.alert(
           '💬 Chat limit reached',
-          `Free plan includes ${features.maxChatMessages === -1 ? 'unlimited' : features.maxChatMessages} chat messages per day.\n\nSubscribe to Pro to get unlimited chats.`,
+          `Free plan includes ${limit === -1 ? 'unlimited' : limit} chat messages per day.\n\nSubscribe to Pro to get unlimited chats.`,
           [
             { text: 'Not now', style: 'cancel' },
             {
@@ -521,7 +568,7 @@ export const ChatScreen: React.FC = () => {
       return;
     }
 
-    const trimmed = inputText.trim();
+    const trimmed = rawInput.trim();
     const replySnippet = replyTo ? String(replyTo.content || '').slice(0, 500) : '';
     const userMessageText = replyTo
       ? `Replying to ${replyTo.role}:\n${replySnippet}\n\n${trimmed}`
@@ -584,6 +631,7 @@ export const ChatScreen: React.FC = () => {
       id: pendingId,
       role: 'assistant',
       content: isExportRequest ? 'Preparing your file…' : 'Thinking…',
+      promptText: userMessageText,
       timestamp: new Date(),
     };
 
@@ -674,66 +722,83 @@ export const ChatScreen: React.FC = () => {
 
         // Stream response for speed.
         let acc = '';
-        setMessages(prev => prev.map(m => (m.id === pendingId ? { ...m, content: '' } : m)));
+        let hasStarted = false;
 
         const apiAny: any = ApiService as any;
         const preferredStreamFn = isChatMind ? apiAny.chatMindStream : apiAny.docChatStream;
-        const streamFnToUse: any = typeof preferredStreamFn === 'function' ? preferredStreamFn : ApiService.chatStream;
+        const streamFnToUse: any = isChatMind
+          ? apiAny.chatMindStream
+          : (typeof preferredStreamFn === 'function' ? preferredStreamFn : ApiService.chatStream);
 
-        try {
-          const onDelta = (delta: string) => {
-            const cleaned = normalizeStreamDelta(delta);
-            if (!cleaned) return;
-            acc += cleaned;
-            // Update pending message progressively
-            setMessages(prev => prev.map(m => (m.id === pendingId ? { ...m, content: acc } : m)));
-          };
-
-          const onError = (err: any) => {
-            console.warn('chatStream error:', err?.message || err);
-          };
-
-          if (isChatMind) {
-            await streamFnToUse(
-              userMessageText,
-              '',
-              history,
-              activeAgentId,
-              onDelta,
-              undefined,
-              onError,
-              {
-                mode: chatMindMode,
-                memoryEnabled: chatMindMemoryEnabled,
+        if (streamingEnabled) {
+          try {
+            const onDelta = (delta: string) => {
+              const cleaned = normalizeStreamDelta(delta);
+              if (!cleaned) return;
+              acc += cleaned;
+              // Update pending message progressively
+              if (!hasStarted) {
+                hasStarted = true;
               }
-            );
-          } else {
-            await streamFnToUse(
-              userMessageText,
-              relevantContext,
-              history,
-              activeAgentId,
-              onDelta,
-              undefined,
-              onError
-            );
+              setMessages(prev => prev.map(m => (m.id === pendingId ? { ...m, content: acc } : m)));
+            };
+
+            const onMeta = (meta: { messageId?: string }) => {
+              if (!meta?.messageId) return;
+              setMessages(prev => prev.map(m => (m.id === pendingId ? { ...m, serverMessageId: meta.messageId } : m)));
+            };
+
+            const onError = (err: any) => {
+              console.warn('chatStream error:', err?.message || err);
+            };
+
+            if (isChatMind) {
+              await streamFnToUse(
+                userMessageText,
+                '',
+                history,
+                activeAgentId,
+                onDelta,
+                undefined,
+                onError,
+                {
+                  mode: chatMindMode,
+                  memoryEnabled: chatMindMemoryEnabled,
+                },
+                onMeta
+              );
+            } else {
+              await streamFnToUse(
+                userMessageText,
+                relevantContext,
+                history,
+                activeAgentId,
+                onDelta,
+                undefined,
+                onError,
+                onMeta
+              );
+            }
+          } catch (e: any) {
+            console.warn('chatStream failed, falling back:', e?.message || e);
           }
-        } catch (e: any) {
-          console.warn('chatStream failed, falling back:', e?.message || e);
         }
 
         if (!acc.trim()) {
           // Fallback to non-streaming (and guard against any accidental SSE text)
           const apiAny: any = ApiService as any;
           const response = isChatMind
-            ? (typeof apiAny.chatMind === 'function'
-              ? await apiAny.chatMind(userMessageText, history, activeAgentId, { mode: chatMindMode, memoryEnabled: chatMindMemoryEnabled })
-                : await ApiService.chat(userMessageText, '', history, activeAgentId))
+            ? await ApiService.chatMind(userMessageText, history, activeAgentId, { mode: chatMindMode, memoryEnabled: chatMindMemoryEnabled })
             : (typeof apiAny.docChat === 'function'
                 ? await apiAny.docChat(userMessageText, relevantContext, history, activeAgentId)
                 : await ApiService.chat(userMessageText, relevantContext, history, activeAgentId));
-          const cleaned = normalizeStreamDelta(response);
-          const finalText = cleaned || response || 'No response received. Please try again.';
+          const responseText = typeof response === 'string' ? response : response?.text;
+          const cleaned = normalizeStreamDelta(responseText);
+          const finalText = cleaned || responseText || 'No response received. Please try again.';
+
+          if (typeof response === 'object' && response?.messageId) {
+            setMessages(prev => prev.map(m => (m.id === pendingId ? { ...m, serverMessageId: response.messageId } : m)));
+          }
 
           if (!finalText || !finalText.trim()) {
             setMessages(prev => prev.map(m => (
@@ -836,6 +901,69 @@ export const ChatScreen: React.FC = () => {
           <Text style={styles.timestamp}>
             {item.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           </Text>
+          {!isUser && (showRetry || showLikeDislike) && (
+            <View style={styles.actionBar}>
+              {showLikeDislike && (
+                <TouchableOpacity
+                  style={styles.actionButton}
+                  onPress={() => item.serverMessageId && ApiService.sendChatFeedback(item.serverMessageId, 'like')}
+                >
+                  <Text style={styles.actionText}>👍</Text>
+                </TouchableOpacity>
+              )}
+              {showLikeDislike && (
+                <TouchableOpacity
+                  style={styles.actionButton}
+                  onPress={() => item.serverMessageId && ApiService.sendChatFeedback(item.serverMessageId, 'dislike')}
+                >
+                  <Text style={styles.actionText}>👎</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                style={styles.actionButton}
+                onPress={async () => {
+                  try {
+                    await Clipboard.setStringAsync(String(item.content || ''));
+                  } catch {
+                    // ignore
+                  }
+                }}
+              >
+                <Text style={styles.actionText}>📋</Text>
+              </TouchableOpacity>
+              {showRetry && (
+                <TouchableOpacity
+                  style={styles.actionButton}
+                  onPress={async () => {
+                    try {
+                      setMessages(prev => prev.map(m => (
+                        m.id === item.id ? { ...m, content: 'Thinking…' } : m
+                      )));
+                      if (item.serverMessageId) {
+                        const res = await ApiService.retryChatMessage(item.serverMessageId);
+                        const cleaned = normalizeStreamDelta(res?.response || '');
+                        setMessages(prev => prev.map(m => (
+                          m.id === item.id
+                            ? { ...m, content: cleaned || 'No response received.', serverMessageId: res?.messageId || m.serverMessageId }
+                            : m
+                        )));
+                        return;
+                      }
+                      if (item.promptText) {
+                        await sendMessage(item.promptText);
+                      }
+                    } catch {
+                      setMessages(prev => prev.map(m => (
+                        m.id === item.id ? { ...m, content: '❌ Retry failed. Please try again.' } : m
+                      )));
+                    }
+                  }}
+                >
+                  <Text style={styles.actionText}>🔄</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
         </View>
 
         {isUser && (
@@ -1123,6 +1251,32 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primary,
     gap: 12,
   },
+  guestBanner: {
+    backgroundColor: colors.surface,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  guestBannerText: {
+    flex: 1,
+    color: colors.text,
+    fontSize: 12,
+  },
+  guestBannerButton: {
+    backgroundColor: colors.primary,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 10,
+  },
+  guestBannerButtonText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 12,
+  },
   chatMindControls: {
     paddingHorizontal: 16,
     paddingVertical: 10,
@@ -1316,6 +1470,22 @@ const styles = StyleSheet.create({
     color: 'rgba(0,0,0,0.4)',
     marginTop: 6,
     alignSelf: 'flex-end',
+  },
+  actionBar: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  actionButton: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+  },
+  actionText: {
+    fontSize: 12,
   },
 
   sourcesBox: {
