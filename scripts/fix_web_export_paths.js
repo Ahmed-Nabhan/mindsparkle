@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 
 const projectRoot = path.resolve(__dirname, '..');
-const webRoot = path.join(projectRoot, 'docs');
+const webRoot = path.join(projectRoot, 'docs', 'app');
 
 function replaceInFile(filePath, replacements) {
   let content = fs.readFileSync(filePath, 'utf8');

@@ -733,11 +733,31 @@ export const ChatScreen: React.FC = () => {
                 ? await apiAny.docChat(userMessageText, relevantContext, history, activeAgentId)
                 : await ApiService.chat(userMessageText, relevantContext, history, activeAgentId));
           const cleaned = normalizeStreamDelta(response);
-          setMessages(prev => prev.map(m => (
-            m.id === pendingId
-              ? { ...m, content: cleaned || response || 'No response received. Please try again.' }
-              : m
-          )));
+          const finalText = cleaned || response || 'No response received. Please try again.';
+
+          if (!finalText || !finalText.trim()) {
+            setMessages(prev => prev.map(m => (
+              m.id === pendingId
+                ? { ...m, content: 'No response received. Please try again.' }
+                : m
+            )));
+          } else {
+            // Progressive reveal to mimic streaming when a full response is returned.
+            const chunkSize = Platform.OS === 'web' ? 28 : 22;
+            const delayMs = Platform.OS === 'web' ? 12 : 16;
+            let i = 0;
+            let shown = '';
+            while (i < finalText.length) {
+              shown += finalText.slice(i, i + chunkSize);
+              i += chunkSize;
+              setMessages(prev => prev.map(m => (
+                m.id === pendingId
+                  ? { ...m, content: shown }
+                  : m
+              )));
+              await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+          }
         }
       }
     } catch (error: any) {

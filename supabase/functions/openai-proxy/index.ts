@@ -237,15 +237,15 @@ function normalizeChatMindMode(raw: any): ChatMindMode {
 
 function modeGuidance(mode: ChatMindMode): string {
   if (mode === 'study') {
-    return `\n\nMode: Study\n- Teach step-by-step when helpful.\n- Use short examples.\n- End with 1 quick check question when appropriate.`;
+    return `\n\nMode: Study\n- Teach step-by-step when helpful.\n- Use short examples or analogies.\n- End with 1 quick check question when appropriate.\n- Output format (plain text, no markdown symbols):\n  Summary:\n  Key points: (bullets)\n  Example (if helpful):\n  Quick check:`;
   }
   if (mode === 'work') {
-    return `\n\nMode: Work\n- Be direct and actionable.\n- Prefer bullets, templates, and next steps.\n- Highlight risks and assumptions.`;
+    return `\n\nMode: Work\n- Be direct and actionable.\n- Prefer bullets, templates, and next steps.\n- Highlight risks and assumptions.\n- Output format (plain text, no markdown symbols):\n  Summary:\n  Recommended actions: (bullets)\n  Risks/assumptions:\n  Next step:`;
   }
   if (mode === 'health') {
-    return `\n\nMode: Health\n- Be supportive and practical.\n- Include safety guidance: not a medical professional; encourage seeing a clinician for urgent/serious symptoms.\n- Ask a short clarifying question if needed.`;
+    return `\n\nMode: Health\n- Be supportive and practical.\n- Include safety guidance: not a medical professional; encourage seeing a clinician for urgent/serious symptoms.\n- Ask a short clarifying question if needed.\n- Output format (plain text, no markdown symbols):\n  Summary:\n  Practical steps: (bullets)\n  Safety note:\n  Clarifying question:`;
   }
-  return `\n\nMode: General\n- Be concise and clear by default. Expand if asked.`;
+  return `\n\nMode: General\n- Be concise and clear by default. Expand if asked.\n- Use simple labels and bullets (plain text, no markdown symbols like # or **).\n- If the topic is technical, include 1 short example or analogy.\n- Output format (plain text):\n  Summary:\n  Key points: (bullets)\n  Example (if helpful):`;
 }
 
 async function getChatMindMemorySummary(supabase: any, userId: string): Promise<string> {
@@ -456,6 +456,61 @@ async function callOpenAIInternalStream(
   return res;
 }
 
+async function callProviderOnce(
+  messages: any[],
+  maxTokens: number,
+  temperature: number,
+  provider: LlmProvider,
+  meta?: LlmCallMeta,
+  modelOverrides?: Partial<Record<LlmProvider, string>>,
+): Promise<string> {
+  return callOpenAI(messages, maxTokens, temperature, modelOverrides?.openai, meta, [provider], modelOverrides);
+}
+
+async function ensembleChatMindAnswer(params: {
+  messages: any[];
+  meta?: LlmCallMeta;
+  modelOverrides?: Partial<Record<LlmProvider, string>>;
+  maxTokens: number;
+  temperature: number;
+}): Promise<string> {
+  const { messages, meta, modelOverrides, maxTokens, temperature } = params;
+
+  const [openaiText, geminiText, anthropicText] = await Promise.all([
+    callProviderOnce(messages, maxTokens, temperature, 'openai', meta, modelOverrides),
+    callProviderOnce(messages, maxTokens, temperature, 'gemini', meta, modelOverrides),
+    callProviderOnce(messages, maxTokens, temperature, 'anthropic', meta, modelOverrides),
+  ]);
+
+  const synthSystem = `You are an expert editor creating the best possible final answer.
+Rules:
+- Merge and refine the best parts of all drafts.
+- Fix any inaccuracies or weak reasoning.
+- Keep it concise but information-dense.
+- Output plain text only. No markdown symbols, no links, no citations, no Sources section.`;
+
+  const synthUser = `Draft A (OpenAI):\n${openaiText}\n\nDraft B (Gemini):\n${geminiText}\n\nDraft C (Anthropic):\n${anthropicText}\n\nReturn the single best final answer.`;
+
+  const synthMeta: LlmCallMeta | undefined = meta
+    ? { ...meta, requestType: `${String(meta.requestType)}_ensemble` }
+    : undefined;
+
+  const synthesized = await callOpenAI(
+    [
+      { role: 'system', content: synthSystem },
+      { role: 'user', content: synthUser },
+    ],
+    Math.min(900, Math.max(400, Math.floor(maxTokens * 0.8))),
+    0.2,
+    modelOverrides?.openai || 'gpt-5.2',
+    synthMeta,
+    ['openai'],
+    modelOverrides,
+  );
+
+  return synthesized;
+}
+
 function chunkTextSse(text: string): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   const t = String(text || '');
@@ -477,6 +532,31 @@ function chunkTextSse(text: string): ReadableStream<Uint8Array> {
       push();
     },
   });
+}
+
+function sanitizeChatMindOutput(text: string): string {
+  let out = String(text || '');
+  if (!out.trim()) return out;
+
+  // Remove markdown headings and inline markers.
+  out = out.replace(/^\s{0,3}#{1,6}\s+/gm, '');
+  out = out.replace(/\*\*(.*?)\*\*/g, '$1');
+  out = out.replace(/__(.*?)__/g, '$1');
+  out = out.replace(/`([^`]*)`/g, '$1');
+
+  // Normalize list markers to plain bullets.
+  out = out.replace(/^\s*[-*]\s+/gm, '• ');
+
+  // Remove citation markers like [1].
+  out = out.replace(/\[\d+\]/g, '');
+
+  // Drop any Sources section if present.
+  const sourcesIdx = out.toLowerCase().indexOf('sources');
+  if (sourcesIdx !== -1) {
+    out = out.slice(0, sourcesIdx).trimEnd();
+  }
+
+  return out.trim();
 }
 
 function normalizeExportKind(raw: string): 'notes' | 'study_guide' | 'flashcards_csv' | 'quiz_json' | 'report' {
@@ -2209,6 +2289,10 @@ Prefer structured answers: short summary, then bullets/steps when useful.`
   const memorySummary = isChatMindRequest && opts?.chatMindMemoryEnabled ? String(opts?.chatMindMemorySummary || '').trim() : '';
   const memoryBlock = memorySummary ? `\n\nUser memory (opt-in; may be empty/partial):\n- ${memorySummary}` : '';
 
+  const chatMindQualityGuidance = isChatMindRequest
+    ? `\n\nChatMind quality bar:\n- Provide an expert-level explanation, not a shallow definition.\n- Include how it works (core components/flow), why it matters, and practical implications.\n- Add a short, concrete example or analogy when helpful.\n- Include pros and tradeoffs only if relevant and non-obvious.\n- Keep it concise but information-dense.\n- Do NOT include citations, links, or a Sources section unless the user explicitly asks.\n- Output MUST be plain text: no markdown symbols (#, **, ###, -, *, >, triple backticks). Use simple labels and short sentences.\n- Prefer this structure:\n  Summary: <1–2 sentences>\n  How it works: <2–4 short sentences>\n  Key points: 1) ... 2) ... 3) ...\n  Example/analogy: <1–2 sentences (optional)>`
+    : '';
+
   const identityGuidance = `
 Identity:
 - If the user asks "who developed you / who made you / who built you", answer: "MindSparkle was developed by Ahmed Nabhan. This assistant is powered by GPT-5.2 and may use multiple AI providers depending on the request." Keep it to 1–2 sentences.
@@ -2243,7 +2327,7 @@ Capabilities:
     : '';
 
   const messages = [
-    { role: "system", content: systemPrompt + (isChatMindRequest ? (modeGuidance(mode) + memoryBlock) : '') + identityGuidance + capabilityGuidance + languageGuidance + citationGuidance },
+    { role: "system", content: systemPrompt + (isChatMindRequest ? (modeGuidance(mode) + memoryBlock + chatMindQualityGuidance) : '') + identityGuidance + capabilityGuidance + languageGuidance + citationGuidance },
     ...(truncated.trim().length > 0
       ? [{ role: "user", content: `DOCUMENT CONTEXT (may be partial):\n${truncated.slice(0, 12000)}` }]
       : []),
@@ -2317,9 +2401,20 @@ Capabilities:
     modelOverrides.anthropic = (Deno.env.get('ANTHROPIC_CHAT_MODEL_CREATIVE') || modelOverrides.anthropic || '').trim();
   }
 
-  const maxTokens = isChatMindRequest ? 700 : 900;
-  const temp = isChatMindRequest ? 0.25 : 0.35;
-  const answer = await callOpenAI(messages, maxTokens, temp, modelOverrides.openai || "gpt-5.2", meta, providerOrder, modelOverrides);
+  const maxTokens = isChatMindRequest ? 1100 : 900;
+  const temp = isChatMindRequest ? 0.2 : 0.35;
+  let answer = isChatMindRequest
+    ? await ensembleChatMindAnswer({
+        messages,
+        meta,
+        modelOverrides,
+        maxTokens,
+        temperature: temp,
+      })
+    : await callOpenAI(messages, maxTokens, temp, modelOverrides.openai || "gpt-5.2", meta, providerOrder, modelOverrides);
+  if (isChatMindRequest) {
+    answer = sanitizeChatMindOutput(answer);
+  }
 
   // Optional verify pass (best-effort) to improve accuracy for general chat.
   // Disabled by default; enable via env var to avoid doubling cost for all chats.
@@ -2828,6 +2923,10 @@ Capabilities:
         const memorySummary = isChatMindStream && !isGuest && memoryEnabled ? await getChatMindMemorySummary(supabase, user.id) : '';
         const memoryBlock = memorySummary ? `\n\nUser memory (opt-in; may be empty/partial):\n- ${memorySummary}` : '';
 
+        const chatMindQualityGuidance = isChatMindStream
+          ? `\n\nChatMind quality bar:\n- Provide an expert-level explanation, not a shallow definition.\n- Include how it works (core components/flow), why it matters, and practical implications.\n- Add a short, concrete example or analogy when helpful.\n- Include pros and tradeoffs only if relevant and non-obvious.\n- Keep it concise but information-dense.\n- Do NOT include citations, links, or a Sources section unless the user explicitly asks.\n- Output MUST be plain text: no markdown symbols (#, **, ###, -, *, >, triple backticks). Use simple labels and short sentences.\n- Prefer this structure:\n  Summary: <1–2 sentences>\n  How it works: <2–4 short sentences>\n  Key points: 1) ... 2) ... 3) ...\n  Example/analogy: <1–2 sentences (optional)>`
+          : '';
+
         let sources: WebSource[] = [];
         if (!isChatMindStream && shouldUseWebSearchForChat(q)) {
           try {
@@ -2847,7 +2946,7 @@ Citations:
           : '';
 
         const messages = [
-          { role: 'system', content: systemPrompt + (isChatMindStream ? (modeGuidance(chatMode) + memoryBlock) : '') + identityGuidance + capabilityGuidance + languageGuidance + citationGuidance },
+          { role: 'system', content: systemPrompt + (isChatMindStream ? (modeGuidance(chatMode) + memoryBlock + chatMindQualityGuidance) : '') + identityGuidance + capabilityGuidance + languageGuidance + citationGuidance },
           ...(truncatedCtx.trim().length > 0
             ? [{ role: 'user', content: `DOCUMENT CONTEXT (may be partial):\n${truncatedCtx.slice(0, 12000)}` }]
             : []),
@@ -2867,14 +2966,30 @@ Citations:
         const providerOrder = chooseChatProviderOrder({ question: q, context: truncatedCtx, history });
         const primaryProvider = providerOrder[0] || 'openai';
 
+        if (isChatMindStream) {
+          const txt = await ensembleChatMindAnswer({
+            messages,
+            meta,
+            modelOverrides: {
+              openai: smartModel,
+              gemini: (Deno.env.get('GEMINI_CHAT_MODEL') || Deno.env.get('GEMINI_TEXT_MODEL') || '').trim(),
+              anthropic: (Deno.env.get('ANTHROPIC_CHAT_MODEL') || Deno.env.get('ANTHROPIC_TEXT_MODEL') || 'claude-3-5-sonnet-latest').trim(),
+            },
+            maxTokens: 1100,
+            temperature: 0.2,
+          });
+          const sanitized = sanitizeChatMindOutput(txt);
+          return new Response(chunkTextSse(sanitized), { headers: sseHeaders() });
+        }
+
         if (primaryProvider !== 'openai') {
           const txt = await callOpenAI(messages, 900, 0.35, undefined, meta, [primaryProvider]);
           return new Response(chunkTextSse(txt), { headers: sseHeaders() });
         }
 
         try {
-          const maxTokens = isChatMindStream ? 700 : 900;
-          const temp = isChatMindStream ? 0.25 : 0.35;
+          const maxTokens = isChatMindStream ? 1100 : 900;
+          const temp = isChatMindStream ? 0.2 : 0.35;
           const upstream = await callOpenAIInternalStream(messages, maxTokens, temp, openAiModel);
           const encoder = new TextEncoder();
           const decoder = new TextDecoder();
