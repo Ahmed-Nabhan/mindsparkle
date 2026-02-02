@@ -460,6 +460,8 @@ export const ChatScreen: React.FC = () => {
     );
   };
 
+  const clearChatDisabled = isLoading && Platform.OS !== 'web';
+
   const handleMessageLongPress = (msg: Message) => {
     const content = String(msg?.content || '');
     Alert.alert('Message', 'Choose an action', [
@@ -918,7 +920,7 @@ export const ChatScreen: React.FC = () => {
                 accessibilityRole="button"
                 accessibilityLabel="Clear chat"
                 style={[styles.forgetButton, styles.clearChatButton]}
-                disabled={isLoading}
+                disabled={clearChatDisabled}
               >
                 <Text style={styles.forgetButtonText}>Clear chat</Text>
               </TouchableOpacity>
