@@ -137,7 +137,7 @@ export var callApi = async function(action: string, data: any, retries: number =
 
   // The openai-proxy Edge Function validates the user's JWT for nearly all actions.
   // Avoid confusing "Invalid JWT" errors on fresh installs by failing fast.
-  const guestAllowedActions = new Set(['test', 'chatMind', 'listAgents', 'chatMindMemory', 'config', 'feedback', 'retry']);
+  const guestAllowedActions = new Set(['test', 'chatMind', 'chatMindStream', 'listAgents', 'chatMindMemory', 'config', 'feedback', 'retry']);
   if (!guestAllowedActions.has(action)) {
     const token = await getSessionAccessToken();
     if (!token) {

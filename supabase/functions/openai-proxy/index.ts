@@ -227,11 +227,11 @@ function sseHeaders() {
 }
 
 // ========== CHAT MIND MODE + MEMORY ==========
-type ChatMindMode = 'general' | 'study' | 'work' | 'health';
+type ChatMindMode = 'general' | 'study' | 'work' | 'health' | 'code' | 'writing' | 'language' | 'creative';
 
 function normalizeChatMindMode(raw: any): ChatMindMode {
   const v = String(raw || '').trim().toLowerCase();
-  if (v === 'study' || v === 'work' || v === 'health') return v;
+  if (v === 'study' || v === 'work' || v === 'health' || v === 'code' || v === 'writing' || v === 'language' || v === 'creative') return v;
   return 'general';
 }
 
@@ -244,6 +244,18 @@ function modeGuidance(mode: ChatMindMode): string {
   }
   if (mode === 'health') {
     return `\n\nMode: Health\n- Be supportive and practical.\n- Include safety guidance: not a medical professional; encourage seeing a clinician for urgent/serious symptoms.\n- Ask a short clarifying question if needed.\n- Output format (plain text, no markdown symbols):\n  Summary:\n  Practical steps: (bullets)\n  Safety note:\n  Clarifying question:`;
+  }
+  if (mode === 'code') {
+    return `\n\nMode: Code\n- Be precise and practical.\n- Provide clear steps and working examples.\n- Call out edge cases and common pitfalls.\n- Output format (plain text):\n  Summary:\n  Steps: (bullets)\n  Example:`;
+  }
+  if (mode === 'writing') {
+    return `\n\nMode: Writing\n- Focus on clarity, tone, and structure.\n- Provide concise drafts with optional alternatives.\n- Highlight key edits or improvements.\n- Output format (plain text):\n  Summary:\n  Draft:\n  Notes:`;
+  }
+  if (mode === 'language') {
+    return `\n\nMode: Language\n- Prioritize correctness and natural phrasing.\n- Provide corrections and short explanations.\n- Offer a concise translated or improved version.\n- Output format (plain text):\n  Summary:\n  Improved text:\n  Notes:`;
+  }
+  if (mode === 'creative') {
+    return `\n\nMode: Creative\n- Be imaginative but coherent.\n- Provide 2–3 ideas if helpful.\n- Keep it concise unless asked to expand.\n- Output format (plain text):\n  Summary:\n  Ideas:\n  Draft (optional):`;
   }
   return `\n\nMode: General\n- Be concise and clear by default. Expand if asked.\n- Use simple labels and bullets (plain text, no markdown symbols like # or **).\n- If the topic is technical, include 1 short example or analogy.\n- Output format (plain text):\n  Summary:\n  Key points: (bullets)\n  Example (if helpful):`;
 }
@@ -427,6 +439,31 @@ async function webSearch(query: string, maxResults = 5): Promise<WebSource[]> {
   return [];
 }
 
+function openAiUsesMaxCompletionTokens(model: string): boolean {
+  const m = String(model || '').trim().toLowerCase();
+  // Some newer OpenAI model families reject `max_tokens` and require `max_completion_tokens`.
+  // Keep this heuristic conservative and easy to extend.
+  return m.startsWith('o1') || m.startsWith('gpt-5') || m.startsWith('gpt-4.1');
+}
+
+function buildOpenAiChatCompletionsBody(params: {
+  model: string;
+  messages: any[];
+  temperature: number;
+  maxTokens: number;
+  stream?: boolean;
+  responseFormat?: any;
+}): any {
+  const { model, messages, temperature, maxTokens, stream, responseFormat } = params;
+  const safeMaxTokens = Math.max(1, Math.min(maxTokens || 1, 16000));
+  const body: any = { model, messages, temperature };
+  if (openAiUsesMaxCompletionTokens(model)) body.max_completion_tokens = safeMaxTokens;
+  else body.max_tokens = safeMaxTokens;
+  if (stream != null) body.stream = Boolean(stream);
+  if (responseFormat) body.response_format = responseFormat;
+  return body;
+}
+
 async function callOpenAIInternalStream(
   messages: any[],
   maxTokens: number,
@@ -436,13 +473,12 @@ async function callOpenAIInternalStream(
   const apiKey = Deno.env.get('OPENAI_API_KEY');
   if (!apiKey) throw new Error('OPENAI_API_KEY not set');
 
-  const safeMaxTokens = Math.max(1, Math.min(maxTokens || 1, 16000));
   const res = await fetchWithTimeout(
     'https://api.openai.com/v1/chat/completions',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages, max_tokens: safeMaxTokens, temperature, stream: true }),
+      body: JSON.stringify(buildOpenAiChatCompletionsBody({ model, messages, temperature, maxTokens, stream: true })),
     },
     OPENAI_TIMEOUT_MS,
   );
@@ -455,16 +491,254 @@ async function callOpenAIInternalStream(
 
   return res;
 }
+async function readOpenAIStreamText(res: Response): Promise<string> {
+  const reader = res.body?.getReader();
+  if (!reader) return '';
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let out = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let split;
+    while ((split = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, split);
+      buffer = buffer.slice(split + 2);
+      const lines = frame.split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.replace(/^data:\s*/, '');
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          const obj = JSON.parse(payload);
+          const delta = obj?.choices?.[0]?.delta?.content;
+          if (typeof delta === 'string' && delta.length > 0) {
+            out += delta;
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  return out;
+}
 
-async function callProviderOnce(
+async function callOpenAIInternalStreamText(
   messages: any[],
   maxTokens: number,
   temperature: number,
-  provider: LlmProvider,
-  meta?: LlmCallMeta,
-  modelOverrides?: Partial<Record<LlmProvider, string>>,
+  model: string,
 ): Promise<string> {
-  return callOpenAI(messages, maxTokens, temperature, modelOverrides?.openai, meta, [provider], modelOverrides);
+  const res = await callOpenAIInternalStream(messages, maxTokens, temperature, model);
+  return await readOpenAIStreamText(res);
+}
+
+async function callAnthropicInternalStreamText(
+  messages: any[],
+  maxTokens: number,
+  temperature: number,
+  model: string,
+): Promise<string> {
+  const apiKey = (Deno.env.get('ANTHROPIC_API_KEY') || '').trim();
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
+
+  const safeMaxTokens = Math.max(1, Math.min(maxTokens || 1, 8000));
+  const modelToUse = model || Deno.env.get('ANTHROPIC_TEXT_MODEL') || 'claude-3-5-sonnet-latest';
+  const { system, messages: anthMessages } = openAiMessagesToAnthropic(messages);
+
+  const res = await fetchWithTimeout(
+    'https://api.anthropic.com/v1/messages',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: modelToUse,
+        max_tokens: safeMaxTokens,
+        temperature,
+        stream: true,
+        system: system || undefined,
+        messages: anthMessages,
+      }),
+    },
+    OPENAI_TIMEOUT_MS,
+  );
+
+  if (!res.ok) {
+    const bodyText = await res.text();
+    const safeMsg = summarizeAnthropicError(res.status, bodyText);
+    const err: any = new Error(`Anthropic error: ${res.status} ${safeMsg}`);
+    err.status = res.status;
+    console.error('[openai-proxy] Anthropic error:', res.status);
+    throw err;
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) return '';
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let out = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let split;
+    while ((split = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, split);
+      buffer = buffer.slice(split + 2);
+      const lines = frame.split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.replace(/^data:\s*/, '');
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          const obj = JSON.parse(payload);
+          if (obj?.type === 'content_block_delta' && typeof obj?.delta?.text === 'string') {
+            out += obj.delta.text;
+          } else if (obj?.type === 'content_block_start' && typeof obj?.content_block?.text === 'string') {
+            out += obj.content_block.text;
+          } else if (typeof obj?.delta?.text === 'string') {
+            out += obj.delta.text;
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  return out;
+}
+
+async function callGeminiInternalStreamText(
+  messages: any[],
+  maxTokens: number,
+  temperature: number,
+  model: string,
+): Promise<string> {
+  const apiKey = Deno.env.get('GEMINI_API_KEY');
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+
+  const safeMaxTokens = Math.max(1, Math.min(maxTokens || 1, 8192));
+  const promptText = openAiMessagesToGeminiText(messages);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: promptText }] }],
+        generationConfig: {
+          temperature,
+          maxOutputTokens: safeMaxTokens,
+        },
+      }),
+    },
+    OPENAI_TIMEOUT_MS,
+  );
+
+  if (!res.ok) {
+    const bodyText = await res.text();
+    const safeMsg = summarizeGeminiError(res.status, bodyText);
+    const err: any = new Error(`Gemini error: ${res.status} ${safeMsg}`);
+    err.status = res.status;
+    console.error('[openai-proxy] Gemini error:', res.status);
+    throw err;
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) return '';
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let out = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let split;
+    while ((split = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, split);
+      buffer = buffer.slice(split + 2);
+      const lines = frame.split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.replace(/^data:\s*/, '');
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          const obj = JSON.parse(payload);
+          const parts = obj?.candidates?.[0]?.content?.parts;
+          if (Array.isArray(parts)) {
+            const text = parts.map((p: any) => p?.text).filter(Boolean).join('');
+            if (text) out += text;
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  return out;
+}
+
+async function callProviderStreamOnce(params: {
+  messages: any[];
+  maxTokens: number;
+  temperature: number;
+  provider: LlmProvider;
+  meta?: LlmCallMeta;
+  modelOverrides?: Partial<Record<LlmProvider, string>>;
+}): Promise<string> {
+  const { messages, maxTokens, temperature, provider, meta, modelOverrides } = params;
+  const startedAt = Date.now();
+  if (provider === 'openai') {
+    const model = String(modelOverrides?.openai || Deno.env.get('OPENAI_CHAT_MODEL') || 'gpt-5.2');
+    const text = await callOpenAIInternalStreamText(messages, maxTokens, temperature, model);
+    await tryLogAiUsage(meta, {
+      provider,
+      model,
+      tokensInput: 0,
+      tokensOutput: 0,
+      estimatedCost: 0,
+      latencyMs: Date.now() - startedAt,
+      wasFallback: false,
+    }, true);
+    return text;
+  }
+  if (provider === 'gemini') {
+    const model = String(modelOverrides?.gemini || Deno.env.get('GEMINI_TEXT_MODEL') || 'gemini-1.5-pro');
+    const text = await callGeminiInternalStreamText(messages, maxTokens, temperature, model);
+    await tryLogAiUsage(meta, {
+      provider,
+      model,
+      tokensInput: 0,
+      tokensOutput: 0,
+      estimatedCost: 0,
+      latencyMs: Date.now() - startedAt,
+      wasFallback: false,
+    }, true);
+    return text;
+  }
+  const model = String(modelOverrides?.anthropic || Deno.env.get('ANTHROPIC_TEXT_MODEL') || 'claude-3-5-sonnet-latest');
+  const text = await callAnthropicInternalStreamText(messages, maxTokens, temperature, model);
+  await tryLogAiUsage(meta, {
+    provider,
+    model,
+    tokensInput: 0,
+    tokensOutput: 0,
+    estimatedCost: 0,
+    latencyMs: Date.now() - startedAt,
+    wasFallback: false,
+  }, true);
+  return text;
 }
 
 async function ensembleChatMindAnswer(params: {
@@ -473,18 +747,43 @@ async function ensembleChatMindAnswer(params: {
   modelOverrides?: Partial<Record<LlmProvider, string>>;
   maxTokens: number;
   temperature: number;
+  providerOrder?: LlmProvider[];
+  maxModelCalls?: number;
 }): Promise<string> {
   const { messages, meta, modelOverrides, maxTokens, temperature } = params;
+  const configuredOrder = parseProviderOrder();
+  const desiredOrder = Array.isArray(params.providerOrder) && params.providerOrder.length
+    ? intersectProviderOrder(params.providerOrder, configuredOrder)
+    : configuredOrder;
+  const order = desiredOrder.length ? desiredOrder : configuredOrder;
+  const maxModelCalls = Number.isFinite(params.maxModelCalls as any) ? Number(params.maxModelCalls) : 99;
 
-  const results = await Promise.allSettled([
-    callProviderOnce(messages, maxTokens, temperature, 'openai', meta, modelOverrides),
-    callProviderOnce(messages, maxTokens, temperature, 'gemini', meta, modelOverrides),
-    callProviderOnce(messages, maxTokens, temperature, 'anthropic', meta, modelOverrides),
-  ]);
+  // Free/guest safety: limit to at most 2 model calls and avoid the extra synthesis call.
+  // This keeps cost/latency predictable and matches the product requirement.
+  if (maxModelCalls <= 2) {
+    const first = order[0] || 'openai';
+    const second = order[1] || first;
+    try {
+      return await callProviderStreamOnce({ messages, maxTokens, temperature, provider: first, meta, modelOverrides });
+    } catch (e1: any) {
+      if (second === first) throw e1;
+      try {
+        return await callProviderStreamOnce({ messages, maxTokens, temperature, provider: second, meta, modelOverrides });
+      } catch (e2: any) {
+        const r1 = redactSecrets(String(e1?.message || e1 || 'Unknown error')).slice(0, 220);
+        const r2 = redactSecrets(String(e2?.message || e2 || 'Unknown error')).slice(0, 220);
+        throw new Error(`All AI providers failed to respond. (${first}: ${r1} | ${second}: ${r2})`);
+      }
+    }
+  }
+
+  const providers = (order.length ? order : (['openai', 'gemini', 'anthropic'] as LlmProvider[])).slice(0, 3);
+  const results = await Promise.allSettled(
+    providers.map((provider) => callProviderStreamOnce({ messages, maxTokens, temperature, provider, meta, modelOverrides })),
+  );
 
   const drafts: string[] = [];
   const labels: string[] = [];
-  const providers: LlmProvider[] = ['openai', 'gemini', 'anthropic'];
 
   results.forEach((r, idx) => {
     if (r.status === 'fulfilled' && String(r.value || '').trim()) {
@@ -494,7 +793,16 @@ async function ensembleChatMindAnswer(params: {
   });
 
   if (drafts.length === 0) {
-    throw new Error('All AI providers failed to respond.');
+    const reasons = results
+      .map((r, idx) => {
+        if (r.status !== 'rejected') return null;
+        const rawMsg = String((r as any)?.reason?.message || (r as any)?.reason || 'Unknown error');
+        const safeMsg = redactSecrets(rawMsg).slice(0, 220);
+        return `${providers[idx]}: ${safeMsg}`;
+      })
+      .filter(Boolean)
+      .join(' | ');
+    throw new Error(`All AI providers failed to respond.${reasons ? ` (${reasons})` : ''}`);
   }
   if (drafts.length === 1) {
     return drafts[0];
@@ -537,18 +845,41 @@ async function ensembleMultiProviderAnswer(params: {
   modelOverrides?: Partial<Record<LlmProvider, string>>;
   maxTokens: number;
   temperature: number;
+  providerOrder?: LlmProvider[];
+  maxModelCalls?: number;
 }): Promise<string> {
   const { messages, meta, modelOverrides, maxTokens, temperature } = params;
+  const configuredOrder = parseProviderOrder();
+  const desiredOrder = Array.isArray(params.providerOrder) && params.providerOrder.length
+    ? intersectProviderOrder(params.providerOrder, configuredOrder)
+    : configuredOrder;
+  const order = desiredOrder.length ? desiredOrder : configuredOrder;
+  const maxModelCalls = Number.isFinite(params.maxModelCalls as any) ? Number(params.maxModelCalls) : 99;
 
-  const results = await Promise.allSettled([
-    callProviderOnce(messages, maxTokens, temperature, 'openai', meta, modelOverrides),
-    callProviderOnce(messages, maxTokens, temperature, 'gemini', meta, modelOverrides),
-    callProviderOnce(messages, maxTokens, temperature, 'anthropic', meta, modelOverrides),
-  ]);
+  if (maxModelCalls <= 2) {
+    const first = order[0] || 'openai';
+    const second = order[1] || first;
+    try {
+      return await callProviderStreamOnce({ messages, maxTokens, temperature, provider: first, meta, modelOverrides });
+    } catch (e1: any) {
+      if (second === first) throw e1;
+      try {
+        return await callProviderStreamOnce({ messages, maxTokens, temperature, provider: second, meta, modelOverrides });
+      } catch (e2: any) {
+        const r1 = redactSecrets(String(e1?.message || e1 || 'Unknown error')).slice(0, 220);
+        const r2 = redactSecrets(String(e2?.message || e2 || 'Unknown error')).slice(0, 220);
+        throw new Error(`All AI providers failed to respond. (${first}: ${r1} | ${second}: ${r2})`);
+      }
+    }
+  }
+
+  const providers = (order.length ? order : (['openai', 'gemini', 'anthropic'] as LlmProvider[])).slice(0, 3);
+  const results = await Promise.allSettled(
+    providers.map((provider) => callProviderStreamOnce({ messages, maxTokens, temperature, provider, meta, modelOverrides })),
+  );
 
   const drafts: string[] = [];
   const labels: string[] = [];
-  const providers: LlmProvider[] = ['openai', 'gemini', 'anthropic'];
 
   results.forEach((r, idx) => {
     if (r.status === 'fulfilled' && String(r.value || '').trim()) {
@@ -558,7 +889,16 @@ async function ensembleMultiProviderAnswer(params: {
   });
 
   if (drafts.length === 0) {
-    throw new Error('All AI providers failed to respond.');
+    const reasons = results
+      .map((r, idx) => {
+        if (r.status !== 'rejected') return null;
+        const rawMsg = String((r as any)?.reason?.message || (r as any)?.reason || 'Unknown error');
+        const safeMsg = redactSecrets(rawMsg).slice(0, 220);
+        return `${providers[idx]}: ${safeMsg}`;
+      })
+      .filter(Boolean)
+      .join(' | ');
+    throw new Error(`All AI providers failed to respond.${reasons ? ` (${reasons})` : ''}`);
   }
   if (drafts.length === 1) return drafts[0];
 
@@ -650,8 +990,12 @@ const DEFAULT_FEATURE_FLAGS: FeatureFlags = {
   multi_model: { enabled: true, settings: { models: ['claude', 'gpt', 'gemini'] } },
   retry_button: { enabled: true },
   like_dislike: { enabled: true },
-  dark_mode: { enabled: false },
+  dark_mode: { enabled: true },
   guest_mode: { enabled: true, settings: { message_limit: 10, history_retention_hours: 24 } },
+  file_upload: { enabled: true, settings: { max_size_mb: 50, allowed_types: ['pdf', 'docx', 'xlsx', 'pptx', 'txt', 'csv', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'mp3', 'mp4'] } },
+  document_generation: { enabled: true, settings: { formats: ['docx', 'pdf', 'xlsx', 'pptx', 'md'] } },
+  voice_input: { enabled: true },
+  suggested_prompts: { enabled: true },
 };
 
 let featureFlagsCache: { ts: number; flags: FeatureFlags } | null = null;
@@ -897,13 +1241,19 @@ function detectLanguageFromText(text: string): string {
   const t = String(text || '');
   if (!t.trim()) return 'en';
 
+  if (/[\u0590-\u05FF]/.test(t)) return 'he';
+  if (/[\u0900-\u097F]/.test(t)) return 'hi';
   if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/.test(t)) return 'ar';
+  if (/[\u0980-\u09FF]/.test(t)) return 'ur';
   if (/[\u3040-\u309F\u30A0-\u30FF]/.test(t)) return 'ja';
   if (/[\uAC00-\uD7AF]/.test(t)) return 'ko';
   if (/[\u4E00-\u9FFF]/.test(t)) return 'zh';
   if (/[\u0400-\u04FF]/.test(t)) return 'ru';
 
   const lower = t.toLowerCase();
+  // Franco Arabic (Arabizi) detection
+  if (/\b(ezayak|3amel|3ayz|ma3lesh|shokran|7abibi|7abibti|3arabi|3ayez|7elwa|5alas|8ali|9alb)\b/.test(lower)) return 'ar';
+  if (/[236789]/.test(lower) && /[a-z]/.test(lower) && /(3|7|5|9|8|6|2)/.test(lower)) return 'ar';
   if (/[¿¡]/.test(t) || /\b(que|para|con|por|como|pero|porque|gracias|hola|usted|ustedes)\b/.test(lower)) return 'es';
   if (/\b(le|la|les|des|pour|avec|merci|bonjour|vous|au|aux)\b/.test(lower)) return 'fr';
   if (/\b(der|die|das|und|nicht|bitte|danke|haben|sein)\b/.test(lower)) return 'de';
@@ -916,6 +1266,9 @@ function detectLanguageFromText(text: string): string {
 function languageInstruction(lang: string): string {
   switch (lang) {
     case 'ar': return '\nLanguage: Respond in Arabic.';
+    case 'he': return '\nLanguage: Respond in Hebrew.';
+    case 'hi': return '\nLanguage: Respond in Hindi.';
+    case 'ur': return '\nLanguage: Respond in Urdu.';
     case 'zh': return '\nLanguage: Respond in Chinese.';
     case 'ja': return '\nLanguage: Respond in Japanese.';
     case 'ko': return '\nLanguage: Respond in Korean.';
@@ -1120,11 +1473,13 @@ async function callAnthropicInternal(
         err.status = res.status;
         // Stateless logging: never log upstream bodies (may contain user content).
         console.error('[openai-proxy] Anthropic error:', res.status);
-        if ((res.status === 429 || res.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
-          await sleep(500 * Math.pow(2, attempt));
-          continue;
-        }
-        throw err;
+
+          if ((res.status === 429 || res.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
+            await sleep(500 * Math.pow(2, attempt));
+            continue;
+          }
+
+          throw err;
       }
 
       const data = await res.json();
@@ -1156,6 +1511,7 @@ async function callAnthropicInternal(
       const isTimeout = msg.includes('aborted') || msg.includes('timeout');
       if ((isTimeout || e?.status === 429 || e?.status >= 500) && attempt < OPENAI_MAX_RETRIES) {
         await sleep(500 * Math.pow(2, attempt));
+
         continue;
       }
       break;
@@ -1214,7 +1570,7 @@ async function callOpenAIInternal(
         {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-          body: JSON.stringify({ model: modelToUse, messages, max_tokens: safeMaxTokens, temperature }),
+          body: JSON.stringify(buildOpenAiChatCompletionsBody({ model: modelToUse, messages, temperature, maxTokens: safeMaxTokens })),
         },
         OPENAI_TIMEOUT_MS
       );
@@ -1361,7 +1717,7 @@ async function callGeminiInternal(
       const isTimeout = msg.includes('aborted') || msg.includes('timeout');
       if (isTimeout && attempt < OPENAI_MAX_RETRIES) {
         await sleep(500 * Math.pow(2, attempt));
-        continue;
+      const reader = res.body?.getReader(); // Ensure reader is obtained correctly
       }
       break;
     }
@@ -1395,6 +1751,7 @@ async function callOpenAI(
     : configuredOrder;
 
   let lastErr: any;
+
   for (let idx = 0; idx < providers.length; idx++) {
     const provider = providers[idx];
     try {
@@ -1481,15 +1838,15 @@ function chooseChatProviderOrder(params: { question: string; context: string; hi
   // Heuristics:
   // - Long-context summarization/translation tends to do well on Gemini.
   // - Code/debugging tends to do well on OpenAI.
-  // - Otherwise: prefer OpenAI, then Claude, then Gemini (if configured).
+  // - Otherwise: prefer OpenAI, then Gemini, then Claude (if configured).
   if ((ctxLen > 12000 && wantsSummarizeOrExtract) || (ctxLen > 8000 && wantsTranslate)) {
-    return intersectProviderOrder(['gemini', 'anthropic', 'openai'], configuredOrder);
+    return intersectProviderOrder(['gemini', 'openai', 'anthropic'], configuredOrder);
   }
   if (hasCodeSignals) {
-    return intersectProviderOrder(['openai', 'anthropic', 'gemini'], configuredOrder);
+    return intersectProviderOrder(['openai', 'gemini', 'anthropic'], configuredOrder);
   }
 
-  return intersectProviderOrder(['openai', 'anthropic', 'gemini'], configuredOrder);
+  return intersectProviderOrder(['openai', 'gemini', 'anthropic'], configuredOrder);
 }
 
 // Strict JSON helper: asks the best configured provider to return a single JSON object.
@@ -1531,13 +1888,13 @@ async function callOpenAIJson(
             {
               method: "POST",
               headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-              body: JSON.stringify({
+              body: JSON.stringify(buildOpenAiChatCompletionsBody({
                 model: usedModel,
                 messages,
-                max_tokens: safeMaxTokens,
                 temperature,
-                response_format: { type: "json_object" },
-              }),
+                maxTokens: safeMaxTokens,
+                responseFormat: { type: "json_object" },
+              })),
             },
             OPENAI_TIMEOUT_MS
           );
@@ -2445,7 +2802,7 @@ async function chat(
   history: any[] = [],
   meta?: LlmCallMeta,
   agentId?: string,
-  opts?: { chatMindMode?: ChatMindMode; chatMindMemorySummary?: string; chatMindMemoryEnabled?: boolean; multiModelEnabled?: boolean }
+  opts?: { chatMindMode?: ChatMindMode; chatMindMemorySummary?: string; chatMindMemoryEnabled?: boolean; multiModelEnabled?: boolean; isPremium?: boolean; isChatMindRequest?: boolean }
 ): Promise<string> {
   // Handle undefined content gracefully
   if (!content || typeof content !== 'string') {
@@ -2468,7 +2825,10 @@ Accuracy first: do not guess. If unsure, say you are not sure and suggest a next
 Prefer structured answers: short summary, then bullets/steps when useful.`
     : "You are a helpful AI study assistant. Be concise and clear by default. If the user asks for detail, expand. If context is missing, ask 1 short clarifying question. Accuracy first: do not guess. If unsure, say you are not sure and suggest a next step. Prefer structured answers: short summary, then bullets/steps when useful.";
 
-  const isChatMindRequest = String(meta?.requestType || '') === 'chatMind' || String(meta?.requestType || '') === 'chatMindStream';
+  const isChatMindRequest =
+    Boolean(opts?.isChatMindRequest) ||
+    String(meta?.requestType || '') === 'chatMind' ||
+    String(meta?.requestType || '') === 'chatMindStream';
   const mode = isChatMindRequest ? normalizeChatMindMode(opts?.chatMindMode) : 'general';
   const memorySummary = isChatMindRequest && opts?.chatMindMemoryEnabled ? String(opts?.chatMindMemorySummary || '').trim() : '';
   const memoryBlock = memorySummary ? `\n\nUser memory (opt-in; may be empty/partial):\n- ${memorySummary}` : '';
@@ -2588,6 +2948,8 @@ Capabilities:
   const maxTokens = isChatMindRequest ? 1100 : 900;
   const temp = isChatMindRequest ? 0.2 : 0.35;
   const multiModelEnabled = Boolean(opts?.multiModelEnabled);
+  const isPremium = Boolean(opts?.isPremium);
+  const maxModelCalls = isPremium ? 99 : 2;
   let answer = isChatMindRequest
     ? await ensembleChatMindAnswer({
         messages,
@@ -2595,6 +2957,8 @@ Capabilities:
         modelOverrides,
         maxTokens,
         temperature: temp,
+        providerOrder,
+        maxModelCalls,
       })
     : (multiModelEnabled
         ? await ensembleMultiProviderAnswer({
@@ -2603,6 +2967,8 @@ Capabilities:
             modelOverrides,
             maxTokens,
             temperature: temp,
+            providerOrder,
+            maxModelCalls,
           })
         : await callOpenAI(messages, maxTokens, temp, modelOverrides.openai || "gpt-5.2", meta, providerOrder, modelOverrides));
   if (isChatMindRequest) {
@@ -2799,7 +3165,10 @@ Deno.serve(async (req) => {
         JSON.stringify({
           status: "ok",
           version: "3.1-vendor-expertise",
-          hasOpenAIKey: Boolean(Deno.env.get("OPENAI_API_KEY")),
+            hasOpenAIKey: Boolean(Deno.env.get("OPENAI_API_KEY")),
+            hasGeminiKey: Boolean(Deno.env.get("GEMINI_API_KEY")),
+            hasAnthropicKey: Boolean(Deno.env.get("ANTHROPIC_API_KEY")),
+            providerOrder: parseProviderOrder(),
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -2902,9 +3271,12 @@ Deno.serve(async (req) => {
       }
     }
 
+    const premiumUser = (!isGuest && user?.id)
+      ? await isPremiumUser(supabase, user.id)
+      : false;
+
     if (!isGuest) {
-      const premium = await isPremiumUser(supabase, user.id);
-      if (!premium) {
+      if (!premiumUser) {
         // ChatMind gets its own higher cap.
         const freeChatMindDailyLimit = parseOptionalNumberEnv('FREE_CHATMIND_DAILY_LIMIT') || 30;
         if (freeChatMindDailyLimit > 0) {
@@ -2952,8 +3324,7 @@ Deno.serve(async (req) => {
     // Optional per-feature daily limits for free users (server-side backstop).
     // Disabled by default unless you set the corresponding env vars.
     if (!isGuest) {
-      const premiumForFeatureCaps = await isPremiumUser(supabase, user.id);
-      if (!premiumForFeatureCaps) {
+      if (!premiumUser) {
         const today = new Date().toISOString().slice(0, 10);
         const actionToEnv: Record<string, { env: string; label: string }> = {
           quiz: { env: 'FREE_QUIZ_DAILY_LIMIT', label: 'quiz' },
@@ -3063,7 +3434,12 @@ Deno.serve(async (req) => {
         }
 
         const multiModelEnabled = featureFlags?.multi_model?.enabled !== false;
-        const regenerated = await chat('', String(original.prompt), [], meta, agentId, { multiModelEnabled });
+        const retryIsChatMind = String(original?.chat_type || '').toLowerCase() === 'chatmind';
+        const regenerated = await chat('', String(original.prompt), [], meta, agentId, {
+          multiModelEnabled,
+          isPremium: premiumUser,
+          isChatMindRequest: retryIsChatMind,
+        });
         const newMessageId = await createChatMessage({
           db: dbClient,
           userId: !isGuest && user?.id ? user.id : undefined,
@@ -3097,7 +3473,7 @@ Deno.serve(async (req) => {
         break;
       case "chat": {
         const multiModelEnabled = featureFlags?.multi_model?.enabled !== false;
-        const responseText = await chat(contentCompat, questionCompat, history || [], meta, agentId, { multiModelEnabled });
+        const responseText = await chat(contentCompat, questionCompat, history || [], meta, agentId, { multiModelEnabled, isPremium: premiumUser });
         const messageId = await createChatMessage({
           db: dbClient,
           userId: !isGuest && user?.id ? user.id : undefined,
@@ -3114,7 +3490,7 @@ Deno.serve(async (req) => {
       case "docChat": {
         // Explicit document chat action (isolated from Chat Mind)
         const multiModelEnabled = featureFlags?.multi_model?.enabled !== false;
-        const responseText = await chat(contentCompat, questionCompat, history || [], meta, agentId, { multiModelEnabled });
+        const responseText = await chat(contentCompat, questionCompat, history || [], meta, agentId, { multiModelEnabled, isPremium: premiumUser });
         const messageId = await createChatMessage({
           db: dbClient,
           userId: !isGuest && user?.id ? user.id : undefined,
@@ -3145,6 +3521,8 @@ Deno.serve(async (req) => {
             chatMindMemoryEnabled: memoryEnabled,
             chatMindMemorySummary: memorySummary,
             multiModelEnabled,
+            isPremium: premiumUser,
+            isChatMindRequest: true,
           });
 
           if (!isGuest && memoryEnabled && shouldUpdateChatMindMemory(questionCompat)) {
@@ -3263,6 +3641,7 @@ Citations:
         const providerOrder = chooseChatProviderOrder({ question: q, context: truncatedCtx, history });
         const primaryProvider = providerOrder[0] || 'openai';
         const multiModelEnabled = featureFlags?.multi_model?.enabled !== false;
+        const maxModelCalls = premiumUser ? 99 : 2;
 
         const messageId = await createChatMessage({
           db: dbClient,
@@ -3284,6 +3663,8 @@ Citations:
             },
             maxTokens: 1100,
             temperature: 0.2,
+            providerOrder,
+            maxModelCalls,
           });
           const sanitized = sanitizeChatMindOutput(txt);
           if (messageId) await updateChatMessageResponse({ db: dbClient, messageId, response: sanitized });
@@ -3302,6 +3683,8 @@ Citations:
                 },
                 maxTokens: 900,
                 temperature: 0.35,
+                providerOrder,
+                maxModelCalls,
               })
             : await callOpenAI(messages, 900, 0.35, undefined, meta, [primaryProvider]);
           if (messageId) await updateChatMessageResponse({ db: dbClient, messageId, response: txt });

@@ -16,6 +16,7 @@ import { ThemeProvider } from './src/context/ThemeContext';
 import { PremiumProvider } from './src/context/PremiumContext';
 import { GamificationProvider } from './src/context/GamificationContext';
 import { FeatureFlagProvider } from './src/context/FeatureFlagContext';
+import { ToastProvider } from './src/context/ToastContext';
 import { initDatabase, deleteAllDocuments } from './src/services/storage';
 import { Alert, InteractionManager, Linking } from 'react-native';
 import type { RootStackParamList } from './src/navigation/types';
@@ -159,29 +160,31 @@ export default function App() {
       <SafeAreaProvider>
         <ThemeProvider>
           <AuthProvider>
-            <FeatureFlagProvider>
-              <PremiumProvider>
-                <GamificationProvider>
-                  <DocumentProvider>
-                    <PaperProvider>
-                      <NavigationContainer
-                        ref={navigationRef}
-                        onReady={() => {
-                          void SplashScreen.hideAsync();
-                          if (pendingResetNav.current && navigationRef.isReady()) {
-                            pendingResetNav.current = false;
-                            navigationRef.navigate('ResetPassword');
-                          }
-                        }}
-                      >
-                        <AppNavigator />
-                      </NavigationContainer>
-                      <StatusBar style="light" />
-                    </PaperProvider>
-                  </DocumentProvider>
-                </GamificationProvider>
-              </PremiumProvider>
-            </FeatureFlagProvider>
+            <ToastProvider>
+              <FeatureFlagProvider>
+                <PremiumProvider>
+                  <GamificationProvider>
+                    <DocumentProvider>
+                      <PaperProvider>
+                        <NavigationContainer
+                          ref={navigationRef}
+                          onReady={() => {
+                            void SplashScreen.hideAsync();
+                            if (pendingResetNav.current && navigationRef.isReady()) {
+                              pendingResetNav.current = false;
+                              navigationRef.navigate('ResetPassword');
+                            }
+                          }}
+                        >
+                          <AppNavigator />
+                        </NavigationContainer>
+                        <StatusBar style="light" />
+                      </PaperProvider>
+                    </DocumentProvider>
+                  </GamificationProvider>
+                </PremiumProvider>
+              </FeatureFlagProvider>
+            </ToastProvider>
           </AuthProvider>
         </ThemeProvider>
       </SafeAreaProvider>

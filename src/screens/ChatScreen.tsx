@@ -22,6 +22,7 @@ import ApiService from '../services/apiService';
 import { supabase } from '../services/supabase';
 import { usePremiumContext } from '../context/PremiumContext';
 import { useFeatureFlags } from '../context/FeatureFlagContext';
+import { useTheme } from '../context/ThemeContext';
 import { useDocument } from '../hooks/useDocument';
 import type { MainDrawerScreenProps } from '../navigation/types';
 
@@ -48,6 +49,8 @@ export const ChatScreen: React.FC = () => {
   const { documentId, documentContent, documentTitle, agentId, agentName } = (route as any).params || {};
   const { isPremium, features, dailyChatCount, incrementChatCount, showPaywall } = usePremiumContext();
   const { flags } = useFeatureFlags();
+  const { theme, toggleTheme } = useTheme();
+  const t = theme.colors;
   const { getDocument } = useDocument();
 
   const [activeAgentId, setActiveAgentId] = useState<string>(agentId || 'general');
@@ -56,19 +59,6 @@ export const ChatScreen: React.FC = () => {
   const [isAgentPickerOpen, setIsAgentPickerOpen] = useState(false);
   const [isAgentsLoading, setIsAgentsLoading] = useState(false);
 
-      {!isAuthed && guestModeEnabled && (
-        <View style={styles.guestBanner}>
-          <Text style={styles.guestBannerText}>
-            Sign in to save your conversations and get unlimited messages.
-          </Text>
-          <TouchableOpacity
-            style={styles.guestBannerButton}
-            onPress={() => navigation.navigate('Auth', { mode: 'signin' } as any)}
-          >
-            <Text style={styles.guestBannerButtonText}>Sign in</Text>
-          </TouchableOpacity>
-        </View>
-      )}
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [replyTo, setReplyTo] = useState<Message | null>(null);
@@ -211,12 +201,55 @@ export const ChatScreen: React.FC = () => {
           if (!t.trim()) return null;
           return (
             <View key={`txt-${idx}`}>
-              {renderLinkifiedText(t.trim(), [styles.messageText, styles.assistantText], styles.linkText)}
+              {renderLinkifiedText(
+                t.trim(),
+                [styles.messageText, styles.assistantText, { color: (theme?.colors?.text ?? colors.text) }],
+                [styles.linkText, { color: (theme?.colors?.secondary ?? colors.secondary) }]
+              )}
             </View>
           );
         })}
       </View>
     );
+  };
+
+  const handleAttachPress = () => {
+    // Attach = take user to the Upload screen (document picker + library).
+    (navigation as any).navigate('Upload');
+  };
+
+  const handleAudioPress = async () => {
+    const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant' && String(m.content || '').trim());
+    if (!lastAssistant) {
+      Alert.alert('No audio yet', 'Ask a question first, then tap Audio to read the reply aloud.');
+      return;
+    }
+
+    const cleaned = extractSources(String(lastAssistant.content || '')).main.trim();
+    if (!cleaned) {
+      Alert.alert('No audio yet', 'Ask a question first, then tap Audio to read the reply aloud.');
+      return;
+    }
+
+    try {
+      // Prefer the browser Web Speech API on web.
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        const w = window as any;
+        if (w?.speechSynthesis && typeof w.SpeechSynthesisUtterance === 'function') {
+          w.speechSynthesis.cancel();
+          const utter = new w.SpeechSynthesisUtterance(cleaned);
+          w.speechSynthesis.speak(utter);
+          return;
+        }
+      }
+
+      // Native (and as a fallback on web) via Expo Speech.
+      const Speech = await import('expo-speech');
+      (Speech as any).stop?.();
+      (Speech as any).speak(cleaned);
+    } catch {
+      Alert.alert('Audio unavailable', 'Audio playback is not available on this device/browser.');
+    }
   };
 
   const normalizeStreamDelta = (raw: string): string => {
@@ -867,7 +900,13 @@ export const ChatScreen: React.FC = () => {
       <TouchableOpacity
         activeOpacity={1}
         onLongPress={() => handleMessageLongPress(item)}
-        style={[styles.messageBubble, isUser ? styles.userBubble : styles.assistantBubble]}
+        style={[
+          styles.messageBubble,
+          isUser ? styles.userBubble : styles.assistantBubble,
+          isUser
+            ? { backgroundColor: t.primary, borderColor: t.primary }
+            : { backgroundColor: t.cardBackground, borderColor: t.border },
+        ]}
       >
         {!isUser && (
           <View style={styles.avatarContainer}>
@@ -878,7 +917,11 @@ export const ChatScreen: React.FC = () => {
         <View style={[styles.messageContent, isUser ? styles.userContent : styles.assistantContent]}>
           {isUser ? (
             !!parsed.main && (
-              renderLinkifiedText(parsed.main, [styles.messageText, styles.userText], styles.linkText)
+              renderLinkifiedText(
+                parsed.main,
+                [styles.messageText, styles.userText, { color: t.textLight }],
+                [styles.linkText, { color: t.secondary }]
+              )
             )
           ) : (
             !!parsed.main && renderAssistantContent(parsed.main)
@@ -984,7 +1027,7 @@ export const ChatScreen: React.FC = () => {
 
   return (
     <KeyboardAvoidingView
-      style={styles.container}
+      style={[styles.container, { backgroundColor: t.background }]}
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={0}
     >
@@ -1004,6 +1047,17 @@ export const ChatScreen: React.FC = () => {
             {documentId ? (documentTitle || (activeAgentName ? 'Chat' : 'Your Document')) : (activeAgentName || 'General')}
           </Text>
         </View>
+
+        {/* Dark mode toggle */}
+        <TouchableOpacity
+          onPress={toggleTheme}
+          accessibilityRole="button"
+          accessibilityLabel="Toggle dark mode"
+          style={styles.headerIconButton}
+        >
+          <Text style={styles.headerIconText}>{theme.isDark ? '☀️' : '🌙'}</Text>
+        </TouchableOpacity>
+
         {!isPremium && (
           <View style={styles.limitBadge}>
             <Text style={styles.limitText}>
@@ -1013,8 +1067,23 @@ export const ChatScreen: React.FC = () => {
         )}
       </View>
 
+      {/* Guest Banner - Show when not authenticated */}
+      {!isAuthed && guestModeEnabled && (
+        <View style={[styles.guestBanner, { backgroundColor: t.surface, borderBottomColor: t.border }]}>
+          <Text style={styles.guestBannerText}>
+            Sign in to save your conversations and get unlimited messages.
+          </Text>
+          <TouchableOpacity
+            style={styles.guestBannerButton}
+            onPress={() => navigation.navigate('Auth', { mode: 'signin' } as any)}
+          >
+            <Text style={styles.guestBannerButtonText}>Sign in</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
       {isChatMind && (
-        <View style={styles.chatMindControls}>
+        <View style={[styles.chatMindControls, { backgroundColor: t.surface, borderBottomColor: t.border }]}>
           <View style={styles.modeRow}>
             {([
               { id: 'general', label: 'General' },
@@ -1026,12 +1095,19 @@ export const ChatScreen: React.FC = () => {
               return (
                 <TouchableOpacity
                   key={m.id}
-                  style={[styles.modeChip, selected && styles.modeChipSelected]}
+                  style={[
+                    styles.modeChip,
+                    selected && styles.modeChipSelected,
+                    {
+                      backgroundColor: selected ? t.primary : t.background,
+                      borderColor: selected ? t.primary : t.border,
+                    },
+                  ]}
                   onPress={() => setChatMindMode(m.id)}
                   accessibilityRole="button"
                   accessibilityLabel={`Set mode to ${m.label}`}
                 >
-                  <Text style={[styles.modeChipText, selected && styles.modeChipTextSelected]}>{m.label}</Text>
+                  <Text style={[styles.modeChipText, selected && styles.modeChipTextSelected, { color: selected ? t.textLight : t.text }]}>{m.label}</Text>
                 </TouchableOpacity>
               );
             })}
@@ -1055,9 +1131,13 @@ export const ChatScreen: React.FC = () => {
               }}
               accessibilityRole="button"
               accessibilityLabel="Toggle memory"
-              style={[styles.memoryToggle, chatMindMemoryEnabled && styles.memoryToggleOn]}
+              style={[
+                styles.memoryToggle,
+                chatMindMemoryEnabled && styles.memoryToggleOn,
+                { backgroundColor: chatMindMemoryEnabled ? t.primary : t.background, borderColor: chatMindMemoryEnabled ? t.primary : t.border },
+              ]}
             >
-              <Text style={[styles.memoryToggleText, chatMindMemoryEnabled && styles.memoryToggleTextOn]}>
+              <Text style={[styles.memoryToggleText, chatMindMemoryEnabled && styles.memoryToggleTextOn, { color: chatMindMemoryEnabled ? t.textLight : t.text }]}>
                 Memory: {chatMindMemoryEnabled ? 'On' : 'Off'}
               </Text>
             </TouchableOpacity>
@@ -1111,23 +1191,23 @@ export const ChatScreen: React.FC = () => {
         data={messages}
         renderItem={renderMessage}
         keyExtractor={item => item.id}
-        contentContainerStyle={styles.messageList}
+        contentContainerStyle={[styles.messageList, { backgroundColor: t.background }]}
         onContentSizeChange={() => flatListRef.current?.scrollToEnd()}
         showsVerticalScrollIndicator={false}
       />
 
       {/* Suggested Questions - only show when few messages */}
       {messages.length <= 2 && !isLoading && (
-        <View style={styles.suggestionsContainer}>
+        <View style={[styles.suggestionsContainer, { backgroundColor: t.background }]}>
           <Text style={styles.suggestionsLabel}>Try asking:</Text>
           <View style={styles.suggestions}>
             {suggestedQuestions.map((question, index) => (
               <TouchableOpacity
                 key={index}
-                style={styles.suggestionChip}
+                style={[styles.suggestionChip, { backgroundColor: t.surface, borderColor: t.border }]}
                 onPress={() => setInputText(question)}
               >
-                <Text style={styles.suggestionText}>{question}</Text>
+                <Text style={[styles.suggestionText, { color: t.text }]}>{question}</Text>
               </TouchableOpacity>
             ))}
           </View>
@@ -1208,14 +1288,30 @@ export const ChatScreen: React.FC = () => {
         </View>
       )}
       <View style={styles.inputContainer}>
+        <TouchableOpacity
+          style={[styles.inputIconButton, { backgroundColor: t.surface, borderColor: t.border }]}
+          onPress={handleAttachPress}
+          accessibilityRole="button"
+          accessibilityLabel="Attach a file"
+        >
+          <Text style={[styles.inputIconText, { color: t.text }]}>📎</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.inputIconButton, { backgroundColor: t.surface, borderColor: t.border }]}
+          onPress={handleAudioPress}
+          accessibilityRole="button"
+          accessibilityLabel="Play audio"
+        >
+          <Text style={[styles.inputIconText, { color: t.text }]}>🔊</Text>
+        </TouchableOpacity>
         <TextInput
-          style={styles.input}
+          style={[styles.input, { backgroundColor: t.surface, borderColor: t.border, color: t.text }]}
           placeholder={
             canSendMessage()
               ? (isChatMind ? 'Ask me anything…' : 'Ask me anything about this document…')
               : 'Upgrade to continue chatting'
           }
-          placeholderTextColor={colors.textLight}
+          placeholderTextColor={t.textSecondary}
           value={inputText}
           onChangeText={setInputText}
           multiline
@@ -1250,6 +1346,15 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
     backgroundColor: colors.primary,
     gap: 12,
+  },
+  headerIconButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+  },
+  headerIconText: {
+    fontSize: 18,
+    color: '#FFFFFF',
   },
   guestBanner: {
     backgroundColor: colors.surface,
@@ -1564,6 +1669,17 @@ const styles = StyleSheet.create({
   },
   loadingText: {
     color: colors.textLight,
+  inputIconButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+  },
+  inputIconText: {
+    fontSize: 18,
+  },
     fontSize: 14,
   },
   inputContainer: {

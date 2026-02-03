@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MindSparkle — AI Study Companion</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      color: #1f1f1f;
+      background: #0f0f16;
+    }
+    .hero {
+      background: radial-gradient(1200px 600px at 20% 0%, rgba(108,99,255,0.35), transparent),
+                  radial-gradient(1200px 600px at 80% 0%, rgba(157,78,221,0.35), transparent),
+                  linear-gradient(180deg, #0f0f16 0%, #151526 100%);
+      color: #fff;
+      padding: 80px 20px 60px;
+      text-align: center;
+    }
+    .hero h1 {
+      font-size: clamp(2.4rem, 4vw, 3.6rem);
+      margin-bottom: 12px;
+      letter-spacing: -0.02em;
+    }
+    .hero p {
+      max-width: 720px;
+      margin: 0 auto 24px;
+      font-size: 1.1rem;
+      color: #e2e2f0;
+    }
+    .cta {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .btn {
+      padding: 12px 22px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.2);
+      background: #6C63FF;
+      color: #fff;
+      text-decoration: none;
+      font-weight: 600;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .btn.secondary {
+      background: transparent;
+    }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(108,99,255,0.4); }
+
+    .section {
+      padding: 60px 20px;
+      background: #fff;
+      color: #1f1f1f;
+    }
+    .container { max-width: 1000px; margin: 0 auto; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 18px;
+      margin-top: 30px;
+    }
+    .card {
+      background: #f7f7ff;
+      border-radius: 16px;
+      padding: 22px;
+      border: 1px solid #ececff;
+    }
+    .card h3 { margin-bottom: 8px; color: #4b3ccf; }
+
+    .feature-band {
+      background: #151526;
+      color: #fff;
+      padding: 50px 20px;
+      text-align: center;
+    }
+
+    .footer {
+      padding: 30px 20px;
+      text-align: center;
+      color: #888;
+      background: #0f0f16;
+    }
+    .footer a { color: #9D4EDD; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <section class="hero">
+    <h1>MindSparkle</h1>
+    <p>AI that reads your materials, explains concepts clearly, and helps you study smarter. Fast, focused, and built for real learning.</p>
+    <div class="cta">
+      <a class="btn" href="/">Open the App</a>
+      <a class="btn secondary" href="/">Try ChatMind</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Everything you need to master your studies</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>AI Summaries</h3>
+          <p>Get crisp summaries and key takeaways from any document.</p>
+        </div>
+        <div class="card">
+          <h3>Flashcards & Quizzes</h3>
+          <p>Turn notes into flashcards and practice with instant quizzes.</p>
+        </div>
+        <div class="card">
+          <h3>ChatMind Tutor</h3>
+          <p>Ask anything. Get expert-level explanations with real-world context.</p>
+        </div>
+        <div class="card">
+          <h3>Multilingual Support</h3>
+          <p>Automatic language detection and natural responses.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="feature-band">
+    <div class="container">
+      <h2>Built for speed, accuracy, and focus</h2>
+      <p>Optimized responses, faster streaming, and clean outputs without clutter.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Start learning in minutes</h2>
+      <p>Open the app, upload your document, and study smarter immediately.</p>
+      <div class="cta" style="margin-top:18px;">
+        <a class="btn" href="/">Launch MindSparkle</a>
+        <a class="btn secondary" href="/privacy.html">Privacy</a>
+        <a class="btn secondary" href="/terms.html">Terms</a>
+        <a class="btn secondary" href="/support.html">Support</a>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <p>© 2026 MindSparkle. All rights reserved.</p>
+    <p><a href="/privacy.html">Privacy Policy</a> · <a href="/terms.html">Terms</a> · <a href="/support.html">Support</a></p>
+  </footer>
+</body>
+</html>

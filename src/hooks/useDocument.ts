@@ -175,7 +175,7 @@ export const useDocument = () => {
           content: result.document.extractedText,
           chunks: [result.document.extractedText],
           totalChunks: 1,
-          isLargeFile: fileSize > 10 * 1024 * 1024,
+          isLargeFile: resolvedFileSize > 10 * 1024 * 1024,
           uploadedAt: new Date(),
           fileType: result.document.fileType,
           fileSize: result.document.fileSize,

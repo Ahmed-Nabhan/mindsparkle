@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import ApiService from '../services/apiService';
+import { useToast } from './ToastContext';
 
 export type FeatureFlag = {
   enabled: boolean;
@@ -13,8 +14,12 @@ const DEFAULT_FLAGS: FeatureFlags = {
   multi_model: { enabled: true, settings: { models: ['claude', 'gpt', 'gemini'] } },
   retry_button: { enabled: true },
   like_dislike: { enabled: true },
-  dark_mode: { enabled: false },
+  dark_mode: { enabled: true },
   guest_mode: { enabled: true, settings: { message_limit: 10, history_retention_hours: 24 } },
+  file_upload: { enabled: true, settings: { max_size_mb: 50, allowed_types: ['pdf', 'docx', 'xlsx', 'pptx', 'txt', 'csv', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'mp3', 'mp4'] } },
+  document_generation: { enabled: true, settings: { formats: ['docx', 'pdf', 'xlsx', 'pptx', 'md'] } },
+  voice_input: { enabled: true },
+  suggested_prompts: { enabled: true },
 };
 
 interface FeatureFlagContextValue {
@@ -32,6 +37,8 @@ const FeatureFlagContext = createContext<FeatureFlagContextValue>({
 export const FeatureFlagProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [flags, setFlags] = useState<FeatureFlags>(DEFAULT_FLAGS);
   const [isReady, setIsReady] = useState(false);
+  const { showToast } = useToast();
+  const lastFlagsRef = useRef<FeatureFlags | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -40,7 +47,16 @@ export const FeatureFlagProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const res = await ApiService.getRemoteConfig();
         if (cancelled) return;
         if (res && typeof res === 'object') {
-          setFlags((prev) => ({ ...prev, ...(res as FeatureFlags) }));
+          const nextFlags = { ...DEFAULT_FLAGS, ...(res as FeatureFlags) };
+          const prevFlags = lastFlagsRef.current;
+          setFlags(nextFlags);
+          if (prevFlags) {
+            const changed = JSON.stringify(prevFlags) !== JSON.stringify(nextFlags);
+            if (changed) {
+              showToast('✨ New features available!', 'info');
+            }
+          }
+          lastFlagsRef.current = nextFlags;
         }
       } catch {
         // keep defaults
@@ -50,7 +66,7 @@ export const FeatureFlagProvider: React.FC<{ children: React.ReactNode }> = ({ c
     };
 
     fetchFlags();
-    const interval = setInterval(fetchFlags, 60000);
+    const interval = setInterval(fetchFlags, 30000);
     return () => {
       cancelled = true;
       clearInterval(interval);
