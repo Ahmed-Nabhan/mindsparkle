@@ -454,3 +454,115 @@ export const getAllTestResults = async (): Promise<TestResult[]> => {
     throw error;
   }
 };
+
+const parseDocumentRow = (row: any): Document => {
+  let extractedData: ExtractedData | undefined;
+  if (row.extractedDataJson) {
+    const MAX_PARSE_JSON = 900_000;
+    if (String(row.extractedDataJson).length <= MAX_PARSE_JSON) {
+      try {
+        extractedData = JSON.parse(row.extractedDataJson);
+      } catch (error) {
+        console.log('Error parsing extractedDataJson:', error);
+      }
+    }
+  }
+
+  let summaryModules: any[] | undefined;
+  if (row.summaryModulesJson) {
+    try {
+      if (String(row.summaryModulesJson).length < 2_000_000) {
+        summaryModules = JSON.parse(row.summaryModulesJson);
+      }
+    } catch (error) {
+      console.log('Error parsing summaryModulesJson:', error);
+    }
+  }
+
+  let summaryPaged: any | undefined;
+  if (row.summaryPagedJson) {
+    try {
+      if (String(row.summaryPagedJson).length < 2_000_000) {
+        summaryPaged = JSON.parse(row.summaryPagedJson);
+      }
+    } catch (error) {
+      console.log('Error parsing summaryPagedJson:', error);
+    }
+  }
+
+  return {
+    ...row,
+    uploadedAt: new Date(row.uploadedAt),
+    pdfCloudUrl: row.pdfCloudUrl || undefined,
+    extractedData,
+    summaryModules,
+    summaryPaged,
+  };
+};
+
+export const getDocumentsForMigration = async (): Promise<Document[]> => {
+  const db = await getDb();
+  const rows = await db.getAllAsync<any>('SELECT * FROM documents ORDER BY uploadedAt DESC;');
+  return rows.map(parseDocumentRow);
+};
+
+export const countDocuments = async (): Promise<number> => {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ c: number }>('SELECT COUNT(*) as c FROM documents;');
+  return Number(row?.c) || 0;
+};
+
+export const claimDocumentsForUser = async (userId: string): Promise<number> => {
+  if (!userId) return 0;
+  const db = await getDb();
+  const result = await db.runAsync(
+    `UPDATE documents SET userId = ? WHERE userId IS NULL OR userId = '';`,
+    [userId]
+  );
+  return result.changes || 0;
+};
+
+export const rekeyDocumentId = async (oldId: string, newId: string): Promise<void> => {
+  if (!oldId || !newId || oldId === newId) return;
+  const db = await getDb();
+
+  const existing = await db.getFirstAsync<any>('SELECT id FROM documents WHERE id = ?;', [newId]);
+  if (existing) {
+    await db.runAsync('DELETE FROM documents WHERE id = ?;', [oldId]);
+    return;
+  }
+
+  await db.runAsync('UPDATE documents SET id = ? WHERE id = ?;', [newId, oldId]);
+  await db.runAsync('UPDATE test_results SET documentId = ? WHERE documentId = ?;', [newId, oldId]);
+
+  const folders = await db.getAllAsync<any>('SELECT id, documentIds FROM folders;');
+  for (const folder of folders) {
+    const ids = JSON.parse(folder.documentIds || '[]');
+    const next = ids.map((id: string) => (id === oldId ? newId : id));
+    if (JSON.stringify(ids) !== JSON.stringify(next)) {
+      await db.runAsync('UPDATE folders SET documentIds = ? WHERE id = ?;', [
+        JSON.stringify(next),
+        folder.id,
+      ]);
+    }
+  }
+};
+
+export const upsertTestResult = async (result: TestResult): Promise<void> => {
+  const db = await getDb();
+  await db.runAsync(
+    `INSERT OR REPLACE INTO test_results (id, documentId, userId, score, totalQuestions, correctAnswers, completedAt, timeSpent, testType)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+    [
+      result.id,
+      result.documentId,
+      result.userId,
+      result.score,
+      result.totalQuestions,
+      result.correctAnswers,
+      result.completedAt.toISOString(),
+      result.timeSpent,
+      result.testType,
+    ]
+  );
+};

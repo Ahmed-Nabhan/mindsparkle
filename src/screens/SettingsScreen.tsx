@@ -21,6 +21,14 @@ import { useAuth } from '../context/AuthContext';
 import { restorePurchases } from '../services/revenueCat';
 import { notificationService } from '../services/notificationService';
 import * as CloudStorage from '../services/cloudStorageService';
+import {
+  CURRENT_APP_VERSION,
+  getLastMigrationReport,
+  migrateLocalDataToCurrentEdition,
+  pickAndImportBackup,
+  shareBackupFile,
+} from '../services/dataMigrationService';
+import { summarizeReport, type MigrationReport } from '../services/dataMigration/mapper';
 import type { MainDrawerScreenProps } from '../navigation/types';
 
 type SettingsScreenProps = MainDrawerScreenProps<'Settings'>;
@@ -39,10 +47,13 @@ export const SettingsScreen: React.FC = () => {
   const [studyReminders, setStudyReminders] = useState(true);
   const [streakReminders, setStreakReminders] = useState(true);
   const [storageUsage, setStorageUsage] = useState<CloudStorage.StorageUsage | null>(null);
+  const [migrationSummary, setMigrationSummary] = useState<string | null>(null);
+  const [isMigrating, setIsMigrating] = useState(false);
 
   useEffect(() => {
     loadSettings();
     loadStorageUsage();
+    loadMigrationSummary();
   }, [user]);
 
   const loadStorageUsage = async () => {
@@ -63,6 +74,76 @@ export const SettingsScreen: React.FC = () => {
       setStreakReminders(settings.streakReminders);
     } catch (error) {
       console.error('Error loading settings:', error);
+    }
+  };
+
+  const loadMigrationSummary = async () => {
+    try {
+      const report = await getLastMigrationReport();
+      if (report) {
+        setMigrationSummary(summarizeReport(report));
+      }
+    } catch (error) {
+      console.warn('Error loading migration summary:', error);
+    }
+  };
+
+  const showMigrationResult = (report: MigrationReport, title: string) => {
+    const message = summarizeReport(report);
+    setMigrationSummary(message);
+    const extra = report.errors.length
+      ? `\n\n${report.errors.slice(0, 3).join('\n')}`
+      : '';
+    Alert.alert(title, `${message}${extra}`);
+  };
+
+  const handleExportData = async () => {
+    setIsMigrating(true);
+    try {
+      const result = await shareBackupFile();
+      Alert.alert(
+        'Backup ready',
+        `Saved ${result.documentCount} document${result.documentCount === 1 ? '' : 's'} to ${result.fileName}. Keep this file to move your library into another install of this edition.`
+      );
+    } catch (error: any) {
+      Alert.alert('Export failed', error?.message || 'Could not export your data.');
+    } finally {
+      setIsMigrating(false);
+    }
+  };
+
+  const handleImportData = async () => {
+    setIsMigrating(true);
+    try {
+      const report = await pickAndImportBackup();
+      if (!report) return;
+      showMigrationResult(report, 'Import complete');
+    } catch (error: any) {
+      Alert.alert('Import failed', error?.message || 'Could not import that backup.');
+    } finally {
+      setIsMigrating(false);
+    }
+  };
+
+  const handleCopyToThisEdition = async () => {
+    if (!user) {
+      Alert.alert(
+        'Sign in required',
+        'Sign in to copy your local documents into this edition’s cloud library.'
+      );
+      return;
+    }
+    setIsMigrating(true);
+    try {
+      const report = await migrateLocalDataToCurrentEdition({
+        userId: user.id,
+        syncToCloud: true,
+      });
+      showMigrationResult(report, 'Migration complete');
+    } catch (error: any) {
+      Alert.alert('Migration failed', error?.message || 'Could not copy local data.');
+    } finally {
+      setIsMigrating(false);
     }
   };
 
@@ -314,6 +395,37 @@ export const SettingsScreen: React.FC = () => {
           )}
         </Card>
 
+        {/* Move library into this edition */}
+        <Text style={styles.sectionTitle}>Move Your Data</Text>
+        <Card style={styles.card}>
+          <Text style={styles.upgradeTitle}>Bring an existing library here</Text>
+          <Text style={styles.upgradeDescription}>
+            If you already have a working MindSparkle app, export a backup there and import it into this edition. Documents, folders, quiz history, and settings are preserved. Signed-in accounts can also copy the local library to the cloud.
+          </Text>
+          {isMigrating ? (
+            <Text style={styles.syncNote}>Working on your library…</Text>
+          ) : migrationSummary ? (
+            <Text style={styles.syncNote}>{migrationSummary}</Text>
+          ) : null}
+          <View style={styles.migrationActions}>
+            <Button title="Export backup" onPress={handleExportData} disabled={isMigrating} />
+            <View style={styles.migrationSpacer} />
+            <Button
+              title="Import backup"
+              onPress={handleImportData}
+              disabled={isMigrating}
+              variant="outline"
+            />
+            <View style={styles.migrationSpacer} />
+            <Button
+              title={user ? 'Copy local library to this edition' : 'Sign in to copy to cloud'}
+              onPress={handleCopyToThisEdition}
+              disabled={isMigrating}
+              variant="secondary"
+            />
+          </View>
+        </Card>
+
         {/* Data & Privacy Section */}
         <Text style={styles.sectionTitle}>Data & Privacy</Text>
         <Card style={styles.card}>
@@ -345,7 +457,7 @@ export const SettingsScreen: React.FC = () => {
         <Card style={styles.card}>
           <View style={styles.row}>
             <Text style={styles.label}>Version</Text>
-            <Text style={styles.value}>1.0.0</Text>
+            <Text style={styles.value}>{CURRENT_APP_VERSION}</Text>
           </View>
           <View style={styles.row}>
             <Text style={styles.label}>Build</Text>
@@ -624,5 +736,11 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 12,
     marginBottom: 12,
+  },
+  migrationActions: {
+    marginTop: 8,
+  },
+  migrationSpacer: {
+    height: 10,
   },
 });
