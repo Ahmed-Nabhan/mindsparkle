@@ -315,6 +315,13 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         void cloudSyncService.initialize(supabaseUser.id).catch((err) => {
           console.warn('[CloudSync] initialize failed:', err);
         });
+        void import('../services/dataMigrationService')
+          .then(({ migrateLocalDataToCurrentEdition }) =>
+            migrateLocalDataToCurrentEdition({ userId: supabaseUser.id, syncToCloud: true })
+          )
+          .catch((err) => {
+            console.warn('[DataMigration] login migration failed:', err);
+          });
         
         console.log('[Auth] User session updated:', appUser.id, 'Role:', appUser.role, 'Provider:', authProvider, 'Premium:', isPremiumUser);
       } catch (error) {
@@ -331,6 +338,13 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         void cloudSyncService.initialize(supabaseUser.id).catch((err) => {
           console.warn('[CloudSync] initialize failed:', err);
         });
+        void import('../services/dataMigrationService')
+          .then(({ migrateLocalDataToCurrentEdition }) =>
+            migrateLocalDataToCurrentEdition({ userId: supabaseUser.id, syncToCloud: true })
+          )
+          .catch((err) => {
+            console.warn('[DataMigration] login migration failed:', err);
+          });
       }
     } else {
       // No user - clear state

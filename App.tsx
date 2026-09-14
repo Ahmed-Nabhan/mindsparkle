@@ -7,7 +7,6 @@ import { Provider as PaperProvider } from 'react-native-paper';
 import { StyleSheet } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNavigationContainerRef } from '@react-navigation/native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { AppNavigator } from './src/navigation/AppNavigator';
 import { AuthProvider } from './src/context/AuthContext';
@@ -17,12 +16,10 @@ import { PremiumProvider } from './src/context/PremiumContext';
 import { GamificationProvider } from './src/context/GamificationContext';
 import { FeatureFlagProvider } from './src/context/FeatureFlagContext';
 import { ToastProvider } from './src/context/ToastContext';
-import { initDatabase, deleteAllDocuments } from './src/services/storage';
+import { initDatabase } from './src/services/storage';
 import { Alert, InteractionManager, Linking } from 'react-native';
 import type { RootStackParamList } from './src/navigation/types';
-
-const APP_VERSION_KEY = '@mindsparkle_app_version';
-const CURRENT_APP_VERSION = '2.0.0'; // Pro version - clear old data
+import { runStartupDataMigration } from './src/services/dataMigrationService';
 
 const navigationRef = createNavigationContainerRef<RootStackParamList>();
 
@@ -134,21 +131,11 @@ export default function App() {
       // All storage calls are guarded to wait for schema init.
       void initDatabase();
 
-      // Run maintenance AFTER first render/animations to keep startup snappy.
+      // Keep existing local data when the edition changes; migrate schema instead of wiping.
       InteractionManager.runAfterInteractions(() => {
-        void (async () => {
-          const storedVersion = await AsyncStorage.getItem(APP_VERSION_KEY);
-          if (storedVersion !== CURRENT_APP_VERSION) {
-            console.log('[App] New version detected - clearing old documents...');
-            try {
-              await deleteAllDocuments();
-              console.log('[App] Old documents cleared successfully');
-            } catch (clearError) {
-              console.log('[App] Could not clear old documents:', clearError);
-            }
-            await AsyncStorage.setItem(APP_VERSION_KEY, CURRENT_APP_VERSION);
-          }
-        })();
+        void runStartupDataMigration().catch((error) => {
+          console.warn('[App] Data migration failed:', error);
+        });
       });
     } catch (error) {
       console.error('Error preparing app:', error);
