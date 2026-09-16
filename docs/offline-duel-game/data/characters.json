@@ -1,0 +1,116 @@
+{
+  "playerExclusiveRules": {
+    "callOfDragonOnlyForUser": true,
+    "neverInNpcDecks": true,
+    "neverInShops": true,
+    "neverInPacks": true
+  },
+  "topFive": [
+    "yami_yugi",
+    "yugi_muto",
+    "seto_kaiba",
+    "zane_truesdale",
+    "jaden_yuki"
+  ],
+  "characters": [
+    {
+      "id": "yugi_muto",
+      "name": "Yugi Muto",
+      "district": "domino",
+      "role": "friend_rescue",
+      "friendOrder": 1,
+      "powerTier": 5
+    },
+    {
+      "id": "joey_wheeler",
+      "name": "Joey Wheeler",
+      "district": "domino",
+      "role": "friend_rescue",
+      "friendOrder": 2,
+      "powerTier": 3
+    },
+    {
+      "id": "tea_gardner",
+      "name": "Téa Gardner",
+      "district": "domino",
+      "role": "friend_rescue",
+      "friendOrder": 3,
+      "powerTier": 2
+    },
+    {
+      "id": "tristan_taylor",
+      "name": "Tristan Taylor",
+      "district": "domino",
+      "role": "friend_rescue",
+      "friendOrder": 4,
+      "powerTier": 2
+    },
+    {
+      "id": "syrus_truesdale",
+      "name": "Syrus Truesdale",
+      "district": "academy",
+      "role": "friend_rescue",
+      "friendOrder": 5,
+      "powerTier": 2
+    },
+    {
+      "id": "chazz_princeton",
+      "name": "Chazz Princeton",
+      "district": "academy",
+      "role": "friend_rescue",
+      "friendOrder": 6,
+      "powerTier": 3
+    },
+    {
+      "id": "alexis_rhodes",
+      "name": "Alexis Rhodes",
+      "district": "academy",
+      "role": "friend_rescue",
+      "friendOrder": 7,
+      "powerTier": 3,
+      "givesEgyptRumor": true
+    },
+    {
+      "id": "bastion_misawa",
+      "name": "Bastion Misawa",
+      "district": "academy",
+      "role": "friend_rescue",
+      "friendOrder": 8,
+      "powerTier": 3
+    },
+    {
+      "id": "zane_truesdale",
+      "name": "Zane Truesdale",
+      "district": "academy",
+      "role": "friend_rescue",
+      "friendOrder": 9,
+      "powerTier": 5
+    },
+    {
+      "id": "jaden_yuki",
+      "name": "Jaden Yuki",
+      "district": "academy",
+      "role": "friend_rescue",
+      "friendOrder": 10,
+      "powerTier": 5,
+      "unlocksVillainHunt": true,
+      "unlocksEgypt": true
+    },
+    {
+      "id": "yami_yugi",
+      "name": "Yami Yugi",
+      "district": "domino",
+      "role": "top_five_trial",
+      "friendOrder": null,
+      "powerTier": 5
+    },
+    {
+      "id": "seto_kaiba",
+      "name": "Seto Kaiba",
+      "district": "domino",
+      "role": "top_five_rival",
+      "friendOrder": null,
+      "powerTier": 5
+    }
+  ]
+}

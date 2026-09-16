@@ -1,0 +1,122 @@
+{
+  "friendGate": 10,
+  "missions": [
+    {
+      "id": "rescue_yugi",
+      "friendId": "yugi_muto",
+      "order": 1,
+      "district": "domino",
+      "location": "Domino Square Alley",
+      "phoneMessage": "Yugi is cornered in Domino Square alley by card thieves!",
+      "rewardCoins": 300,
+      "rewardCardId": "kuriboh"
+    },
+    {
+      "id": "rescue_joey",
+      "friendId": "joey_wheeler",
+      "order": 2,
+      "district": "domino",
+      "location": "Domino Pier",
+      "phoneMessage": "Joey's duel bet went bad at the pier. He's in trouble!",
+      "rewardCoins": 350,
+      "rewardCardId": "baby_dragon"
+    },
+    {
+      "id": "rescue_tea",
+      "friendId": "tea_gardner",
+      "order": 3,
+      "district": "domino",
+      "location": "Domino Museum",
+      "phoneMessage": "Téa never came back from the museum night tour...",
+      "rewardCoins": 300,
+      "rewardCardId": null
+    },
+    {
+      "id": "rescue_tristan",
+      "friendId": "tristan_taylor",
+      "order": 4,
+      "district": "domino",
+      "location": "Industrial Warehouse",
+      "phoneMessage": "Tristan got locked in the industrial warehouse district!",
+      "rewardCoins": 300,
+      "rewardCardId": null
+    },
+    {
+      "id": "rescue_syrus",
+      "friendId": "syrus_truesdale",
+      "order": 5,
+      "district": "academy",
+      "location": "Academy Dorm Arena",
+      "phoneMessage": "Syrus is panicking — bullies forced him into an unfair dorm duel!",
+      "rewardCoins": 400,
+      "rewardCardId": null
+    },
+    {
+      "id": "rescue_chazz",
+      "friendId": "chazz_princeton",
+      "order": 6,
+      "district": "academy",
+      "location": "Academy Cliff Docks",
+      "phoneMessage": "Chazz's rare binder was stolen near the pier docks under the Academy cliffs!",
+      "rewardCoins": 450,
+      "rewardCardId": "armed_dragon_lv3"
+    },
+    {
+      "id": "rescue_alexis",
+      "friendId": "alexis_rhodes",
+      "order": 7,
+      "district": "academy",
+      "location": "Abandoned Dorm Wing",
+      "phoneMessage": "Alexis disappeared after investigating the abandoned dorm wing.",
+      "rewardCoins": 500,
+      "rewardCardId": null,
+      "flagsOnComplete": ["egypt_rumor_unlocked"]
+    },
+    {
+      "id": "rescue_bastion",
+      "friendId": "bastion_misawa",
+      "order": 8,
+      "district": "academy",
+      "location": "Science Lab",
+      "phoneMessage": "Bastion's formula lab overloaded — duel spirits are leaking!",
+      "rewardCoins": 500,
+      "rewardCardId": null
+    },
+    {
+      "id": "rescue_zane",
+      "friendId": "zane_truesdale",
+      "order": 9,
+      "district": "academy",
+      "location": "Under-Duel Arena",
+      "phoneMessage": "Zane is being forced into a black-market under-duel. He won't ask for help — but he needs it.",
+      "rewardCoins": 700,
+      "rewardCardId": "cyber_dragon"
+    },
+    {
+      "id": "rescue_jaden",
+      "friendId": "jaden_yuki",
+      "order": 10,
+      "district": "academy",
+      "location": "Wild Field Edge",
+      "phoneMessage": "Jaden challenged a masked villain alone outside campus. Get there NOW.",
+      "rewardCoins": 800,
+      "rewardCardId": "elemental_hero_burstinatrix",
+      "flagsOnComplete": ["villain_hunt_unlocked", "egypt_access_unlocked"]
+    },
+    {
+      "id": "egypt_call_of_dragon",
+      "type": "unique_card_quest",
+      "district": "egypt",
+      "requiresFlags": ["egypt_access_unlocked"],
+      "requiresFriends": 10,
+      "steps": [
+        "valley_approach",
+        "trial_of_bonds",
+        "guardian_duel",
+        "claim_call_of_dragon"
+      ],
+      "rewardCardId": "call_of_dragon",
+      "onceOnly": true
+    }
+  ]
+}

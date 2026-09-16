@@ -1,0 +1,174 @@
+{
+  "cards": [
+    {
+      "id": "call_of_dragon",
+      "name": "Call of Dragon",
+      "type": "Monster",
+      "monsterType": "Dragon/Effect",
+      "attribute": "DARK",
+      "level": 12,
+      "atk": 10000,
+      "def": 10000,
+      "rarity": "unique",
+      "exclusiveToPlayer": true,
+      "acquire": "egypt_quest",
+      "shopEligible": false,
+      "npcDeckEligible": false,
+      "cannotBeDestroyed": true,
+      "summon": {
+        "method": "special_player_option",
+        "tributesRequired": 0,
+        "conditions": [
+          "opponent_monster_atk_greater_than_yours",
+          "you_control_no_monster"
+        ]
+      },
+      "effects": [
+        {
+          "id": "devour_growth",
+          "trigger": "destroy_monster_by_battle",
+          "gainAtk": 1000,
+          "duration": "this_duel"
+        },
+        {
+          "id": "spell_trap_break",
+          "timing": "ignition",
+          "oncePerTurn": true,
+          "effect": "destroy_one_spell_or_trap"
+        }
+      ]
+    },
+    {
+      "id": "dark_magician",
+      "name": "Dark Magician",
+      "type": "Monster",
+      "monsterType": "Spellcaster",
+      "attribute": "DARK",
+      "level": 7,
+      "atk": 2500,
+      "def": 2100,
+      "era": "dm",
+      "rarity": "rare"
+    },
+    {
+      "id": "blue_eyes_white_dragon",
+      "name": "Blue-Eyes White Dragon",
+      "type": "Monster",
+      "monsterType": "Dragon",
+      "attribute": "LIGHT",
+      "level": 8,
+      "atk": 3000,
+      "def": 2500,
+      "era": "dm",
+      "rarity": "rare"
+    },
+    {
+      "id": "red_eyes_black_dragon",
+      "name": "Red-Eyes Black Dragon",
+      "type": "Monster",
+      "monsterType": "Dragon",
+      "attribute": "DARK",
+      "level": 7,
+      "atk": 2400,
+      "def": 2000,
+      "era": "dm",
+      "rarity": "rare"
+    },
+    {
+      "id": "kuriboh",
+      "name": "Kuriboh",
+      "type": "Monster",
+      "monsterType": "Fiend/Effect",
+      "attribute": "DARK",
+      "level": 1,
+      "atk": 300,
+      "def": 200,
+      "era": "dm",
+      "rarity": "common"
+    },
+    {
+      "id": "baby_dragon",
+      "name": "Baby Dragon",
+      "type": "Monster",
+      "monsterType": "Dragon",
+      "attribute": "WIND",
+      "level": 3,
+      "atk": 1200,
+      "def": 700,
+      "era": "dm",
+      "rarity": "common"
+    },
+    {
+      "id": "elemental_hero_burstinatrix",
+      "name": "Elemental HERO Burstinatrix",
+      "type": "Monster",
+      "monsterType": "Warrior",
+      "attribute": "FIRE",
+      "level": 3,
+      "atk": 1200,
+      "def": 800,
+      "era": "gx",
+      "rarity": "common"
+    },
+    {
+      "id": "elemental_hero_aviany",
+      "name": "Elemental HERO Avian",
+      "type": "Monster",
+      "monsterType": "Warrior",
+      "attribute": "WIND",
+      "level": 3,
+      "atk": 1000,
+      "def": 1000,
+      "era": "gx",
+      "rarity": "common"
+    },
+    {
+      "id": "cyber_dragon",
+      "name": "Cyber Dragon",
+      "type": "Monster",
+      "monsterType": "Machine/Effect",
+      "attribute": "LIGHT",
+      "level": 5,
+      "atk": 2100,
+      "def": 1600,
+      "era": "gx",
+      "rarity": "rare"
+    },
+    {
+      "id": "armed_dragon_lv3",
+      "name": "Armed Dragon LV3",
+      "type": "Monster",
+      "monsterType": "Dragon/Effect",
+      "attribute": "WIND",
+      "level": 3,
+      "atk": 1200,
+      "def": 900,
+      "era": "gx",
+      "rarity": "common"
+    },
+    {
+      "id": "polymerization",
+      "name": "Polymerization",
+      "type": "Spell",
+      "spellType": "Normal",
+      "era": "both",
+      "rarity": "common"
+    },
+    {
+      "id": "monster_reborn",
+      "name": "Monster Reborn",
+      "type": "Spell",
+      "spellType": "Normal",
+      "era": "both",
+      "rarity": "rare"
+    },
+    {
+      "id": "mirror_force",
+      "name": "Mirror Force",
+      "type": "Trap",
+      "trapType": "Normal",
+      "era": "both",
+      "rarity": "rare"
+    }
+  ]
+}
