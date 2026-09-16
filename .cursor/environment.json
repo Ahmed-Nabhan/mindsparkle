@@ -1,0 +1,11 @@
+{
+  "name": "MindSparkle",
+  "install": "npm ci",
+  "terminals": [
+    {
+      "name": "expo-web",
+      "command": "npx expo start --web --port 8081"
+    }
+  ],
+  "ports": [8081]
+}
