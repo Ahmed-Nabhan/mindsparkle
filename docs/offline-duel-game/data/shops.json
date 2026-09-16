@@ -1,0 +1,41 @@
+{
+  "currency": "coins",
+  "shops": [
+    {
+      "id": "domino_card_shop",
+      "name": "Domino Card Shop",
+      "district": "domino",
+      "inventory": [
+        { "cardId": "kuriboh", "price": 100 },
+        { "cardId": "baby_dragon", "price": 150 },
+        { "cardId": "dark_magician", "price": 1200 },
+        { "cardId": "blue_eyes_white_dragon", "price": 2000 },
+        { "cardId": "red_eyes_black_dragon", "price": 1500 },
+        { "cardId": "polymerization", "price": 400 },
+        { "cardId": "monster_reborn", "price": 900 },
+        { "cardId": "mirror_force", "price": 900 }
+      ],
+      "excludedCardIds": ["call_of_dragon"]
+    },
+    {
+      "id": "academy_card_shop",
+      "name": "Academy Card Shop",
+      "district": "academy",
+      "inventory": [
+        { "cardId": "elemental_hero_aviany", "price": 150 },
+        { "cardId": "elemental_hero_burstinatrix", "price": 150 },
+        { "cardId": "armed_dragon_lv3", "price": 250 },
+        { "cardId": "cyber_dragon", "price": 1400 },
+        { "cardId": "polymerization", "price": 400 },
+        { "cardId": "monster_reborn", "price": 900 },
+        { "cardId": "mirror_force", "price": 900 }
+      ],
+      "excludedCardIds": ["call_of_dragon"]
+    }
+  ],
+  "notes": [
+    "Call of Dragon must never appear in either shop.",
+    "For personal offline fun, prices can be lowered later.",
+    "Both shops share the same coin wallet."
+  ]
+}
