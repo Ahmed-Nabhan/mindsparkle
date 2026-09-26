@@ -376,7 +376,7 @@ button { cursor: pointer; }
 .slide-nav { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
 .slide-card {
   border: 1px solid var(--line); border-radius: 16px; padding: 1rem;
-  background: linear-gradient(180deg, var(--hub-card), color-mix(in srgb, var(--hub-card) 80%, #1e3a8a10));
+  background: var(--hub-card);
   min-height: 160px;
 }
 .slide-card h4 { margin: 0 0 0.55rem; font-family: var(--display); font-size: 1.25rem; color: var(--navy-deep); }
