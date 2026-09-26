@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#17357a" />
+    <title>MindSparkle</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./vendor/jszip.min.js"></script>
+    <script src="./app.js" type="module"></script>
+  </head>
+  <body>
+    <!-- Auth -->
+    <section class="screen auth-screen" id="auth-screen">
+      <div class="auth-shell">
+        <div class="auth-brand">
+          <p class="eyebrow">MindSparkle</p>
+          <h1>Learn from any document.</h1>
+          <p class="lead">Summaries, quizzes, decks, guides, and study packs — in one focused workspace.</p>
+        </div>
+        <div class="auth-card">
+          <div class="tabs" role="tablist">
+            <button class="tab active" id="tab-login" type="button" role="tab" aria-selected="true">Login</button>
+            <button class="tab" id="tab-signup" type="button" role="tab" aria-selected="false">Sign up</button>
+          </div>
+
+          <form id="login-form" class="auth-form">
+            <label>Email<input id="login-email" type="email" required placeholder="you@email.com" /></label>
+            <label>Password<input id="login-password" type="password" required placeholder="••••••••" minlength="6" /></label>
+            <button class="primary wide" type="submit">Login</button>
+            <p class="tiny">Local profile for this app. Anna account powers cloud LLM separately.</p>
+          </form>
+
+          <form id="signup-form" class="auth-form" hidden>
+            <label>Name<input id="signup-name" type="text" required placeholder="Your name" /></label>
+            <label>Email<input id="signup-email" type="email" required placeholder="you@email.com" /></label>
+            <label>Password<input id="signup-password" type="password" required placeholder="Min 6 characters" minlength="6" /></label>
+            <button class="primary wide" type="submit">Create account</button>
+            <p class="tiny">Creates a local MindSparkle profile on this device.</p>
+          </form>
+          <p class="auth-error" id="auth-error" hidden></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Welcome -->
+    <section class="screen entrance" id="entrance" hidden>
+      <div class="entrance-card">
+        <p class="eyebrow">Welcome to MindSparkle</p>
+        <h1 class="brand">Mind<span>Sparkle</span></h1>
+        <p class="entrance-lead" id="welcome-user">Your AI study workspace is ready.</p>
+        <ul class="welcome-points">
+          <li>Upload PDF, DOCX, TXT, MD, CSV</li>
+          <li>Run Summarize, Quiz, Presentation, Guide, Study</li>
+          <li>Ask follow-up questions in chat</li>
+        </ul>
+        <button class="primary entrance-cta" id="enter-btn" type="button">Start learning</button>
+      </div>
+    </section>
+
+    <!-- Workspace -->
+    <div class="app" id="workspace" hidden>
+      <header class="top">
+        <div class="top-left">
+          <button class="icon-btn" id="menu-btn" type="button" title="Modes">☰</button>
+          <div>
+            <p class="eyebrow">MindSparkle</p>
+            <h1 id="mode-title">Summarize</h1>
+          </div>
+        </div>
+        <div class="top-actions">
+          <span class="pill" id="conn-pill">Connecting…</span>
+          <button class="cmd" id="theme-toggle" type="button">Dark</button>
+          <button class="cmd" id="cmd-export" type="button">Export</button>
+          <button class="cmd" id="logout-btn" type="button">Logout</button>
+        </div>
+      </header>
+
+      <div class="layout">
+        <aside class="drawer" id="drawer">
+          <div class="drawer-head">
+            <h2>Modes</h2>
+            <button class="ghost" id="drawer-close" type="button">Close</button>
+          </div>
+          <div class="mode-list" id="mode-list"></div>
+
+          <div class="doc-box">
+            <div class="doc-box-head">
+              <h3>Document</h3>
+              <span id="doc-meta">No file</span>
+            </div>
+            <label class="upload-tile" id="dropzone">
+              <strong>Upload document</strong>
+              <span>PDF · DOCX · TXT · MD · CSV</span>
+              <input
+                id="file-input"
+                type="file"
+                accept=".txt,.md,.markdown,.csv,.json,.pdf,.docx,text/plain,text/markdown,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                hidden
+              />
+            </label>
+            <textarea id="doc-input" placeholder="Or paste text…"></textarea>
+            <div class="row">
+              <button class="ghost" id="clear-doc" type="button">Clear</button>
+              <button class="secondary" id="run-mode" type="button">Run mode</button>
+            </div>
+          </div>
+
+          <div class="history-box">
+            <div class="doc-box-head">
+              <h3>Recent</h3>
+              <button class="ghost compact" id="clear-history" type="button">Clear</button>
+            </div>
+            <div id="history-list"><p class="muted">No outputs yet</p></div>
+          </div>
+        </aside>
+
+        <main class="main">
+          <section class="chat" id="chat" aria-live="polite">
+            <div class="hub" id="hub">
+              <h2>What do you want to create?</h2>
+              <p class="muted">Pick a mode or upload a document to begin.</p>
+              <div class="hub-grid" id="hub-grid"></div>
+            </div>
+          </section>
+
+          <footer class="composer">
+            <div class="composer-box">
+              <textarea id="prompt-input" rows="1" placeholder="Ask about your document…"></textarea>
+              <button class="primary" id="send-btn" type="button">Send</button>
+            </div>
+            <p class="hint" id="hint">Modes 1–5 · Upload extracts text in-browser (no huge file transfer)</p>
+          </footer>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>

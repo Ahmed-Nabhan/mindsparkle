@@ -1,0 +1,122 @@
+MindSparkle × Anna — Phase 1 Plan
+=================================
+
+GOAL
+----
+Rebuild MindSparkle as an Anna App (chat-first), with low cost,
+then grow features slowly for Marketplace + Founding Builder traction.
+
+
+USER EXPERIENCE (Phase 1)
+-------------------------
+1. User opens MindSparkle
+2. Main screen = clean chat (like Cursor / Anna chat feel)
+3. Left/side control = dots / slim rail that opens a sidebar
+4. Sidebar modes (Phase 1 only):
+   - Summarize
+   - Quiz
+   - Presentation
+   - Guide
+   - Study
+
+Flow:
+  Upload or paste document
+  → pick a mode from sidebar
+  → chat / result area generates the output
+  → user can ask follow-up questions in chat about that output
+
+
+FRONTEND (bundle/)
+------------------
+Tech: Anna App UI bundle (HTML/JS/CSS SPA inside iframe)
+
+Screens / areas:
+1. Chat canvas (default home)
+   - welcome message
+   - input box
+   - message history
+   - attach document button
+
+2. Side rail + sidebar
+   - collapsed: dots / icons
+   - expanded: mode list
+     Summarize | Quiz | Presentation | Guide | Study
+   - active mode highlighted
+
+3. Mode result panel (can be inside chat as structured cards)
+   - Summarize → markdown summary
+   - Quiz → questions + answers / check
+   - Presentation → slide outline / slide cards
+   - Guide → step-by-step learning path
+   - Study → study notes / key concepts
+
+Frontend responsibilities:
+- UI only + call Anna host APIs / tools
+- Keep selected mode in local/UI state
+- Show loading / errors cleanly
+- NO API keys in frontend
+
+
+BACKEND (executas/ + Anna Host APIs)
+-----------------------------------
+Do NOT rebuild old Supabase/Cloud Run in Phase 1.
+
+Use Anna platform instead:
+- llm.complete / sampling  → AI generation (no your OpenAI bill if platform covers it)
+- files / upload / storage → save documents + outputs per user
+- tools.invoke             → call your mode tools from UI
+
+Phase 1 tools (Executa):
+1. summarize_document
+2. generate_quiz
+3. generate_presentation
+4. generate_guide
+5. generate_study_notes
+(+ optional: parse_document / extract_text helper)
+
+Each tool:
+- input: document text (or file ref) + options
+- output: structured result for that mode
+- uses Anna LLM sampling under the hood
+
+
+WHAT IS IN / OUT FOR PHASE 1
+----------------------------
+IN:
+- Chat-first UI
+- 5 modes above
+- Document upload (PDF/TXT/DOCX if Anna supports; start with TXT/PDF)
+- Save recent sessions/results in Anna storage
+- Marketplace listing ready
+
+OUT (later phases):
+- Full old MindSparkle backend (Supabase queue, Cloud Run OCR worker, etc.)
+- Video generation
+- Labs
+- RevenueCat / complex subscriptions
+- Heavy analytics
+- Multi-language deep localization (can add later)
+
+
+SUCCESS METRICS (Phase 1)
+-------------------------
+- App installs on Anna
+- Users complete at least 1 mode successfully
+- Enough MAU to enter Founding Builder conversation
+- Feedback loop for Phase 2
+
+
+BUILD ORDER
+-----------
+1. Scaffold anna-app project
+2. Chat shell UI
+3. Sidebar modes UI
+4. One working tool (Summarize) end-to-end
+5. Add Quiz / Study / Guide / Presentation
+6. Polish listing + screenshots
+7. Publish → review → release
+
+
+NEXT AFTER YOU APPROVE
+----------------------
+Start coding the Anna App scaffold + chat/sidebar UI + Summarize tool first.

@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MindSparkle × Anna — Phase 1 Pitch</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #0f172a;
+      --navy: #1e3a8a;
+      --spark: #f59e0b;
+      --mist: #e8eef9;
+      --paper: #f7f4ef;
+      --line: rgba(15, 23, 42, 0.12);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: "DM Sans", sans-serif;
+      color: var(--ink);
+      background: #0b1220;
+      overflow: hidden;
+    }
+    .deck { height: 100%; position: relative; }
+    .slide {
+      position: absolute; inset: 0;
+      display: none;
+      padding: clamp(2rem, 5vw, 4.5rem);
+      background:
+        radial-gradient(1000px 500px at 10% -10%, rgba(245,158,11,0.18), transparent 50%),
+        radial-gradient(900px 500px at 100% 0%, rgba(30,58,138,0.45), transparent 45%),
+        linear-gradient(160deg, #0b1220 0%, #14213d 45%, #1e3a8a 100%);
+      color: #f8fafc;
+      flex-direction: column;
+      justify-content: center;
+      gap: 1.25rem;
+      animation: fadeIn 0.45s ease;
+    }
+    .slide.active { display: flex; }
+    .slide.light {
+      background:
+        radial-gradient(800px 400px at 0% 0%, rgba(245,158,11,0.15), transparent 50%),
+        linear-gradient(180deg, #f7f4ef 0%, #eef2ff 100%);
+      color: var(--ink);
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: none; }
+    }
+    .brand {
+      font-family: "Cormorant Garamond", serif;
+      font-size: clamp(3rem, 8vw, 6rem);
+      line-height: 0.95;
+      letter-spacing: -0.02em;
+    }
+    .brand span { color: var(--spark); }
+    h2 {
+      font-family: "Cormorant Garamond", serif;
+      font-size: clamp(2.2rem, 5vw, 3.6rem);
+      line-height: 1.05;
+      max-width: 16ch;
+    }
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: var(--spark);
+    }
+    .lead {
+      font-size: clamp(1.05rem, 2vw, 1.35rem);
+      max-width: 42rem;
+      opacity: 0.92;
+      line-height: 1.55;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 1rem;
+      margin-top: 0.75rem;
+      max-width: 920px;
+    }
+    .card {
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.06);
+      backdrop-filter: blur(8px);
+      border-radius: 18px;
+      padding: 1.1rem 1.2rem;
+      min-height: 120px;
+    }
+    .slide.light .card {
+      background: white;
+      border-color: var(--line);
+      box-shadow: 0 10px 30px rgba(15,23,42,0.06);
+    }
+    .card h3 {
+      font-size: 1.05rem;
+      margin-bottom: 0.4rem;
+    }
+    .card p { font-size: 0.92rem; opacity: 0.85; line-height: 1.4; }
+    .pill-row { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.5rem; }
+    .pill {
+      border: 1px solid rgba(245,158,11,0.5);
+      color: #fff7e6;
+      background: rgba(245,158,11,0.12);
+      padding: 0.45rem 0.85rem;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+    .slide.light .pill {
+      color: var(--navy);
+      border-color: rgba(30,58,138,0.25);
+      background: rgba(30,58,138,0.08);
+    }
+    .mock {
+      display: grid;
+      grid-template-columns: 72px 1fr;
+      gap: 0;
+      max-width: 860px;
+      min-height: 320px;
+      border-radius: 22px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.04);
+      margin-top: 0.5rem;
+    }
+    .rail {
+      background: rgba(0,0,0,0.28);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.7rem;
+      padding: 1rem 0.5rem;
+    }
+    .dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      background: rgba(255,255,255,0.35);
+    }
+    .dot.active { background: var(--spark); box-shadow: 0 0 0 4px rgba(245,158,11,0.2); }
+    .chat {
+      padding: 1.25rem 1.4rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.8rem;
+    }
+    .bubble {
+      align-self: flex-start;
+      max-width: 80%;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 14px;
+      padding: 0.75rem 0.95rem;
+      font-size: 0.92rem;
+      line-height: 1.4;
+    }
+    .bubble.user {
+      align-self: flex-end;
+      background: rgba(245,158,11,0.18);
+      border-color: rgba(245,158,11,0.35);
+    }
+    .composer {
+      margin-top: auto;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 14px;
+      padding: 0.8rem 1rem;
+      opacity: 0.8;
+      font-size: 0.9rem;
+    }
+    .footer-nav {
+      position: fixed;
+      left: 0; right: 0; bottom: 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.9rem 1.4rem;
+      background: linear-gradient(transparent, rgba(0,0,0,0.45));
+      color: #e2e8f0;
+      font-size: 0.85rem;
+      z-index: 5;
+    }
+    .footer-nav button {
+      appearance: none;
+      border: 1px solid rgba(255,255,255,0.25);
+      background: rgba(255,255,255,0.08);
+      color: white;
+      border-radius: 999px;
+      padding: 0.55rem 1rem;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .footer-nav button:hover { background: rgba(245,158,11,0.25); border-color: var(--spark); }
+    .steps { counter-reset: s; display: grid; gap: 0.75rem; max-width: 720px; }
+    .steps li {
+      list-style: none;
+      display: grid;
+      grid-template-columns: 36px 1fr;
+      gap: 0.8rem;
+      align-items: start;
+    }
+    .steps li::before {
+      counter-increment: s;
+      content: counter(s);
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      display: grid; place-items: center;
+      background: var(--spark);
+      color: #111;
+      font-weight: 700;
+    }
+    .big-cta {
+      margin-top: 0.5rem;
+      font-family: "Cormorant Garamond", serif;
+      font-size: clamp(2rem, 5vw, 3.4rem);
+      max-width: 18ch;
+    }
+  </style>
+</head>
+<body>
+  <div class="deck" id="deck">
+    <section class="slide active">
+      <div class="eyebrow">Anna Founding Builder · Phase 1</div>
+      <div class="brand">Mind<span>Sparkle</span></div>
+      <p class="lead">Turn any document into summaries, quizzes, presentations, guides, and study plans — inside a chat-first AI learning app on Anna.</p>
+    </section>
+
+    <section class="slide light">
+      <div class="eyebrow">The problem</div>
+      <h2>Students drown in PDFs. Tools talk. Few teach.</h2>
+      <p class="lead">MindSparkle converts study materials into actionable learning outputs in one place — no tab-hopping, no copy-paste chaos.</p>
+    </section>
+
+    <section class="slide">
+      <div class="eyebrow">Product vision</div>
+      <h2>Chat-first learning OS</h2>
+      <p class="lead">Open the app → beautiful chat. Side rail unlocks focused modes. Same document, five learning superpowers.</p>
+      <div class="mock" aria-hidden="true">
+        <div class="rail">
+          <div class="dot active"></div>
+          <div class="dot"></div>
+          <div class="dot"></div>
+          <div class="dot"></div>
+          <div class="dot"></div>
+        </div>
+        <div class="chat">
+          <div class="bubble">Welcome to MindSparkle. Upload a document or ask me anything about your material.</div>
+          <div class="bubble user">Summarize chapter 3 and make a 5-question quiz.</div>
+          <div class="bubble">Done. Summary ready + quiz drafted. Switch modes anytime from the side rail.</div>
+          <div class="composer">Ask MindSparkle…  ·  attach document</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide light">
+      <div class="eyebrow">Phase 1 features</div>
+      <h2>Five modes. One flow.</h2>
+      <div class="grid">
+        <div class="card"><h3>Summarize</h3><p>Clear, structured summary of any uploaded material.</p></div>
+        <div class="card"><h3>Quiz</h3><p>Auto-generated questions to test understanding fast.</p></div>
+        <div class="card"><h3>Presentation</h3><p>Slide-ready outlines from the same document.</p></div>
+        <div class="card"><h3>Guide</h3><p>Step-by-step learning path through the content.</p></div>
+        <div class="card"><h3>Study</h3><p>Key concepts, notes, and revision-friendly packs.</p></div>
+      </div>
+    </section>
+
+    <section class="slide">
+      <div class="eyebrow">Why Anna</div>
+      <h2>Ship distribution before infrastructure debt</h2>
+      <div class="pill-row">
+        <span class="pill">Anna LLM sampling</span>
+        <span class="pill">Built-in storage</span>
+        <span class="pill">Marketplace reach</span>
+        <span class="pill">Founding Builder grants</span>
+        <span class="pill">No heavy Cloud Run bill</span>
+      </div>
+      <p class="lead" style="margin-top:1rem">We rebuild the product surface on Anna first — not the old expensive backend stack.</p>
+    </section>
+
+    <section class="slide light">
+      <div class="eyebrow">Architecture (Phase 1)</div>
+      <h2>Frontend + lean tools</h2>
+      <div class="grid">
+        <div class="card"><h3>Frontend</h3><p>Anna App UI bundle: chat canvas, side rail, mode results.</p></div>
+        <div class="card"><h3>Backend tools</h3><p>Executa tools for summarize / quiz / presentation / guide / study.</p></div>
+        <div class="card"><h3>Platform</h3><p>Anna host APIs for LLM, files, upload, and per-user storage.</p></div>
+      </div>
+    </section>
+
+    <section class="slide">
+      <div class="eyebrow">Go-to-market</div>
+      <h2>Launch path</h2>
+      <ol class="steps">
+        <li><div><strong>Build MVP on Anna</strong><br/>Chat + 5 modes, document upload, save results.</div></li>
+        <li><div><strong>Publish to Marketplace</strong><br/>Validate → cut version → submit review → release.</div></li>
+        <li><div><strong>Grow with Founding Builder</strong><br/>Push MAU, collect feedback, unlock grant tiers.</div></li>
+        <li><div><strong>Expand Phase 2+</strong><br/>Deeper memory, richer quizzes, advanced outputs.</div></li>
+      </ol>
+    </section>
+
+    <section class="slide light">
+      <div class="eyebrow">The ask / next step</div>
+      <p class="big-cta">Approve Phase 1 scope — then we scaffold and ship Summarize first.</p>
+      <p class="lead">MindSparkle becomes an Anna-native learning app: fast to launch, cheap to run, ready to grow.</p>
+    </section>
+  </div>
+
+  <div class="footer-nav">
+    <button type="button" id="prev">← Prev</button>
+    <div id="indicator">1 / 8</div>
+    <button type="button" id="next">Next →</button>
+  </div>
+
+  <script>
+    const slides = [...document.querySelectorAll(".slide")];
+    let i = 0;
+    const indicator = document.getElementById("indicator");
+    function show(n) {
+      i = (n + slides.length) % slides.length;
+      slides.forEach((s, idx) => s.classList.toggle("active", idx === i));
+      indicator.textContent = `${i + 1} / ${slides.length}`;
+    }
+    document.getElementById("prev").onclick = () => show(i - 1);
+    document.getElementById("next").onclick = () => show(i + 1);
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowRight" || e.key === " ") show(i + 1);
+      if (e.key === "ArrowLeft") show(i - 1);
+    });
+  </script>
+</body>
+</html>
