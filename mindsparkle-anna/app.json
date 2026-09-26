@@ -1,0 +1,13 @@
+{
+  "slug": "mindsparkle",
+  "name": "MindSparkle",
+  "version": "0.2.0",
+  "tagline": "Chat-first AI study companion for any document — summaries, quizzes, presentations, guides, and study packs.",
+  "description": "MindSparkle opens with a polished welcome, then a focused chat workspace. Upload PDF, DOCX, TXT, MD, or CSV, switch modes from the side rail (Summarize, Quiz, Presentation, Guide, Study), ask follow-up questions, and export results.",
+  "category": "education",
+  "homepage_url": "https://github.com/Ahmed-Nabhan/mindsparkle",
+  "support_url": "https://github.com/Ahmed-Nabhan/mindsparkle/issues",
+  "bundled_executas": {
+    "mindsparkle": { "path": "./executas/mindsparkle" }
+  }
+}

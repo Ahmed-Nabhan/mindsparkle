@@ -1,0 +1,180 @@
+MindSparkle on Anna — Marketplace Upload Steps
+================================================
+Last updated from Anna Developer docs (app-publish / app-quickstart)
+Official docs: https://anna.partners/developers
+Publish guide: https://anna.partners/developers/apps/app-publish.md
+Quickstart:    https://anna.partners/developers/apps/app-quickstart.md
+
+IMPORTANT
+---------
+There is NO raw zip upload. You use the anna-app CLI + Developer Console.
+`anna-app apps publish` creates a version — it does NOT put the app live in the store.
+Live store = submit review → admin approve → release version.
+
+
+STEP 0 — Create Anna account + activate developer
+-------------------------------------------------
+1. Create account: https://anna.partners (or the signup link from their email)
+2. Verify your email
+3. Open Developer Console: https://anna.partners/developer
+4. Accept Developer Terms of Service
+5. Activate developer profile (self-serve / instant)
+6. Join Discord + Founding Builder Program (Luma) if you want grants
+
+
+STEP 1 — Install tools on your machine
+--------------------------------------
+Requirements:
+- Node.js 22+
+- uv (Astral)
+- anna-app CLI
+
+Commands:
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  npm i -g @anna-ai/cli
+  anna-app --help
+  anna-app doctor
+
+
+STEP 2 — Scaffold the MindSparkle Anna App
+------------------------------------------
+  anna-app init mindsparkle --slug mindsparkle
+  cd mindsparkle
+
+You will get roughly:
+  manifest.json
+  app.json
+  bundle/          <- frontend (chat + sidebar UI)
+  executas/        <- backend tools (summarize, quiz, etc.)
+  README.md
+
+
+STEP 3 — Build Phase 1 locally
+------------------------------
+1. Implement frontend in bundle/ (chat-first + sidebar modes)
+2. Implement tools under executas/ for:
+   - summarize
+   - quiz
+   - presentation
+   - guide
+   - study
+3. Use Anna host APIs where possible:
+   - llm.complete / sampling (AI without your own API key)
+   - storage / files (save docs + results)
+   - upload (document files)
+4. Run local harness:
+     anna-app dev
+   Open the printed localhost dashboard URL and test end-to-end.
+
+
+STEP 4 — Validate before upload
+-------------------------------
+  anna-app validate
+  anna-app validate --strict
+
+Fix every error. Also manually test:
+- App opens on chat
+- Sidebar modes switch correctly
+- Upload a PDF/DOCX/TXT
+- Each mode returns usable output
+- No crashes / empty screens
+
+
+STEP 5 — Fill Marketplace listing (Developer Console)
+-----------------------------------------------------
+In Developer Console → your App → Listing tab, fill:
+- App name: MindSparkle
+- Tagline (short)
+- Full description
+- Category (Education / Productivity)
+- Logo / icon
+- Screenshots (chat + each mode if possible)
+- Privacy / permissions notes if needed
+
+See: https://anna.partners/developers/apps/app-listing.md
+
+
+STEP 6 — Push draft + cut version
+---------------------------------
+Option A (recommended composite):
+  anna-app apps publish
+  (this = push + cut version; creates immutable version artifact)
+
+Option B (manual):
+  anna-app apps push
+  anna-app apps cut 0.1.0
+
+Notes:
+- After this, version exists on Anna but is NOT public in Marketplace yet.
+- For UI apps (schema >= 2), make sure UI bundle finalize = bundle_ready.
+
+
+STEP 7 — Install + self-test the uploaded version
+-------------------------------------------------
+1. In Developer Console, install the version yourself
+2. Run the full Phase 1 flow again on the real platform
+3. Confirm listing text matches real behavior
+
+
+STEP 8 — Submit for review
+--------------------------
+Console:
+  Versions tab → Submit for review
+  (button names the candidate version, e.g. "Submit v0.1.0 for review")
+
+Or CLI:
+  anna-app apps submit-review
+
+Status becomes: PENDING_REVIEW
+Review usually targets that pinned candidate version.
+Tip: reviews are often processed within ~5 business days (per Anna forum posts).
+
+
+STEP 9 — After approval → Release / Publish version
+---------------------------------------------------
+When status is APPROVED (or admin approved with publish):
+1. Go to Versions tab
+2. Publish / Release the approved version
+   or: anna-app apps release <version>
+
+Then status becomes PUBLISHED and the app appears in Anna App Store / Marketplace.
+
+
+STEP 10 — After it is live
+--------------------------
+- Share the store link / #mindsparkle mention
+- Track installs + feedback
+- Join Founding Builder Program and report MAU / traction
+- Ship Phase 2 features as new versions (each public version needs review again)
+
+
+CHEAT SHEET (commands)
+----------------------
+  npm i -g @anna-ai/cli
+  anna-app doctor
+  anna-app init mindsparkle --slug mindsparkle
+  anna-app dev
+  anna-app validate --strict
+  anna-app apps push
+  anna-app apps cut 0.1.0
+  # or: anna-app apps publish
+  anna-app apps submit-review
+  anna-app apps release 0.1.0
+  anna-app apps status
+  anna-app apps versions
+
+
+STATUS FLOW (simple)
+--------------------
+DRAFT → PENDING_REVIEW → APPROVED → PUBLISHED
+                ↘ REJECTED → fix → submit again
+
+
+LINKS
+-----
+Developer Hub:     https://anna.partners/developers
+Developer Console: https://anna.partners/developer
+Build on Anna 101: https://forum.anna.partners/t/build-on-anna-101/228
+App publish docs:  https://anna.partners/developers/apps/app-publish.md
+Founding Builder:  (use the Luma / email links Anna sent you)
+Discord:           (from Anna onboarding email)

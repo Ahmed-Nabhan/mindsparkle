@@ -1,0 +1,15 @@
+{
+  "name": "mindsparkle-anna",
+  "private": true,
+  "version": "0.1.0",
+  "description": "MindSparkle Anna App — Phase 1",
+  "scripts": {
+    "doctor": "anna-app doctor",
+    "validate": "anna-app validate",
+    "dev": "anna-app dev",
+    "test:plugin": "python3 scripts/smoke_plugin.py"
+  },
+  "devDependencies": {
+    "@anna-ai/cli": "*"
+  }
+}

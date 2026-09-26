@@ -1,0 +1,19 @@
+{
+  "slug": "mindsparkle",
+  "name": "MindSparkle Learning Tools",
+  "version": "0.2.0",
+  "executa_type": "tool",
+  "description": "Extract PDF/DOCX/TXT and run MindSparkle modes: summarize, quiz, presentation, guide, study, ask.",
+  "tool_id": "tool-dev-mindsparkle",
+  "type": "python",
+  "enabled": true,
+  "distribution": {
+    "active": "local",
+    "profiles": {
+      "local": {
+        "type": "local",
+        "supports_protocol": true
+      }
+    }
+  }
+}
