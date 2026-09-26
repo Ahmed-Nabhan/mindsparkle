@@ -188,12 +188,43 @@ def extract_document(filename: str, content_base64: str, mime_type: str = "") ->
     }
 
 
+def _pick_diverse(sents: list[str], count: int = 8) -> list[str]:
+    if not sents:
+        return []
+    if len(sents) <= count:
+        return sents
+    step = max(1, len(sents) // count)
+    picked = [sents[i] for i in range(0, len(sents), step)]
+    # always include early + late signal
+    if sents[0] not in picked:
+        picked = [sents[0], *picked]
+    if sents[-1] not in picked:
+        picked.append(sents[-1])
+    # de-dupe preserve order
+    out: list[str] = []
+    seen = set()
+    for s in picked:
+        key = s[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+        if len(out) >= count:
+            break
+    return out
+
+
 def summarize(document_text: str, user_prompt: str = "") -> dict[str, Any]:
     paras = _paragraphs(document_text)
     sents = _sentences(document_text)
-    key_points = sents[:8] if sents else paras[:8]
+    key_points = _pick_diverse(sents, 8) if sents else paras[:8]
     overview = " ".join(key_points[:2]) if key_points else "No usable text found."
     focus = user_prompt.strip() or "general understanding"
+    concepts = []
+    for point in key_points[:6]:
+        words = re.findall(r"[A-Za-z][A-Za-z\-]{4,}", point)
+        if words:
+            concepts.append(f"- **{' / '.join(words[:3])}** — {point[:160]}")
 
     markdown = [
         "## Summary",
@@ -202,15 +233,26 @@ def summarize(document_text: str, user_prompt: str = "") -> dict[str, Any]:
         "",
         f"**Focus:** {focus}",
         "",
-        "### Key points",
+        "## Key Takeaways",
     ]
     for i, point in enumerate(key_points[:8], 1):
         markdown.append(f"{i}. {point}")
+    if concepts:
+        markdown.extend(["", "## Important Concepts", *concepts])
     if paras:
-        markdown.extend(["", "### Sections covered", ""])
+        markdown.extend(["", "## Sections Covered", ""])
         for i, p in enumerate(paras[:6], 1):
             title = (p[:80] + "…") if len(p) > 80 else p
             markdown.append(f"- Section {i}: {title}")
+    markdown.extend(
+        [
+            "",
+            "## Next Steps",
+            "- Run **Quiz** on weak points",
+            "- Run **Guide** for a study path",
+            "- Ask a specific question in chat",
+        ]
+    )
 
     return {
         "mode": "summarize",

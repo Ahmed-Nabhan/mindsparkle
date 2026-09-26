@@ -564,6 +564,118 @@ function isModeCommand(text = "") {
   return false;
 }
 
+const MODE_LLM_PROMPTS = {
+  summarize: `Create a high-quality study summary of the document.
+Use this exact markdown structure:
+## Summary
+(2-4 sentences overview in your own words)
+
+## Key Takeaways
+- 6 to 10 bullet points (clear, specific, non-redundant)
+
+## Important Concepts
+- term — short definition
+
+## Who Should Care
+- who this helps and why
+
+## Next Steps
+- 3 practical study actions
+Do not copy long paragraphs. Synthesize.`,
+  quiz: `Create 5 challenging multiple-choice questions from the document.
+For each question provide:
+**Q1. ...**
+- A) ...
+- B) ...
+- C) ...
+- D) ...
+**Answer:** X
+**Why:** one sentence
+Cover different sections, not only the beginning.`,
+  presentation: `Create a presentation outline with 7 slides.
+For each slide:
+### Slide N: Title
+- 3 to 4 concise bullets
+Make it pitch/teach ready. Cover beginning, middle, and end of the material.`,
+  guide: `Create a step-by-step learning guide (6-8 steps).
+For each step:
+### Step N — Title
+Explanation (2-3 sentences)
+**Action:** one concrete task the learner should do
+Order from foundations to advanced.`,
+  study: `Create a study pack:
+## Must-Know Concepts
+- **Term** — explanation
+## Memory Hooks
+- mnemonic / analogy style tips
+## Revision Checklist
+- checkbox-style bullets
+## Weak-Spot Drill
+- 3 self-test prompts`,
+};
+
+function sampleDocument(text, maxChars = 12000) {
+  const raw = String(text || "");
+  if (raw.length <= maxChars) return raw;
+  const head = Math.floor(maxChars * 0.45);
+  const mid = Math.floor(maxChars * 0.3);
+  const tail = maxChars - head - mid;
+  const midStart = Math.max(0, Math.floor(raw.length / 2) - Math.floor(mid / 2));
+  return [
+    raw.slice(0, head),
+    "\n\n[... middle sample ...]\n\n",
+    raw.slice(midStart, midStart + mid),
+    "\n\n[... end sample ...]\n\n",
+    raw.slice(-tail),
+  ].join("");
+}
+
+function extractLlmText(reply) {
+  return (
+    reply?.content?.text ||
+    reply?.message?.content?.text ||
+    reply?.text ||
+    (Array.isArray(reply?.content) ? reply.content.map((c) => c?.text || "").join("\n") : "") ||
+    ""
+  );
+}
+
+async function runWithLlm({ modeId, asking, userPrompt, docSample }) {
+  if (!anna?.llm?.complete) return null;
+  const system =
+    "You are MindSparkle, an elite study coach. Be accurate, structured, and useful. Use markdown. Never invent facts not supported by the document.";
+  const task = asking
+    ? `Answer the learner's question using ONLY the document.\n\nQuestion: ${userPrompt}\n\nWrite a complete answer with:
+## Direct Answer
+## Supporting Evidence
+## Extra Clarity (if needed)`
+    : `${MODE_LLM_PROMPTS[modeId] || MODE_LLM_PROMPTS.summarize}${
+        userPrompt ? `\n\nExtra learner request: ${userPrompt}` : ""
+      }`;
+
+  const reply = await anna.llm.complete({
+    messages: [
+      { role: "system", content: { type: "text", text: system } },
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text: `${task}\n\nDOCUMENT:\n${docSample}`,
+        },
+      },
+    ],
+    maxTokens: asking ? 1400 : 1800,
+  });
+  const text = extractLlmText(reply).trim();
+  if (!text) return null;
+  return {
+    mode: asking ? "ask" : modeId,
+    title: asking ? "Answer" : currentMode().title,
+    markdown: text,
+    engine: "anna.llm.complete",
+  };
+}
+
 async function runLearning({ userPrompt = "", fromChat = false } = {}) {
   const doc = getDoc();
   if (!doc) {
@@ -584,58 +696,41 @@ async function runLearning({ userPrompt = "", fromChat = false } = {}) {
   const sk = addSkeleton();
   try {
     let result = null;
-    const clipped = doc.slice(0, 14000); // keep tool/LLM payloads small
+    const docSample = sampleDocument(doc, 12000);
 
-    // Prefer structured mode tools for summarize/quiz/... (better than ask retrieval)
-    if (!asking && anna?.tools?.invoke) {
+    // 1) Prefer real LLM for modes AND questions
+    try {
+      result = await runWithLlm({
+        modeId: mode.id,
+        asking,
+        userPrompt: intentMode ? "" : userPrompt || "",
+        docSample,
+      });
+    } catch (e) {
+      console.warn("llm.complete failed", e);
+      addMessage("system", "Anna LLM failed — falling back to local engine.");
+    }
+
+    // 2) Structured tool fallback
+    if (!result && anna?.tools?.invoke) {
       try {
-        result = await callTool("run_mode", {
-          mode: mode.id,
-          document_text: clipped,
-          user_prompt: intentMode ? "" : userPrompt || "",
-        });
+        result = asking
+          ? await callTool("ask_document", { document_text: docSample, question: userPrompt })
+          : await callTool("run_mode", {
+              mode: mode.id,
+              document_text: docSample,
+              user_prompt: intentMode ? "" : userPrompt || "",
+            });
       } catch (e) {
-        console.warn("run_mode failed", e);
+        console.warn("tool fallback failed", e);
       }
     }
 
-    if (asking && anna?.llm?.complete) {
-      try {
-        const reply = await anna.llm.complete({
-          messages: [
-            { role: "system", content: { type: "text", text: "You are MindSparkle, a precise study coach. Answer clearly in markdown." } },
-            {
-              role: "user",
-              content: {
-                type: "text",
-                text: `Answer using ONLY this document.\n\nQuestion: ${userPrompt}\n\nDOCUMENT:\n${clipped}`,
-              },
-            },
-          ],
-          maxTokens: 1200,
-        });
-        const text = reply?.content?.text || reply?.text || "";
-        if (text) result = { mode: "ask", markdown: text, engine: "anna.llm.complete" };
-      } catch (e) {
-        console.warn("llm.complete failed", e);
-      }
-    }
-
-    if (!result && asking && anna?.tools?.invoke) {
-      try {
-        result = await callTool("ask_document", {
-          document_text: clipped,
-          question: userPrompt,
-        });
-      } catch (e) {
-        console.warn("ask_document failed", e);
-      }
-    }
-
+    // 3) Local fallback
     if (!result) {
       result = asking
-        ? await callToolSafeAsk(clipped, userPrompt)
-        : localFallback(mode.id, clipped, userPrompt);
+        ? await callToolSafeAsk(docSample, userPrompt)
+        : localFallback(mode.id, docSample, userPrompt);
     }
 
     sk.remove();
