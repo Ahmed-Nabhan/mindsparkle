@@ -21,11 +21,15 @@ npm install
 # curl -LsSf https://astral.sh/uv/install.sh | sh
 npx anna-app doctor
 npx anna-app validate
-npx anna-app login          # required for LLM
-npx anna-app dev            # do NOT pass --no-llm
+npx anna-app login --host https://anna.partners   # required for LLM
+npx anna-app whoami                               # confirm login worked
+npx anna-app dev                                  # do NOT pass --no-llm
 ```
 
 Open `http://localhost:5180/`. Results should show an **Anna AI** tag.
+
+**Phone preview:** use Chrome Device Toolbar on the Mac (`Cmd+Option+I` → phone icon → iPhone).  
+`anna-app dev` has no `--host` flag — that flag is only for `login`.
 
 Offline-only (weak extractive output — for UI work only):
 
