@@ -255,9 +255,20 @@ html[data-theme="dark"] .top { background: rgba(18,26,43,0.8); }
   text-transform: uppercase; opacity: 0.7; margin-bottom: 0.3rem;
 }
 .msg.markdown { white-space: normal; }
-.msg.markdown h2, .msg.markdown h3 { font-family: var(--display); margin: 0.35rem 0; color: var(--navy); }
-.msg.markdown ul { margin: 0.3rem 0 0.3rem 1.1rem; }
-.msg .engine-tag { display: inline-block; margin-top: 0.5rem; font-size: 0.7rem; color: var(--muted); font-weight: 700; }
+.msg.markdown h2, .msg.markdown h3, .msg.markdown h4 {
+  font-family: var(--display); margin: 0.55rem 0 0.25rem; color: var(--navy);
+}
+.msg.markdown h2 { font-size: 1.25rem; }
+.msg.markdown h3 { font-size: 1.05rem; }
+.msg.markdown p { margin: 0.35rem 0; }
+.msg.markdown ul, .msg.markdown ol { margin: 0.3rem 0 0.45rem 1.2rem; }
+.msg.markdown li { margin: 0.2rem 0; }
+.msg .engine-tag {
+  display: inline-block; margin-top: 0.55rem; font-size: 0.7rem; font-weight: 800;
+  letter-spacing: 0.04em; text-transform: uppercase; padding: 0.15rem 0.45rem; border-radius: 999px;
+}
+.msg .engine-tag.ok { color: #0f766e; background: rgba(15,118,110,0.12); }
+.msg .engine-tag.warn { color: #9a3412; background: rgba(154,52,18,0.12); }
 
 .skeleton { width: min(420px, 90%); display: grid; gap: 0.45rem; padding: 0.9rem; border-radius: 14px; border: 1px solid var(--line); background: var(--card); }
 .skeleton i { display: block; height: 11px; border-radius: 999px; background: rgba(102,112,133,0.18); animation: shimmer 1.2s ease-in-out infinite; }
@@ -284,6 +295,7 @@ html[data-theme="dark"] .top { background: rgba(18,26,43,0.8); }
 .flash.open .note { display: block; }
 .flash .hint-flip { margin-top: 0.45rem; color: var(--spark); font-size: 0.72rem; font-weight: 700; }
 .flash.open .hint-flip { display: none; }
+.study-extra { margin-top: 0.75rem; padding-top: 0.5rem; border-top: 1px solid var(--line); }
 
 .composer { padding: 0 1.1rem 1rem; }
 .composer-box {

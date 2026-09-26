@@ -136,17 +136,22 @@ function formatInline(text) {
 function renderMarkdownLite(md) {
   const lines = String(md || "").split("\n");
   const html = [];
-  let inList = false;
+  let listType = null; // "ul" | "ol"
   const closeList = () => {
-    if (inList) {
-      html.push("</ul>");
-      inList = false;
+    if (listType) {
+      html.push(listType === "ol" ? "</ol>" : "</ul>");
+      listType = null;
     }
   };
   for (const raw of lines) {
     const line = raw.trimEnd();
     if (!line.trim()) {
       closeList();
+      continue;
+    }
+    if (line.startsWith("#### ")) {
+      closeList();
+      html.push(`<h4>${escapeHtml(line.slice(5))}</h4>`);
       continue;
     }
     if (line.startsWith("### ")) {
@@ -159,9 +164,32 @@ function renderMarkdownLite(md) {
       html.push(`<h2>${escapeHtml(line.slice(3))}</h2>`);
       continue;
     }
+    const ol = line.match(/^\d+\.\s+(.*)$/);
+    if (ol) {
+      if (listType !== "ol") {
+        closeList();
+        html.push("<ol>");
+        listType = "ol";
+      }
+      html.push(`<li>${formatInline(ol[1])}</li>`);
+      continue;
+    }
+    const check = line.match(/^- \[[ xX]\]\s+(.*)$/);
+    if (check) {
+      if (listType !== "ul") {
+        closeList();
+        html.push("<ul>");
+        listType = "ul";
+      }
+      html.push(`<li>${formatInline(check[1])}</li>`);
+      continue;
+    }
     if (line.startsWith("- ") || line.startsWith("* ")) {
-      if (!inList) html.push("<ul>");
-      inList = true;
+      if (listType !== "ul") {
+        closeList();
+        html.push("<ul>");
+        listType = "ul";
+      }
       html.push(`<li>${formatInline(line.slice(2))}</li>`);
       continue;
     }
@@ -170,6 +198,13 @@ function renderMarkdownLite(md) {
   }
   closeList();
   return html.join("");
+}
+
+function engineLabel(engine = "") {
+  if (!engine) return "";
+  if (/llm|host-llm|anna\.llm/i.test(engine)) return "Anna AI";
+  if (/local/i.test(engine)) return "Offline extract (no AI)";
+  return engine;
 }
 
 function hideHub() {
@@ -200,8 +235,8 @@ function addMessage(role, content, { markdown = false, engine = "", node = null 
   }
   if (engine) {
     const tag = document.createElement("span");
-    tag.className = "engine-tag";
-    tag.textContent = engine;
+    tag.className = `engine-tag${/local/i.test(engine) ? " warn" : " ok"}`;
+    tag.textContent = engineLabel(engine);
     article.appendChild(tag);
   }
   els.chat.appendChild(article);
@@ -466,7 +501,18 @@ function addRichResult(result) {
   if (mode === "quiz" && result.questions?.length) node = buildQuizNode(result.questions);
   else if (mode === "presentation" && result.slides?.length) node = buildSlidesNode(result.slides);
   else if (mode === "guide" && result.steps?.length) node = buildGuideNode(result.steps);
-  else if (mode === "study" && result.concepts?.length) node = buildStudyNode(result.concepts);
+  else if (mode === "study" && result.concepts?.length) {
+    node = buildStudyNode(result.concepts);
+    // Append hooks/checklist/drills markdown under flashcards when present
+    if (result.markdown && /Memory Hooks|Revision Checklist|Weak-Spot/i.test(result.markdown)) {
+      const extra = document.createElement("div");
+      extra.className = "study-extra markdown";
+      extra.innerHTML = renderMarkdownLite(
+        result.markdown.replace(/^[\s\S]*?(?=## Memory Hooks|## Revision Checklist|## Weak-Spot)/i, ""),
+      );
+      node.appendChild(extra);
+    }
+  }
 
   if (node) addMessage("assistant", "", { node, engine: result.engine || "" });
   else addMessage("assistant", result.markdown || "No output.", { markdown: true, engine: result.engine || "" });
@@ -565,66 +611,78 @@ function isModeCommand(text = "") {
 }
 
 const MODE_LLM_PROMPTS = {
-  summarize: `Create a high-quality study summary of the document.
-Use this exact markdown structure:
-## Summary
-(2-4 sentences overview in your own words)
+  summarize: `Write high-value study notes for THIS document only.
 
-## Key Takeaways
-- 6 to 10 bullet points (clear, specific, non-redundant)
+## TL;DR
+2 sharp sentences. No filler.
 
-## Important Concepts
-- term — short definition
+## Core Ideas
+8-12 bullets. Each bullet = one concrete claim (names, numbers, mechanisms, decisions). Ban vague lines like "important concept" or "key takeaway".
 
-## Who Should Care
-- who this helps and why
+## Deep Dive
+Exactly 3 subsections (### Title) on the strongest themes. 3-5 synthesizing sentences each — rewrite, do not paste.
 
-## Next Steps
-- 3 practical study actions
-Do not copy long paragraphs. Synthesize.`,
-  quiz: `Create 5 challenging multiple-choice questions from the document.
-For each question provide:
-**Q1. ...**
-- A) ...
-- B) ...
-- C) ...
-- D) ...
-**Answer:** X
-**Why:** one sentence
-Cover different sections, not only the beginning.`,
-  presentation: `Create a presentation outline with 7 slides.
-For each slide:
-### Slide N: Title
-- 3 to 4 concise bullets
-Make it pitch/teach ready. Cover beginning, middle, and end of the material.`,
-  guide: `Create a step-by-step learning guide (6-8 steps).
-For each step:
-### Step N — Title
-Explanation (2-3 sentences)
-**Action:** one concrete task the learner should do
-Order from foundations to advanced.`,
-  study: `Create a study pack:
-## Must-Know Concepts
-- **Term** — explanation
-## Memory Hooks
-- mnemonic / analogy style tips
-## Revision Checklist
-- checkbox-style bullets
-## Weak-Spot Drill
-- 3 self-test prompts`,
+## Key Terms
+- **Term** — precise definition from context
+
+## Exam Traps
+3 misconceptions a skimmer might form.
+
+## Next Study Moves
+3 actions tied to THIS material (not generic "take a quiz").`,
+
+  quiz: `Return ONLY valid JSON (no markdown fences):
+{"questions":[{"id":1,"question":"...","options":["...","...","...","..."],"answer_index":0,"explanation":"..."}]}
+
+Rules:
+- Exactly 6 hard but fair MCQs
+- Cover beginning, middle, AND end
+- Options similar length; one clear correct answer
+- No "all/none of the above"
+- explanation grounded in the text`,
+
+  presentation: `Return ONLY valid JSON (no markdown fences):
+{"slides":[{"title":"...","bullets":["...","...","..."]}]}
+
+Rules:
+- Exactly 8 slides
+- Slide 1 = hook/overview; last = takeaways + CTA
+- 3-4 punchy bullets each
+- Cover the full document arc`,
+
+  guide: `Return ONLY valid JSON (no markdown fences):
+{"steps":[{"step":1,"title":"...","detail":"...","action":"..."}]}
+
+Rules:
+- 7 progressive steps (foundations → advanced)
+- detail: 2-3 sentences from the document
+- action: one concrete learner task`,
+
+  study: `Return ONLY valid JSON (no markdown fences):
+{"concepts":[{"term":"...","note":"..."}],"hooks":["..."],"checklist":["..."],"drills":["..."]}
+
+Rules:
+- 8-12 concepts (term + explanation from the doc)
+- 4 memory hooks tied to content
+- 6 checklist items
+- 3 self-test drills`,
 };
 
-function sampleDocument(text, maxChars = 12000) {
+function sampleDocument(text, maxChars = 24000) {
   const raw = String(text || "");
   if (raw.length <= maxChars) return raw;
-  const head = Math.floor(maxChars * 0.45);
-  const mid = Math.floor(maxChars * 0.3);
-  const tail = maxChars - head - mid;
-  const midStart = Math.max(0, Math.floor(raw.length / 2) - Math.floor(mid / 2));
+  const head = Math.floor(maxChars * 0.4);
+  const mid = Math.floor(maxChars * 0.25);
+  const mid2 = Math.floor(maxChars * 0.15);
+  const tail = maxChars - head - mid - mid2;
+  const q1 = Math.max(0, Math.floor(raw.length / 4) - Math.floor(mid / 2));
+  const q3 = Math.max(0, Math.floor((3 * raw.length) / 4) - Math.floor(mid2 / 2));
   return [
     raw.slice(0, head),
-    "\n\n[... middle sample ...]\n\n",
-    raw.slice(midStart, midStart + mid),
+    "\n\n[... sample ~25% ...]\n\n",
+    raw.slice(q1, q1 + mid),
+    "\n\n[... sample ~75% ...]\n\n",
+    raw.slice(q3, q3 + mid2),
     "\n\n[... end sample ...]\n\n",
     raw.slice(-tail),
   ].join("");
@@ -640,19 +698,115 @@ function extractLlmText(reply) {
   );
 }
 
+function parseJsonBlob(text) {
+  let raw = String(text || "").trim();
+  if (!raw) return null;
+  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) raw = fence[1].trim();
+  try {
+    const data = JSON.parse(raw);
+    return data && typeof data === "object" ? data : null;
+  } catch {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        const data = JSON.parse(raw.slice(start, end + 1));
+        return data && typeof data === "object" ? data : null;
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function enrichStructured(modeId, text) {
+  const base = {
+    mode: modeId,
+    title: currentMode().title,
+    markdown: text,
+    engine: "anna.llm.complete",
+  };
+  if (modeId === "summarize" || modeId === "ask") return base;
+  const data = parseJsonBlob(text);
+  if (!data) return base;
+  if (modeId === "quiz" && Array.isArray(data.questions)) {
+    base.questions = data.questions.map((q, i) => ({
+      id: q.id || i + 1,
+      question: q.question || "",
+      options: Array.isArray(q.options) ? q.options.slice(0, 4) : [],
+      answer_index: Number(q.answer_index || 0),
+      explanation: q.explanation || "",
+    }));
+    base.markdown = base.questions
+      .map((q) => {
+        const opts = (q.options || []).map((o, i) => `- ${String.fromCharCode(65 + i)}) ${o}`).join("\n");
+        return `**Q${q.id}. ${q.question}**\n${opts}\n**Answer:** ${String.fromCharCode(65 + q.answer_index)}\n**Why:** ${q.explanation}`;
+      })
+      .join("\n\n");
+  } else if (modeId === "presentation" && Array.isArray(data.slides)) {
+    base.slides = data.slides.map((s) => ({
+      title: s.title || "Slide",
+      bullets: Array.isArray(s.bullets) ? s.bullets : [],
+    }));
+    base.markdown = base.slides
+      .map((s, i) => `### Slide ${i + 1}: ${s.title}\n${(s.bullets || []).map((b) => `- ${b}`).join("\n")}`)
+      .join("\n\n");
+  } else if (modeId === "guide" && Array.isArray(data.steps)) {
+    base.steps = data.steps.map((s, i) => ({
+      step: s.step || i + 1,
+      title: s.title || `Step ${i + 1}`,
+      detail: s.detail || "",
+      action: s.action || "",
+    }));
+    base.markdown = base.steps
+      .map((s) => `### Step ${s.step} — ${s.title}\n${s.detail}\n**Action:** ${s.action}`)
+      .join("\n\n");
+  } else if (modeId === "study" && Array.isArray(data.concepts)) {
+    base.concepts = data.concepts.map((c) => ({ term: c.term || "Concept", note: c.note || "" }));
+    const hooks = Array.isArray(data.hooks) ? data.hooks : [];
+    const checklist = Array.isArray(data.checklist) ? data.checklist : [];
+    const drills = Array.isArray(data.drills) ? data.drills : [];
+    base.markdown = [
+      "## Must-Know Concepts",
+      ...base.concepts.map((c) => `- **${c.term}** — ${c.note}`),
+      "",
+      "## Memory Hooks",
+      ...hooks.map((h) => `- ${h}`),
+      "",
+      "## Revision Checklist",
+      ...checklist.map((c) => `- [ ] ${c}`),
+      "",
+      "## Weak-Spot Drills",
+      ...drills.map((d) => `- ${d}`),
+    ].join("\n");
+  }
+  return base;
+}
+
 async function runWithLlm({ modeId, asking, userPrompt, docSample }) {
   if (!anna?.llm?.complete) return null;
   const system =
-    "You are MindSparkle, an elite study coach. Be accurate, structured, and useful. Use markdown. Never invent facts not supported by the document.";
+    "You are MindSparkle, an elite tutor. Be concrete and specific. Use only facts supported by the document. Never invent. Avoid generic study advice that could apply to any document.";
   const task = asking
-    ? `Answer the learner's question using ONLY the document.\n\nQuestion: ${userPrompt}\n\nWrite a complete answer with:
+    ? `Answer using ONLY the document.
+
 ## Direct Answer
+Clear, complete answer in your own words.
+
 ## Supporting Evidence
-## Extra Clarity (if needed)`
+2-4 short bullets closely paraphrasing the source.
+
+## Extra Clarity
+Only if needed.
+
+Question: ${userPrompt}`
     : `${MODE_LLM_PROMPTS[modeId] || MODE_LLM_PROMPTS.summarize}${
-        userPrompt ? `\n\nExtra learner request: ${userPrompt}` : ""
+        userPrompt ? `\n\nLearner focus: ${userPrompt}` : ""
       }`;
 
+  const maxTokens = asking ? 2000 : modeId === "summarize" ? 3500 : 2800;
   const reply = await anna.llm.complete({
     messages: [
       { role: "system", content: { type: "text", text: system } },
@@ -664,16 +818,20 @@ async function runWithLlm({ modeId, asking, userPrompt, docSample }) {
         },
       },
     ],
-    maxTokens: asking ? 1400 : 1800,
+    maxTokens,
+    temperature: 0.35,
   });
   const text = extractLlmText(reply).trim();
   if (!text) return null;
-  return {
-    mode: asking ? "ask" : modeId,
-    title: asking ? "Answer" : currentMode().title,
-    markdown: text,
-    engine: "anna.llm.complete",
-  };
+  if (asking) {
+    return {
+      mode: "ask",
+      title: "Answer",
+      markdown: text,
+      engine: "anna.llm.complete",
+    };
+  }
+  return enrichStructured(modeId, text);
 }
 
 async function runLearning({ userPrompt = "", fromChat = false } = {}) {
@@ -696,7 +854,7 @@ async function runLearning({ userPrompt = "", fromChat = false } = {}) {
   const sk = addSkeleton();
   try {
     let result = null;
-    const docSample = sampleDocument(doc, 12000);
+    const docSample = sampleDocument(doc, 24000);
 
     // 1) Prefer real LLM for modes AND questions
     try {
@@ -708,10 +866,13 @@ async function runLearning({ userPrompt = "", fromChat = false } = {}) {
       });
     } catch (e) {
       console.warn("llm.complete failed", e);
-      addMessage("system", "Anna LLM failed — falling back to local engine.");
+      addMessage(
+        "system",
+        "Anna LLM failed — trying host tool LLM / local fallback. Tip: run `npx anna-app login` then `npx anna-app dev` (no --no-llm).",
+      );
     }
 
-    // 2) Structured tool fallback
+    // 2) Tool path (plugin uses host sampling when available)
     if (!result && anna?.tools?.invoke) {
       try {
         result = asking
@@ -737,6 +898,12 @@ async function runLearning({ userPrompt = "", fromChat = false } = {}) {
     lastResult = result;
     lastMarkdown = result.markdown || "";
     addRichResult(result);
+    if (/local/i.test(result.engine || "")) {
+      addMessage(
+        "system",
+        "This was Offline extract (no AI). For real tutor answers: stop the server, run `npx anna-app login`, then `npx anna-app dev` — do NOT use `--no-llm`.",
+      );
+    }
     pushHistory({
       at: Date.now(),
       mode: result.mode || mode.id,

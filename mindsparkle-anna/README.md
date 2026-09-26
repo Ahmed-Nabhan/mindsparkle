@@ -9,9 +9,11 @@ Chat-first AI study companion for the Anna Marketplace — rebuilt to be stronge
 - Modes: Summarize · Quiz · Presentation · Guide · Study
 - **Ask-the-document chat** follow-ups
 - **Export last result** as Markdown
-- Prefers Anna `llm.complete` when available; local Executa fallback otherwise
+- Prefers Anna `llm.complete` for tutor-quality answers; Executa can also use host `llm.sample`
+- Quiz / Presentation / Guide / Study return **structured interactive UI** (not flat text) when AI responds
+- Local extractive fallback only if LLM is unavailable (clearly labeled)
 
-## Run locally
+## Run locally (with real AI — recommended)
 
 ```bash
 npm install
@@ -19,10 +21,17 @@ npm install
 # curl -LsSf https://astral.sh/uv/install.sh | sh
 npx anna-app doctor
 npx anna-app validate
-npx anna-app dev --no-llm
+npx anna-app login          # required for LLM
+npx anna-app dev            # do NOT pass --no-llm
 ```
 
-Open `http://localhost:5180/`.
+Open `http://localhost:5180/`. Results should show an **Anna AI** tag.
+
+Offline-only (weak extractive output — for UI work only):
+
+```bash
+npx anna-app dev --no-llm
+```
 
 ## Tests
 

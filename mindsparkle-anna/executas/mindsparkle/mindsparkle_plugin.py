@@ -1,4 +1,4 @@
-"""MindSparkle Executa — extract docs + learning modes + ask."""
+"""MindSparkle Executa — extract docs + learning modes + ask (LLM-first)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import base64
 import json
 import re
 import sys
+import uuid
 import zipfile
 from io import BytesIO
 from typing import Any
@@ -14,7 +15,7 @@ from xml.etree import ElementTree as ET
 MANIFEST = {
     "name": "tool-dev-mindsparkle",
     "display_name": "MindSparkle Learning Tools",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "Extract documents and run summarize/quiz/presentation/guide/study/ask modes.",
     "host_capabilities": ["llm.sample", "aps.kv"],
     "tools": [
@@ -76,6 +77,74 @@ MANIFEST = {
     ],
 }
 
+# Set True only after host initialize advertises sampling capability.
+_HOST_SAMPLING = False
+
+SYSTEM = (
+    "You are MindSparkle, an elite tutor. Be concrete, specific, and useful. "
+    "Use only facts supported by the document. Never invent citations. "
+    "Avoid generic study advice that could apply to any document."
+)
+
+MODE_PROMPTS = {
+    "summarize": """Write high-value study notes for THIS document only.
+
+## TL;DR
+2 sharp sentences. No filler.
+
+## Core Ideas
+8-12 bullets. Each bullet = one concrete claim (names, numbers, mechanisms, decisions). No vague phrases like "important concept".
+
+## Deep Dive
+3 subsections (### Title) covering the strongest themes. 3-5 sentences each that synthesize, not quote.
+
+## Key Terms
+- **Term** — precise definition from context
+
+## Exam Traps
+3 misconceptions a student might form from skimming.
+
+## Next Study Moves
+3 actions tied to THIS material (not generic "run quiz").""",
+    "quiz": """Return ONLY valid JSON (no markdown fences):
+{"questions":[{"id":1,"question":"...","options":["...","...","...","..."],"answer_index":0,"explanation":"..."}]}
+
+Rules:
+- Exactly 6 hard but fair multiple-choice questions
+- Cover beginning, middle, AND end of the document
+- Options similar length; only one clearly correct
+- No "all of the above" / "none of the above"
+- explanation: one sentence grounded in the text""",
+    "presentation": """Return ONLY valid JSON (no markdown fences):
+{"slides":[{"title":"...","bullets":["...","...","..."]}]}
+
+Rules:
+- Exactly 8 slides
+- Slide 1 = hook/overview, last slide = takeaways + call to action
+- 3-4 punchy bullets per slide (teach/pitch ready)
+- Cover whole document arc""",
+    "guide": """Return ONLY valid JSON (no markdown fences):
+{"steps":[{"step":1,"title":"...","detail":"...","action":"..."}]}
+
+Rules:
+- 7 progressive steps (foundations → advanced)
+- detail: 2-3 sentences grounded in the document
+- action: one concrete learner task for that step""",
+    "study": """Return ONLY valid JSON (no markdown fences):
+{"concepts":[{"term":"...","note":"..."}],"hooks":["..."],"checklist":["..."],"drills":["..."]}
+
+Rules:
+- 8-12 concepts with clear term + explanation from the doc
+- 4 memory hooks (mnemonics/analogies tied to content)
+- 6 revision checklist items
+- 3 self-test drill prompts""",
+}
+
+
+def _write(envelope: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(envelope) + "\n")
+    sys.stdout.flush()
+
 
 def _sentences(text: str) -> list[str]:
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
@@ -109,23 +178,44 @@ def _decode_base64(payload: str) -> bytes:
     return base64.b64decode(raw)
 
 
+def _sample_document(text: str, max_chars: int = 24000) -> str:
+    raw = text or ""
+    if len(raw) <= max_chars:
+        return raw
+    head = int(max_chars * 0.4)
+    mid = int(max_chars * 0.25)
+    mid2 = int(max_chars * 0.15)
+    tail = max_chars - head - mid - mid2
+    q1 = max(0, len(raw) // 4 - mid // 2)
+    q3 = max(0, (3 * len(raw)) // 4 - mid2 // 2)
+    return "\n\n".join(
+        [
+            raw[:head],
+            "[... sample ~25% ...]",
+            raw[q1 : q1 + mid],
+            "[... sample ~75% ...]",
+            raw[q3 : q3 + mid2],
+            "[... end sample ...]",
+            raw[-tail:],
+        ]
+    )
+
+
 def _extract_docx(data: bytes) -> str:
     with zipfile.ZipFile(BytesIO(data)) as zf:
         xml = zf.read("word/document.xml")
     root = ET.fromstring(xml)
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    texts: list[str] = []
-    for node in root.findall(".//w:t", ns):
-        if node.text:
-            texts.append(node.text)
-    # Prefer paragraph breaks when possible
     paras: list[str] = []
     for p in root.findall(".//w:p", ns):
         bits = [t.text for t in p.findall(".//w:t", ns) if t.text]
         line = "".join(bits).strip()
         if line:
             paras.append(line)
-    return "\n\n".join(paras) if paras else " ".join(texts)
+    if paras:
+        return "\n\n".join(paras)
+    texts = [node.text for node in root.findall(".//w:t", ns) if node.text]
+    return " ".join(texts)
 
 
 def _extract_pdf(data: bytes) -> tuple[str, str]:
@@ -147,7 +237,6 @@ def _extract_pdf(data: bytes) -> tuple[str, str]:
 
 
 def extract_document(filename: str, content_base64: str, mime_type: str = "") -> dict[str, Any]:
-    # Guard the Anna stdio 16 MiB frame limit (~12 MiB base64 practical ceiling).
     if content_base64 and len(content_base64) > 10_000_000:
         return {
             "success": False,
@@ -169,7 +258,6 @@ def extract_document(filename: str, content_base64: str, mime_type: str = "") ->
     elif ext == "pdf" or mime == "application/pdf":
         text, engine = _extract_pdf(data)
     else:
-        # Best-effort text decode for unknown types
         text = data.decode("utf-8", errors="replace")
         engine = "utf8-fallback"
 
@@ -195,12 +283,10 @@ def _pick_diverse(sents: list[str], count: int = 8) -> list[str]:
         return sents
     step = max(1, len(sents) // count)
     picked = [sents[i] for i in range(0, len(sents), step)]
-    # always include early + late signal
     if sents[0] not in picked:
         picked = [sents[0], *picked]
     if sents[-1] not in picked:
         picked.append(sents[-1])
-    # de-dupe preserve order
     out: list[str] = []
     seen = set()
     for s in picked:
@@ -214,31 +300,257 @@ def _pick_diverse(sents: list[str], count: int = 8) -> list[str]:
     return out
 
 
+def _request_sampling(messages: list[dict[str, Any]], max_tokens: int = 2200) -> str:
+    """Reverse-RPC sampling/createMessage; only call when _HOST_SAMPLING is True."""
+    rid = str(uuid.uuid4())
+    _write(
+        {
+            "jsonrpc": "2.0",
+            "id": rid,
+            "method": "sampling/createMessage",
+            "params": {
+                "messages": messages,
+                "systemPrompt": SYSTEM,
+                "maxTokens": max_tokens,
+                "temperature": 0.35,
+            },
+        }
+    )
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        env = json.loads(line)
+        if env.get("id") == rid and "method" not in env:
+            if "error" in env:
+                raise RuntimeError(env["error"].get("message", "sampling failed"))
+            result = env.get("result") or {}
+            content = result.get("content") or {}
+            if isinstance(content, dict):
+                return str(content.get("text") or "").strip()
+            if isinstance(content, list):
+                return "\n".join(str(c.get("text") or "") for c in content if isinstance(c, dict)).strip()
+            return str(result.get("text") or "").strip()
+        _dispatch(env)
+    raise RuntimeError("stdin closed before sampling response arrived")
+
+
+def _parse_json_blob(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw, re.I)
+    if fence:
+        raw = fence.group(1).strip()
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(raw[start : end + 1])
+                return data if isinstance(data, dict) else None
+            except Exception:  # noqa: BLE001
+                return None
+    return None
+
+
+def _llm_mode(mode: str, document_text: str, user_prompt: str = "") -> dict[str, Any] | None:
+    if not _HOST_SAMPLING:
+        return None
+    task = MODE_PROMPTS.get(mode)
+    if not task:
+        return None
+    extra = f"\n\nLearner focus: {user_prompt.strip()}" if user_prompt.strip() else ""
+    sample = _sample_document(document_text)
+    try:
+        text = _request_sampling(
+            [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": f"{task}{extra}\n\nDOCUMENT:\n{sample}",
+                    },
+                }
+            ],
+            max_tokens=2800 if mode == "summarize" else 2200,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not text:
+        return None
+
+    titles = {
+        "summarize": "Document Summary",
+        "quiz": "Practice Quiz",
+        "presentation": "Presentation Outline",
+        "guide": "Learning Guide",
+        "study": "Study Pack",
+    }
+
+    if mode == "summarize":
+        return {
+            "mode": "summarize",
+            "title": titles[mode],
+            "markdown": text,
+            "engine": "host-llm.sample",
+        }
+
+    data = _parse_json_blob(text)
+    if not data:
+        return {
+            "mode": mode,
+            "title": titles[mode],
+            "markdown": text,
+            "engine": "host-llm.sample",
+        }
+
+    out: dict[str, Any] = {
+        "mode": mode,
+        "title": titles[mode],
+        "engine": "host-llm.sample",
+        "markdown": text,
+    }
+    if mode == "quiz" and isinstance(data.get("questions"), list):
+        out["questions"] = data["questions"]
+        out["markdown"] = _quiz_md(data["questions"], user_prompt)
+    elif mode == "presentation" and isinstance(data.get("slides"), list):
+        out["slides"] = data["slides"]
+        out["markdown"] = _slides_md(data["slides"])
+    elif mode == "guide" and isinstance(data.get("steps"), list):
+        out["steps"] = data["steps"]
+        out["markdown"] = _guide_md(data["steps"], user_prompt)
+    elif mode == "study" and isinstance(data.get("concepts"), list):
+        out["concepts"] = data["concepts"]
+        out["markdown"] = _study_md(data, user_prompt)
+    return out
+
+
+def _llm_ask(document_text: str, question: str) -> dict[str, Any] | None:
+    if not _HOST_SAMPLING:
+        return None
+    sample = _sample_document(document_text)
+    prompt = f"""Answer using ONLY the document.
+
+## Direct Answer
+Clear, complete answer in your own words.
+
+## Supporting Evidence
+2-4 short bullets quoting or closely paraphrasing the source.
+
+## Extra Clarity
+Only if needed — definitions, edge cases, or common confusion.
+
+Question: {question}
+
+DOCUMENT:
+{sample}"""
+    try:
+        text = _request_sampling(
+            [{"role": "user", "content": {"type": "text", "text": prompt}}],
+            max_tokens=1800,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not text:
+        return None
+    return {
+        "mode": "ask",
+        "title": "Document Answer",
+        "markdown": text,
+        "engine": "host-llm.sample",
+    }
+
+
+def _quiz_md(questions: list[dict[str, Any]], user_prompt: str = "") -> str:
+    md = ["## Quiz", ""]
+    if user_prompt.strip():
+        md.extend([f"_Focus:_ {user_prompt.strip()}", ""])
+    for i, q in enumerate(questions, 1):
+        md.append(f"**Q{q.get('id', i)}. {q.get('question', '')}**")
+        for idx, opt in enumerate(q.get("options") or []):
+            md.append(f"- {chr(ord('A') + idx)}) {opt}")
+        ans_i = int(q.get("answer_index") or 0)
+        md.append(f"**Answer:** {chr(ord('A') + ans_i)}")
+        if q.get("explanation"):
+            md.append(f"**Why:** {q['explanation']}")
+        md.append("")
+    return "\n".join(md)
+
+
+def _slides_md(slides: list[dict[str, Any]]) -> str:
+    md = ["## Presentation outline", ""]
+    for i, slide in enumerate(slides, 1):
+        md.append(f"### Slide {i}: {slide.get('title', '')}")
+        for b in slide.get("bullets") or []:
+            if b:
+                md.append(f"- {b}")
+        md.append("")
+    return "\n".join(md)
+
+
+def _guide_md(steps: list[dict[str, Any]], user_prompt: str = "") -> str:
+    md = ["## Learning Guide", ""]
+    if user_prompt.strip():
+        md.extend([f"**Goal:** {user_prompt.strip()}", ""])
+    for s in steps:
+        md.append(f"### Step {s.get('step', '')} — {s.get('title', '')}")
+        md.append(str(s.get("detail") or ""))
+        md.append(f"**Action:** {s.get('action', '')}")
+        md.append("")
+    return "\n".join(md)
+
+
+def _study_md(data: dict[str, Any], user_prompt: str = "") -> str:
+    md = ["## Study Pack", ""]
+    if user_prompt.strip():
+        md.extend([f"**Focus:** {user_prompt.strip()}", ""])
+    md.append("### Must-Know Concepts")
+    for c in data.get("concepts") or []:
+        md.append(f"- **{c.get('term', '')}** — {c.get('note', '')}")
+    if data.get("hooks"):
+        md.extend(["", "### Memory Hooks"])
+        for h in data["hooks"]:
+            md.append(f"- {h}")
+    if data.get("checklist"):
+        md.extend(["", "### Revision Checklist"])
+        for item in data["checklist"]:
+            md.append(f"- [ ] {item}")
+    if data.get("drills"):
+        md.extend(["", "### Weak-Spot Drills"])
+        for d in data["drills"]:
+            md.append(f"- {d}")
+    return "\n".join(md)
+
+
 def summarize(document_text: str, user_prompt: str = "") -> dict[str, Any]:
     paras = _paragraphs(document_text)
     sents = _sentences(document_text)
-    key_points = _pick_diverse(sents, 8) if sents else paras[:8]
+    key_points = _pick_diverse(sents, 10) if sents else paras[:10]
     overview = " ".join(key_points[:2]) if key_points else "No usable text found."
     focus = user_prompt.strip() or "general understanding"
     concepts = []
-    for point in key_points[:6]:
+    for point in key_points[:8]:
         words = re.findall(r"[A-Za-z][A-Za-z\-]{4,}", point)
         if words:
             concepts.append(f"- **{' / '.join(words[:3])}** — {point[:160]}")
 
     markdown = [
-        "## Summary",
+        "## TL;DR",
         "",
         overview,
         "",
         f"**Focus:** {focus}",
         "",
-        "## Key Takeaways",
+        "## Core Ideas",
     ]
-    for i, point in enumerate(key_points[:8], 1):
+    for i, point in enumerate(key_points[:10], 1):
         markdown.append(f"{i}. {point}")
     if concepts:
-        markdown.extend(["", "## Important Concepts", *concepts])
+        markdown.extend(["", "## Key Terms", *concepts])
     if paras:
         markdown.extend(["", "## Sections Covered", ""])
         for i, p in enumerate(paras[:6], 1):
@@ -247,10 +559,10 @@ def summarize(document_text: str, user_prompt: str = "") -> dict[str, Any]:
     markdown.extend(
         [
             "",
-            "## Next Steps",
-            "- Run **Quiz** on weak points",
-            "- Run **Guide** for a study path",
-            "- Ask a specific question in chat",
+            "## Next Study Moves",
+            "- Re-run with Anna LLM enabled for a tutor-quality rewrite",
+            "- Use **Quiz** on the weakest sections above",
+            "- Ask a specific “why/how” question in chat",
         ]
     )
 
@@ -258,7 +570,7 @@ def summarize(document_text: str, user_prompt: str = "") -> dict[str, Any]:
         "mode": "summarize",
         "title": "Document Summary",
         "markdown": "\n".join(markdown),
-        "key_points": key_points[:8],
+        "key_points": key_points[:10],
         "engine": "local-extractive",
     }
 
@@ -267,7 +579,8 @@ def quiz(document_text: str, question_count: int = 5, user_prompt: str = "") -> 
     sents = _sentences(document_text)
     count = _clamp(int(question_count or 5), 3, 10)
     questions = []
-    if not sents:
+    picks = _pick_diverse(sents, count) if sents else []
+    if not picks:
         questions.append(
             {
                 "id": 1,
@@ -278,14 +591,13 @@ def quiz(document_text: str, question_count: int = 5, user_prompt: str = "") -> 
             }
         )
     else:
-        for i in range(min(count, len(sents))):
-            sent = sents[i]
+        for i, sent in enumerate(picks, 1):
             words = [w for w in re.findall(r"[A-Za-z][A-Za-z\-]{3,}", sent)]
             topic = words[0] if words else "the topic"
             questions.append(
                 {
-                    "id": i + 1,
-                    "question": f"Which statement best matches idea {i + 1} from the material?",
+                    "id": i,
+                    "question": f"Which statement best matches idea {i} from the material?",
                     "options": [
                         sent[:140],
                         f"{topic} is unrelated to this document.",
@@ -297,24 +609,10 @@ def quiz(document_text: str, question_count: int = 5, user_prompt: str = "") -> 
                 }
             )
 
-    md = ["## Quiz", ""]
-    if user_prompt.strip():
-        md.append(f"_User focus:_ {user_prompt.strip()}")
-        md.append("")
-    for q in questions:
-        md.append(f"**Q{q['id']}. {q['question']}**")
-        for idx, opt in enumerate(q["options"]):
-            letter = chr(ord("A") + idx)
-            md.append(f"- {letter}) {opt}")
-        ans = chr(ord("A") + int(q["answer_index"]))
-        md.append(f"Answer: {ans}")
-        md.append(f"_Why:_ {q['explanation']}")
-        md.append("")
-
     return {
         "mode": "quiz",
         "title": "Practice Quiz",
-        "markdown": "\n".join(md),
+        "markdown": _quiz_md(questions, user_prompt),
         "questions": questions,
         "engine": "local-extractive",
     }
@@ -346,19 +644,10 @@ def presentation(document_text: str, slide_count: int = 6, user_prompt: str = ""
             ],
         }
     )
-
-    md = ["## Presentation outline", ""]
-    for i, slide in enumerate(slides, 1):
-        md.append(f"### Slide {i}: {slide['title']}")
-        for b in slide["bullets"]:
-            if b:
-                md.append(f"- {b}")
-        md.append("")
-
     return {
         "mode": "presentation",
         "title": "Presentation Outline",
-        "markdown": "\n".join(md),
+        "markdown": _slides_md(slides),
         "slides": slides,
         "engine": "local-extractive",
     }
@@ -385,21 +674,10 @@ def guide(document_text: str, user_prompt: str = "") -> dict[str, Any]:
                 "action": "Attach a file, then run Guide again.",
             }
         ]
-
-    md = ["## Learning Guide", ""]
-    if user_prompt.strip():
-        md.append(f"**Goal:** {user_prompt.strip()}")
-        md.append("")
-    for s in steps:
-        md.append(f"### {s['title']}")
-        md.append(s["detail"])
-        md.append(f"_Action:_ {s['action']}")
-        md.append("")
-
     return {
         "mode": "guide",
         "title": "Learning Guide",
-        "markdown": "\n".join(md),
+        "markdown": _guide_md(steps, user_prompt),
         "steps": steps,
         "engine": "local-extractive",
     }
@@ -408,36 +686,27 @@ def guide(document_text: str, user_prompt: str = "") -> dict[str, Any]:
 def study(document_text: str, user_prompt: str = "") -> dict[str, Any]:
     sents = _sentences(document_text)
     concepts = []
-    for i, sent in enumerate(sents[:10], 1):
+    for i, sent in enumerate(_pick_diverse(sents, 10) or sents[:10], 1):
         words = re.findall(r"[A-Za-z][A-Za-z\-]{4,}", sent)
         label = " / ".join(words[:3]) if words else f"Concept {i}"
         concepts.append({"term": label, "note": sent[:220]})
-
-    md = ["## Study Pack", ""]
-    if user_prompt.strip():
-        md.append(f"**Focus:** {user_prompt.strip()}")
-        md.append("")
-    md.append("### Key concepts")
-    for c in concepts:
-        md.append(f"- **{c['term']}** — {c['note']}")
-    md.extend(
-        [
-            "",
-            "### Memory tips",
-            "- Teach each concept to an imaginary classmate",
-            "- Write one example that is not copied from the text",
-            "",
-            "### Revision checklist",
-            "- Recite each concept without looking",
-            "- Mark weak points",
-            "- Run Quiz mode on those weak points",
-        ]
-    )
-
+    data = {
+        "concepts": concepts,
+        "hooks": [
+            "Teach each concept to an imaginary classmate",
+            "Write one example that is not copied from the text",
+        ],
+        "checklist": [
+            "Recite each concept without looking",
+            "Mark weak points",
+            "Run Quiz mode on those weak points",
+        ],
+        "drills": ["What would break if the main claim were false?"],
+    }
     return {
         "mode": "study",
         "title": "Study Pack",
-        "markdown": "\n".join(md),
+        "markdown": _study_md(data, user_prompt),
         "concepts": concepts,
         "engine": "local-extractive",
     }
@@ -456,11 +725,11 @@ def ask_document(document_text: str, question: str) -> dict[str, Any]:
     evidence = [s for _, s in ranked[:4]] or sents[:3] or [document_text[:400]]
 
     md = [
-        "## Answer",
+        "## Direct Answer",
         "",
         f"**Question:** {q or 'N/A'}",
         "",
-        "### Best matching evidence from your document",
+        "### Supporting Evidence",
     ]
     for i, ev in enumerate(evidence, 1):
         md.append(f"{i}. {ev}")
@@ -470,7 +739,7 @@ def ask_document(document_text: str, question: str) -> dict[str, Any]:
             "### Short synthesis",
             " ".join(evidence[:2]) if evidence else "No matching passages found.",
             "",
-            "_Tip:_ For richer answers, press **Run mode** on Summarize, or connect Anna LLM.",
+            "_Tip:_ Restart with Anna LLM enabled (`npx anna-app login` then `npx anna-app dev`) for tutor-quality answers._",
         ]
     )
     return {
@@ -482,7 +751,7 @@ def ask_document(document_text: str, question: str) -> dict[str, Any]:
     }
 
 
-HANDLERS = {
+LOCAL_HANDLERS = {
     "summarize": lambda args: summarize(args.get("document_text", ""), args.get("user_prompt", "")),
     "quiz": lambda args: quiz(
         args.get("document_text", ""),
@@ -501,7 +770,15 @@ HANDLERS = {
 
 def invoke(method: str, args: dict) -> dict:
     if method == "ping":
-        return {"success": True, "data": {"pong": True, "app": "mindsparkle", "version": "0.2.0"}}
+        return {
+            "success": True,
+            "data": {
+                "pong": True,
+                "app": "mindsparkle",
+                "version": MANIFEST["version"],
+                "host_sampling": _HOST_SAMPLING,
+            },
+        }
 
     if method == "extract_document":
         return extract_document(
@@ -517,18 +794,54 @@ def invoke(method: str, args: dict) -> dict:
             return {"success": False, "error": "document_text is required"}
         if not str(question).strip():
             return {"success": False, "error": "question is required"}
-        return {"success": True, "data": ask_document(text, question)}
+        llm = _llm_ask(text, question)
+        return {"success": True, "data": llm or ask_document(text, question)}
 
     if method == "run_mode":
         mode = (args or {}).get("mode")
         text = (args or {}).get("document_text") or ""
-        if mode not in HANDLERS:
+        if mode not in LOCAL_HANDLERS:
             return {"success": False, "error": f"unknown mode: {mode}"}
         if not str(text).strip():
             return {"success": False, "error": "document_text is required"}
-        return {"success": True, "data": HANDLERS[mode](args or {})}
+        llm = _llm_mode(mode, text, (args or {}).get("user_prompt", "") or "")
+        return {"success": True, "data": llm or LOCAL_HANDLERS[mode](args or {})}
 
     return {"success": False, "error": f"unknown method: {method}"}
+
+
+def _dispatch(env: dict[str, Any]) -> None:
+    global _HOST_SAMPLING
+    method = env.get("method")
+    rid = env.get("id")
+    try:
+        if method == "initialize":
+            # Only hosts that speak the v2 handshake call initialize.
+            # Smoke tests skip this, so local fallbacks never hang on sampling.
+            _HOST_SAMPLING = True
+            result = {
+                "protocolVersion": "2.0",
+                "server_info": {"name": MANIFEST["display_name"], "version": MANIFEST["version"]},
+                "capabilities": {"sampling": {}},
+            }
+        elif method == "describe":
+            result = MANIFEST
+        elif method == "health":
+            result = {"status": "ready", "host_sampling": _HOST_SAMPLING}
+        elif method == "invoke":
+            params = env.get("params") or {}
+            result = invoke(params.get("tool", ""), params.get("arguments") or {})
+        else:
+            raise ValueError(f"unknown rpc: {method}")
+        _write({"jsonrpc": "2.0", "id": rid, "result": result})
+    except Exception as e:  # noqa: BLE001
+        _write(
+            {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "error": {"code": -32601, "message": str(e)},
+            }
+        )
 
 
 def main() -> None:
@@ -536,30 +849,7 @@ def main() -> None:
         line = line.strip()
         if not line:
             continue
-        req = json.loads(line)
-        try:
-            if req.get("method") == "describe":
-                result = MANIFEST
-            elif req.get("method") == "health":
-                result = {"status": "ready"}
-            elif req.get("method") == "invoke":
-                params = req.get("params") or {}
-                result = invoke(params.get("tool", ""), params.get("arguments") or {})
-            else:
-                raise ValueError(f"unknown rpc: {req.get('method')}")
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req.get("id"), "result": result}) + "\n")
-        except Exception as e:  # noqa: BLE001
-            sys.stdout.write(
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req.get("id"),
-                        "error": {"code": -32601, "message": str(e)},
-                    }
-                )
-                + "\n"
-            )
-        sys.stdout.flush()
+        _dispatch(json.loads(line))
 
 
 if __name__ == "__main__":
