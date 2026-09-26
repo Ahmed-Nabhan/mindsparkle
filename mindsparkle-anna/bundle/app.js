@@ -1,8 +1,21 @@
 /**
  * MindSparkle UI — auth + welcome + clean workspace + local file extract
  */
-import { AnnaAppRuntime } from "/static/anna-apps/_sdk/latest/index.js";
 import { extractLocalFile } from "./extract.js";
+
+async function loadAnnaRuntime() {
+  try {
+    const mod = await import("/static/anna-apps/_sdk/latest/index.js");
+    return mod.AnnaAppRuntime;
+  } catch {
+    // Static / mobile preview without Anna host — UI still works offline
+    return {
+      connect: async () => {
+        throw new Error("Anna host unavailable (preview mode)");
+      },
+    };
+  }
+}
 
 const TOOL_ID =
   (typeof window !== "undefined" &&
@@ -266,8 +279,23 @@ function setMode(id) {
   lsSet(KEYS.mode, id);
 }
 
+function isMobileLayout() {
+  return typeof window !== "undefined" && window.matchMedia("(max-width: 900px)").matches;
+}
+
 function setDrawer(open) {
   els.layout.classList.toggle("drawer-closed", !open);
+  // Tap dimmed area to close drawer on phone
+  if (isMobileLayout() && open) {
+    const onScrim = (e) => {
+      if (e.target === els.layout || e.target.classList?.contains?.("main")) {
+        setDrawer(false);
+        els.layout.removeEventListener("click", onScrim);
+      }
+    };
+    // Delay so the opening click doesn't instantly close
+    setTimeout(() => els.layout.addEventListener("click", onScrim, { once: true }), 0);
+  }
 }
 
 function updateDocMeta(meta = {}) {
@@ -318,7 +346,10 @@ function buildModeUi() {
     card.className = "mode-card";
     card.dataset.mode = mode.id;
     card.innerHTML = `<strong>${mode.title}</strong><span>${mode.blurb}</span>`;
-    card.onclick = () => setMode(mode.id);
+    card.onclick = () => {
+      setMode(mode.id);
+      if (isMobileLayout()) setDrawer(false);
+    };
     els.modeList.appendChild(card);
 
     const hub = document.createElement("button");
@@ -331,7 +362,10 @@ function buildModeUi() {
         setDrawer(true);
         addMessage("system", `Mode: ${mode.title}. Upload a document to run it.`);
         showHub();
-      } else runLearning();
+      } else {
+        if (isMobileLayout()) setDrawer(false);
+        runLearning();
+      }
     };
     els.hubGrid.appendChild(hub);
   });
@@ -576,16 +610,17 @@ function localFallback(mode, documentText, userPrompt) {
     mode: "summarize",
     title: "Document Summary",
     markdown: [
-      "## Summary",
+      "## TL;DR",
       "",
       points.slice(0, 2).join(" ") || documentText.slice(0, 280),
       "",
-      "### Key points",
+      "## Core Ideas",
       ...points.map((p, i) => `${i + 1}. ${p}`),
       "",
-      "### How to go deeper",
-      "- Switch to **Quiz** to test yourself",
-      "- Switch to **Guide** for a study path",
+      "## Next Study Moves",
+      "- Restart with Anna LLM for a tutor rewrite (`anna-app login` + `anna-app dev`)",
+      "- Switch to **Quiz** on the weakest ideas above",
+      "- Ask a specific why/how question in chat",
     ].join("\n"),
     engine: "local-summary",
   };
@@ -984,7 +1019,8 @@ function enterWorkspace() {
     /* ignore */
   }
   setScreen("workspace");
-  setDrawer(true);
+  // Phone: start chat-first with hamburger; desktop: open modes rail
+  setDrawer(!isMobileLayout());
   showHub();
 }
 
@@ -1120,9 +1156,10 @@ async function init() {
   } else updateDocMeta({});
 
   try {
+    const AnnaAppRuntime = await loadAnnaRuntime();
     anna = await AnnaAppRuntime.connect();
     setConn(true);
-    await anna.window.set_title({ title: "MindSparkle" });
+    await anna.window?.set_title?.({ title: "MindSparkle" });
   } catch {
     setConn(false);
   }
