@@ -428,7 +428,7 @@ def ask_document(document_text: str, question: str) -> dict[str, Any]:
             "### Short synthesis",
             " ".join(evidence[:2]) if evidence else "No matching passages found.",
             "",
-            "_Tip:_ Connect Anna LLM for richer natural-language answers.",
+            "_Tip:_ For richer answers, press **Run mode** on Summarize, or connect Anna LLM.",
         ]
     )
     return {

@@ -514,12 +514,54 @@ function localFallback(mode, documentText, userPrompt) {
     const concepts = sentences.slice(0, 6).map((s, i) => ({ term: `Concept ${i + 1}`, note: s.slice(0, 160) }));
     return { mode, concepts, markdown: "Study", engine: "local" };
   }
-  const points = sentences.slice(0, 6);
+  const points = (() => {
+    // Prefer diverse sentences across the doc, not only the first ones
+    const all = documentText
+      .split(/(?<=[.!?])\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 40);
+    if (all.length <= 8) return all;
+    const step = Math.max(1, Math.floor(all.length / 8));
+    const picked = [];
+    for (let i = 0; i < all.length && picked.length < 8; i += step) picked.push(all[i]);
+    return picked;
+  })();
   return {
     mode: "summarize",
-    markdown: ["## Summary", "", points.slice(0, 2).join(" "), "", "### Key points", ...points.map((p, i) => `${i + 1}. ${p}`)].join("\n"),
-    engine: "local",
+    title: "Document Summary",
+    markdown: [
+      "## Summary",
+      "",
+      points.slice(0, 2).join(" ") || documentText.slice(0, 280),
+      "",
+      "### Key points",
+      ...points.map((p, i) => `${i + 1}. ${p}`),
+      "",
+      "### How to go deeper",
+      "- Switch to **Quiz** to test yourself",
+      "- Switch to **Guide** for a study path",
+    ].join("\n"),
+    engine: "local-summary",
   };
+}
+
+function detectModeIntent(text = "") {
+  const t = String(text).toLowerCase();
+  if (/\b(summar(y|ize|ise)|ملخص|اختصر)\b/.test(t)) return "summarize";
+  if (/\b(quiz|questions?|اختبار|أسئلة|اسئله)\b/.test(t)) return "quiz";
+  if (/\b(presentation|slides?|عرض|سلايد)\b/.test(t)) return "presentation";
+  if (/\b(guide|roadmap|خطة|دليل)\b/.test(t)) return "guide";
+  if (/\b(study|flashcards?|مذاكرة|مذاكره)\b/.test(t)) return "study";
+  return null;
+}
+
+function isModeCommand(text = "") {
+  const t = String(text).trim().toLowerCase();
+  if (!t) return false;
+  if (detectModeIntent(t)) return true;
+  // short commands like "do it", "run", "go" while a mode is selected
+  if (/^(run|go|start|do it|ok|نعم|يلا|شغل)$/i.test(t)) return true;
+  return false;
 }
 
 async function runLearning({ userPrompt = "", fromChat = false } = {}) {
@@ -530,46 +572,71 @@ async function runLearning({ userPrompt = "", fromChat = false } = {}) {
     showHub();
     return;
   }
+
+  // If user types "summarize it" in chat, treat as mode run — NOT weak ask/retrieval
+  const intentMode = fromChat ? detectModeIntent(userPrompt) : null;
+  if (intentMode) setMode(intentMode);
   const mode = currentMode();
-  const asking = fromChat && Boolean(userPrompt.trim());
-  addMessage("user", asking ? userPrompt : `Run ${mode.title}${userPrompt ? `: ${userPrompt}` : ""}`);
+  const asking = fromChat && Boolean(userPrompt.trim()) && !isModeCommand(userPrompt);
+
+  addMessage("user", asking ? userPrompt : `Run ${mode.title}${userPrompt && !intentMode ? `: ${userPrompt}` : ""}`);
   setBusy(true);
   const sk = addSkeleton();
   try {
     let result = null;
-    if (anna?.llm?.complete && asking) {
+    const clipped = doc.slice(0, 14000); // keep tool/LLM payloads small
+
+    // Prefer structured mode tools for summarize/quiz/... (better than ask retrieval)
+    if (!asking && anna?.tools?.invoke) {
+      try {
+        result = await callTool("run_mode", {
+          mode: mode.id,
+          document_text: clipped,
+          user_prompt: intentMode ? "" : userPrompt || "",
+        });
+      } catch (e) {
+        console.warn("run_mode failed", e);
+      }
+    }
+
+    if (asking && anna?.llm?.complete) {
       try {
         const reply = await anna.llm.complete({
           messages: [
-            { role: "system", content: { type: "text", text: "You are MindSparkle, a precise study coach." } },
+            { role: "system", content: { type: "text", text: "You are MindSparkle, a precise study coach. Answer clearly in markdown." } },
             {
               role: "user",
               content: {
                 type: "text",
-                text: `Answer using the document.\n\nQuestion: ${userPrompt}\n\nDOCUMENT:\n${doc.slice(0, 24000)}`,
+                text: `Answer using ONLY this document.\n\nQuestion: ${userPrompt}\n\nDOCUMENT:\n${clipped}`,
               },
             },
           ],
-          maxTokens: 1600,
+          maxTokens: 1200,
         });
         const text = reply?.content?.text || reply?.text || "";
         if (text) result = { mode: "ask", markdown: text, engine: "anna.llm.complete" };
       } catch (e) {
-        console.warn(e);
+        console.warn("llm.complete failed", e);
       }
     }
-    if (!result && anna?.tools?.invoke) {
-      result = asking
-        ? await callTool("ask_document", { document_text: doc.slice(0, 120000), question: userPrompt })
-        : await callTool("run_mode", {
-            mode: mode.id,
-            document_text: doc.slice(0, 120000),
-            user_prompt: userPrompt || "",
-          });
+
+    if (!result && asking && anna?.tools?.invoke) {
+      try {
+        result = await callTool("ask_document", {
+          document_text: clipped,
+          question: userPrompt,
+        });
+      } catch (e) {
+        console.warn("ask_document failed", e);
+      }
     }
-    if (!result) result = asking
-      ? { mode: "ask", markdown: `## Answer\n\n${doc.slice(0, 400)}…`, engine: "local" }
-      : localFallback(mode.id, doc, userPrompt);
+
+    if (!result) {
+      result = asking
+        ? await callToolSafeAsk(clipped, userPrompt)
+        : localFallback(mode.id, clipped, userPrompt);
+    }
 
     sk.remove();
     lastResult = result;
@@ -588,6 +655,44 @@ async function runLearning({ userPrompt = "", fromChat = false } = {}) {
   } finally {
     setBusy(false);
   }
+}
+
+async function callToolSafeAsk(doc, question) {
+  try {
+    if (anna?.tools?.invoke) {
+      return await callTool("ask_document", { document_text: doc, question });
+    }
+  } catch {
+    /* fall through */
+  }
+  // stronger local ask than single-sentence dump
+  const sentences = doc
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 40);
+  const qWords = new Set((question.toLowerCase().match(/[a-z]{4,}/g) || []));
+  const ranked = sentences
+    .map((s) => ({ s, score: [...qWords].reduce((n, w) => n + (s.toLowerCase().includes(w) ? 1 : 0), 0) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+    .map((x) => x.s);
+  const evidence = ranked.length ? ranked : sentences.slice(0, 5);
+  return {
+    mode: "ask",
+    markdown: [
+      "## Answer",
+      "",
+      `**Question:** ${question}`,
+      "",
+      "### Key evidence",
+      ...evidence.map((e, i) => `${i + 1}. ${e}`),
+      "",
+      "### Short synthesis",
+      evidence.slice(0, 2).join(" "),
+    ].join("\n"),
+    engine: "local-retrieval",
+  };
 }
 
 function exportLast() {
