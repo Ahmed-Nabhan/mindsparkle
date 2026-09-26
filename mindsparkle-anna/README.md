@@ -1,33 +1,34 @@
-# MindSparkle (Anna App) — Phase 1
+# MindSparkle (Anna App) — Phase 1+
 
-Chat-first AI study companion for the Anna Marketplace.
+Chat-first AI study companion for the Anna Marketplace — rebuilt to be stronger than the original MindSparkle stack.
 
-## Phase 1 modes
-- **Summarize**
-- **Quiz**
-- **Presentation**
-- **Guide**
-- **Study**
+## What’s new
+- **Welcome entrance** before the workspace
+- **Professional chat + side-rail UI**
+- **Multi-format upload:** PDF, DOCX, TXT, MD, CSV (+ paste)
+- Modes: Summarize · Quiz · Presentation · Guide · Study
+- **Ask-the-document chat** follow-ups
+- **Export last result** as Markdown
+- Prefers Anna `llm.complete` when available; local Executa fallback otherwise
 
-## UX
-- Opens on a clean chat canvas
-- Left dots / rail expands into a sidebar of modes + document paste/upload
-
-## Stack
-- `bundle/` — Anna App UI (iframe SPA)
-- `executas/mindsparkle/` — learning tools (`run_mode`)
-- Prefers `anna.llm.complete` when available, otherwise falls back to the local Executa heuristics
-
-## Develop locally
+## Run locally
 
 ```bash
 npm install
+# once on your machine:
+# curl -LsSf https://astral.sh/uv/install.sh | sh
 npx anna-app doctor
 npx anna-app validate
-npx anna-app dev
+npx anna-app dev --no-llm
 ```
 
-Open the printed dashboard URL (usually `http://localhost:5180`).
+Open `http://localhost:5180/`.
 
-## Publish later
+## Tests
+
+```bash
+npm run test:plugin
+```
+
+## Publish
 See `../anna-phase1/ANNA_MARKETPLACE_UPLOAD_STEPS.txt`.
