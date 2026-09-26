@@ -1,0 +1,19 @@
+{
+  "slug": "mindsparkle",
+  "name": "MindSparkle Learning Tools",
+  "version": "0.1.0",
+  "executa_type": "tool",
+  "description": "Document learning modes for MindSparkle: summarize, quiz, presentation, guide, and study.",
+  "tool_id": "tool-dev-mindsparkle",
+  "type": "python",
+  "enabled": true,
+  "distribution": {
+    "active": "local",
+    "profiles": {
+      "local": {
+        "type": "local",
+        "supports_protocol": true
+      }
+    }
+  }
+}

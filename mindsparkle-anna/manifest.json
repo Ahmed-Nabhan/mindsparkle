@@ -1,0 +1,53 @@
+{
+  "schema": 2,
+  "required_executas": [
+    {
+      "tool_id": "tool-dev-mindsparkle"
+    }
+  ],
+  "optional_executas": [],
+  "host_capabilities": ["llm.sample", "aps.kv"],
+  "system_prompt_addendum": "The user has MindSparkle open. Help them learn from documents using the mindsparkle tool modes: summarize, quiz, presentation, guide, and study. Prefer calling the tool with the active mode instead of inventing unstructured study plans. Keep answers clear and educational.",
+  "user_message_prefix_template": "[MindSparkle] {user_message}",
+  "tags": ["education", "study", "quiz", "summary", "learning", "mindsparkle"],
+  "ui": {
+    "bundle": {
+      "format": "static-spa",
+      "entry": "index.html",
+      "external_origins": []
+    },
+    "views": [
+      {
+        "name": "main",
+        "title": "MindSparkle",
+        "default": true,
+        "entry": "index.html",
+        "min_size": { "w": 420, "h": 560 },
+        "default_size": { "w": 920, "h": 720 },
+        "max_size": { "w": 1400, "h": 1000 },
+        "resizable": true,
+        "movable": true,
+        "single_instance": true
+      }
+    ],
+    "host_api": {
+      "tools": ["tool-dev-mindsparkle", "required:*"],
+      "chat": ["write_message"],
+      "storage": ["get", "set", "delete", "list"],
+      "llm": ["complete"],
+      "window": ["set_title", "ready"]
+    },
+    "csp_overrides": {
+      "img-src": ["'self'", "data:", "blob:"],
+      "font-src": ["'self'", "data:"],
+      "style-src": ["'self'"],
+      "script-src": ["'self'"]
+    },
+    "state_merge": "last_writer_wins"
+  },
+  "dev": {
+    "fixtures": ["fixtures/*.jsonl"],
+    "seed_storage": {},
+    "user_id": 1
+  }
+}

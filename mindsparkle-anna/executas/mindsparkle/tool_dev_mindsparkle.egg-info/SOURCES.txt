@@ -1,0 +1,7 @@
+mindsparkle_plugin.py
+pyproject.toml
+tool_dev_mindsparkle.egg-info/PKG-INFO
+tool_dev_mindsparkle.egg-info/SOURCES.txt
+tool_dev_mindsparkle.egg-info/dependency_links.txt
+tool_dev_mindsparkle.egg-info/entry_points.txt
+tool_dev_mindsparkle.egg-info/top_level.txt

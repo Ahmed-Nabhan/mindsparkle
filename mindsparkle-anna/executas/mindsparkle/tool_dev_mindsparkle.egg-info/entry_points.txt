@@ -1,0 +1,2 @@
+[console_scripts]
+tool-dev-mindsparkle = mindsparkle_plugin:main
