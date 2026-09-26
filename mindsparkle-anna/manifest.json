@@ -6,8 +6,8 @@
     }
   ],
   "optional_executas": [],
-  "host_capabilities": ["llm.sample", "aps.kv"],
-  "system_prompt_addendum": "The user has MindSparkle open. Help them learn from documents using the mindsparkle tool modes: summarize, quiz, presentation, guide, and study. Prefer calling the tool with the active mode instead of inventing unstructured study plans. Keep answers clear and educational.",
+  "host_capabilities": ["llm.sample", "aps.kv", "host.upload"],
+  "system_prompt_addendum": "The user has MindSparkle open. Help them learn from documents using summarize, quiz, presentation, guide, and study. Keep answers clear and educational.",
   "user_message_prefix_template": "[MindSparkle] {user_message}",
   "tags": ["education", "study", "quiz", "summary", "learning", "mindsparkle"],
   "ui": {
@@ -22,19 +22,20 @@
         "title": "MindSparkle",
         "default": true,
         "entry": "index.html",
-        "min_size": { "w": 420, "h": 560 },
-        "default_size": { "w": 920, "h": 720 },
-        "max_size": { "w": 1400, "h": 1000 },
+        "min_size": { "w": 480, "h": 640 },
+        "default_size": { "w": 1080, "h": 760 },
+        "max_size": { "w": 1600, "h": 1100 },
         "resizable": true,
         "movable": true,
         "single_instance": true
       }
     ],
     "host_api": {
-      "tools": ["tool-dev-mindsparkle", "required:*"],
+      "tools": ["required:*"],
       "chat": ["write_message"],
       "storage": ["get", "set", "delete", "list"],
       "llm": ["complete"],
+      "upload": ["inline", "negotiate", "confirm"],
       "window": ["set_title", "ready"]
     },
     "csp_overrides": {

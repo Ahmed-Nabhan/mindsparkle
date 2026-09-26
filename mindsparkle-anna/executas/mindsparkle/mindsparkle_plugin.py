@@ -147,6 +147,15 @@ def _extract_pdf(data: bytes) -> tuple[str, str]:
 
 
 def extract_document(filename: str, content_base64: str, mime_type: str = "") -> dict[str, Any]:
+    # Guard the Anna stdio 16 MiB frame limit (~12 MiB base64 practical ceiling).
+    if content_base64 and len(content_base64) > 10_000_000:
+        return {
+            "success": False,
+            "error": (
+                "File payload too large for tool transfer. "
+                "Use in-browser extraction (MindSparkle UI) instead of sending raw bytes to the tool."
+            ),
+        }
     data = _decode_base64(content_base64)
     ext = _ext(filename)
     mime = (mime_type or "").lower()

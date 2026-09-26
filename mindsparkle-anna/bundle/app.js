@@ -1,88 +1,70 @@
 /**
- * MindSparkle Anna UI — upgrades 1–7
- * 1 hub · 2 cockpit · 3 rich outputs · 4 motion · 5 command bar · 6 theme · 7 history
+ * MindSparkle UI — auth + welcome + clean workspace + local file extract
  */
 import { AnnaAppRuntime } from "/static/anna-apps/_sdk/latest/index.js";
+import { extractLocalFile } from "./extract.js";
 
-const DEV_FALLBACK_TOOL_ID = "tool-dev-mindsparkle";
 const TOOL_ID =
   (typeof window !== "undefined" &&
     window.__ANNA_TOOL_IDS__ &&
     window.__ANNA_TOOL_IDS__.mindsparkle) ||
-  DEV_FALLBACK_TOOL_ID;
+  "tool-dev-mindsparkle";
 
-const STORAGE_DOC_KEY = "mindsparkle:document";
-const STORAGE_DOC_META_KEY = "mindsparkle:document_meta";
-const STORAGE_MODE_KEY = "mindsparkle:mode";
-const STORAGE_ENTERED_KEY = "mindsparkle:entered";
-const STORAGE_THEME_KEY = "mindsparkle:theme";
-const STORAGE_HISTORY_KEY = "mindsparkle:history";
-
-const MODES = [
-  { id: "summarize", short: "SU", title: "Summarize", blurb: "Executive overview + key points." },
-  { id: "quiz", short: "QZ", title: "Quiz", blurb: "Interactive practice questions." },
-  { id: "presentation", short: "PR", title: "Presentation", blurb: "Slide deck outline." },
-  { id: "guide", short: "GD", title: "Guide", blurb: "Step-by-step learning path." },
-  { id: "study", short: "ST", title: "Study", blurb: "Flashcards + revision pack." },
-];
-
-const MODE_PROMPTS = {
-  summarize:
-    "Create a professional study summary with overview, 5-8 key points, and section coverage. Markdown.",
-  quiz:
-    "Create 5 multiple-choice questions. Options A-D, then Answer + short explanation. Markdown.",
-  presentation:
-    "Create a presentation outline with 6 slides. Each slide: title + 2-4 bullets. Markdown.",
-  guide:
-    "Create a step-by-step learning guide. Each step: title, explanation, action. Markdown.",
-  study:
-    "Create a study pack: key concepts (term — note), memory tips, revision checklist. Markdown.",
+const KEYS = {
+  user: "mindsparkle:user",
+  users: "mindsparkle:users",
+  doc: "mindsparkle:document",
+  meta: "mindsparkle:document_meta",
+  mode: "mindsparkle:mode",
+  theme: "mindsparkle:theme",
+  history: "mindsparkle:history",
+  welcomeSession: "mindsparkle:welcome_done_session",
 };
 
-const TEXT_EXTS = new Set(["txt", "md", "markdown", "csv", "json", "log", "html", "htm"]);
-const BINARY_EXTS = new Set(["pdf", "docx"]);
+const MODES = [
+  { id: "summarize", short: "1", title: "Summarize", blurb: "Clear overview + key points" },
+  { id: "quiz", short: "2", title: "Quiz", blurb: "Interactive practice questions" },
+  { id: "presentation", short: "3", title: "Presentation", blurb: "Slide-ready outline" },
+  { id: "guide", short: "4", title: "Guide", blurb: "Step-by-step learning path" },
+  { id: "study", short: "5", title: "Study", blurb: "Flashcards + revision pack" },
+];
 
-const $ = (sel) => document.querySelector(sel);
-
+const $ = (s) => document.querySelector(s);
 const els = {
+  authScreen: $("#auth-screen"),
+  tabLogin: $("#tab-login"),
+  tabSignup: $("#tab-signup"),
+  loginForm: $("#login-form"),
+  signupForm: $("#signup-form"),
+  authError: $("#auth-error"),
   entrance: $("#entrance"),
   enterBtn: $("#enter-btn"),
+  welcomeUser: $("#welcome-user"),
   workspace: $("#workspace"),
-  showEntrance: $("#show-entrance"),
-  app: $("#workspace"),
-  railToggle: $("#rail-toggle"),
-  railIcons: $("#rail-icons"),
-  sidebar: $("#sidebar"),
-  sidebarClose: $("#sidebar-close"),
+  menuBtn: $("#menu-btn"),
+  drawer: $("#drawer"),
+  drawerClose: $("#drawer-close"),
   modeList: $("#mode-list"),
   modeTitle: $("#mode-title"),
-  modePill: $("#mode-pill"),
   connPill: $("#conn-pill"),
+  themeToggle: $("#theme-toggle"),
+  cmdExport: $("#cmd-export"),
+  logoutBtn: $("#logout-btn"),
   chat: $("#chat"),
   hub: $("#hub"),
   hubGrid: $("#hub-grid"),
-  hubUpload: $("#hub-upload"),
   docInput: $("#doc-input"),
+  docMeta: $("#doc-meta"),
   dropzone: $("#dropzone"),
   fileInput: $("#file-input"),
   clearDoc: $("#clear-doc"),
-  rerunBtn: $("#rerun-btn"),
-  cockpitTitle: $("#cockpit-title"),
-  cockpitType: $("#cockpit-type"),
-  cockpitChars: $("#cockpit-chars"),
-  cockpitWords: $("#cockpit-words"),
-  cockpitMode: $("#cockpit-mode"),
+  runMode: $("#run-mode"),
   historyList: $("#history-list"),
   clearHistory: $("#clear-history"),
   promptInput: $("#prompt-input"),
   sendBtn: $("#send-btn"),
-  runMode: $("#run-mode"),
   hint: $("#hint"),
-  cmdUpload: $("#cmd-upload"),
-  cmdMode: $("#cmd-mode"),
-  cmdExport: $("#cmd-export"),
-  cmdNew: $("#cmd-new"),
-  themeToggle: $("#theme-toggle"),
+  layout: $(".layout"),
 };
 
 let anna = null;
@@ -90,13 +72,39 @@ let busy = false;
 let activeMode = "summarize";
 let lastMarkdown = "";
 let lastResult = null;
-let docMeta = { name: "", type: "", chars: 0 };
+let currentUser = null;
 let history = [];
-let hubVisible = true;
-let quizState = { correct: 0, answered: 0 };
+let docMeta = { name: "", type: "", chars: 0 };
+
+function lsGet(key, fallback = null) {
+  try {
+    const v = localStorage.getItem(key);
+    return v == null ? fallback : JSON.parse(v);
+  } catch {
+    return fallback;
+  }
+}
+function lsSet(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* ignore */
+  }
+}
+
+function showAuthError(msg) {
+  els.authError.hidden = !msg;
+  els.authError.textContent = msg || "";
+}
+
+function setScreen(name) {
+  els.authScreen.hidden = name !== "auth";
+  els.entrance.hidden = name !== "welcome";
+  els.workspace.hidden = name !== "workspace";
+}
 
 function setConn(online, label) {
-  els.connPill.textContent = label || (online ? "Anna connected" : "Standalone");
+  els.connPill.textContent = label || (online ? "Anna connected" : "Local mode");
   els.connPill.classList.toggle("online", online);
   els.connPill.classList.toggle("offline", !online);
 }
@@ -105,7 +113,13 @@ function setBusy(on) {
   busy = on;
   els.sendBtn.disabled = on;
   els.runMode.disabled = on;
-  els.rerunBtn.disabled = on;
+}
+
+function applyTheme(theme) {
+  const next = theme === "dark" ? "dark" : "light";
+  document.documentElement.setAttribute("data-theme", next);
+  els.themeToggle.textContent = next === "dark" ? "Light" : "Dark";
+  lsSet(KEYS.theme, next);
 }
 
 function escapeHtml(str) {
@@ -114,13 +128,11 @@ function escapeHtml(str) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
 }
-
 function formatInline(text) {
   return escapeHtml(text)
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/_(.+?)_/g, "<em>$1</em>");
 }
-
 function renderMarkdownLite(md) {
   const lines = String(md || "").split("\n");
   const html = [];
@@ -148,10 +160,8 @@ function renderMarkdownLite(md) {
       continue;
     }
     if (line.startsWith("- ") || line.startsWith("* ")) {
-      if (!inList) {
-        html.push("<ul>");
-        inList = true;
-      }
+      if (!inList) html.push("<ul>");
+      inList = true;
       html.push(`<li>${formatInline(line.slice(2))}</li>`);
       continue;
     }
@@ -163,16 +173,12 @@ function renderMarkdownLite(md) {
 }
 
 function hideHub() {
-  hubVisible = false;
   if (els.hub) els.hub.hidden = true;
 }
-
 function showHub() {
-  hubVisible = true;
-  if (els.hub) {
-    els.hub.hidden = false;
-    els.chat.appendChild(els.hub);
-  }
+  if (!els.hub) return;
+  els.hub.hidden = false;
+  els.chat.appendChild(els.hub);
 }
 
 function addMessage(role, content, { markdown = false, engine = "", node = null } = {}) {
@@ -200,14 +206,13 @@ function addMessage(role, content, { markdown = false, engine = "", node = null 
   }
   els.chat.appendChild(article);
   els.chat.scrollTop = els.chat.scrollHeight;
-  return article;
 }
 
 function addSkeleton() {
   hideHub();
   const sk = document.createElement("div");
   sk.className = "skeleton";
-  sk.innerHTML = "<i></i><i></i><i></i><i></i>";
+  sk.innerHTML = "<i></i><i></i><i></i>";
   els.chat.appendChild(sk);
   els.chat.scrollTop = els.chat.scrollHeight;
   return sk;
@@ -217,78 +222,31 @@ function currentMode() {
   return MODES.find((m) => m.id === activeMode) || MODES[0];
 }
 
-function setMode(modeId, { persist = true } = {}) {
-  activeMode = modeId;
+function setMode(id) {
+  activeMode = id;
   const mode = currentMode();
   els.modeTitle.textContent = mode.title;
-  els.modePill.textContent = mode.title;
-  els.cockpitMode.textContent = mode.short;
-  els.hint.textContent = `${mode.title}: ${mode.blurb} · Shortcuts: 1–5 modes · U upload · ⌘/Ctrl+Enter send`;
-  els.modeList.querySelectorAll(".mode-card").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.mode === modeId);
-  });
-  els.railIcons.querySelectorAll(".rail-btn").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.mode === modeId);
-  });
-  if (persist && anna) anna.storage.set({ key: STORAGE_MODE_KEY, value: modeId }).catch(() => {});
+  els.hint.textContent = `${mode.title}: ${mode.blurb}. Files extract in-browser (no huge upload frames).`;
+  els.modeList.querySelectorAll(".mode-card").forEach((b) => b.classList.toggle("active", b.dataset.mode === id));
+  lsSet(KEYS.mode, id);
 }
 
-function setSidebarOpen(open) {
-  els.app.classList.toggle("sidebar-open", open);
-  els.sidebar.hidden = !open;
-  els.railToggle.setAttribute("aria-expanded", open ? "true" : "false");
+function setDrawer(open) {
+  els.layout.classList.toggle("drawer-closed", !open);
 }
 
-function showEntrance() {
-  els.entrance.hidden = false;
-  els.workspace.hidden = true;
-}
-
-function enterWorkspace({ persist = true } = {}) {
-  els.entrance.hidden = true;
-  els.workspace.hidden = false;
-  setSidebarOpen(true);
-  if (persist) {
-    try {
-      localStorage.setItem(STORAGE_ENTERED_KEY, "1");
-    } catch {
-      /* ignore */
-    }
-    if (anna?.storage?.set) anna.storage.set({ key: STORAGE_ENTERED_KEY, value: true }).catch(() => {});
-  }
-}
-
-function applyTheme(theme) {
-  const next = theme === "dark" ? "dark" : "light";
-  document.documentElement.setAttribute("data-theme", next);
-  els.themeToggle.textContent = next === "dark" ? "Light" : "Dark";
-  try {
-    localStorage.setItem(STORAGE_THEME_KEY, next);
-  } catch {
-    /* ignore */
-  }
-  if (anna?.storage?.set) anna.storage.set({ key: STORAGE_THEME_KEY, value: next }).catch(() => {});
-}
-
-function updateCockpit() {
-  const chars = docMeta.chars || (els.docInput.value || "").length;
-  const words = (els.docInput.value || "").trim() ? (els.docInput.value.trim().match(/\S+/g) || []).length : 0;
-  els.cockpitTitle.textContent = docMeta.name || (chars ? "Pasted text" : "No document");
-  els.cockpitType.textContent = (docMeta.type || (chars ? "text" : "—")).toUpperCase();
-  els.cockpitChars.textContent = chars.toLocaleString();
-  els.cockpitWords.textContent = words.toLocaleString();
-  els.cockpitMode.textContent = currentMode().short;
-}
-
-function updateDocMeta(meta) {
+function updateDocMeta(meta = {}) {
   docMeta = { ...docMeta, ...meta };
-  updateCockpit();
+  const chars = docMeta.chars || (els.docInput.value || "").length;
+  els.docMeta.textContent = chars
+    ? `${docMeta.name || "Pasted"} · ${(docMeta.type || "text").toUpperCase()} · ${chars.toLocaleString()} chars`
+    : "No file";
 }
 
 function renderHistory() {
   els.historyList.innerHTML = "";
   if (!history.length) {
-    els.historyList.innerHTML = `<p class="history-empty">No outputs yet</p>`;
+    els.historyList.innerHTML = `<p class="muted">No outputs yet</p>`;
     return;
   }
   history
@@ -299,144 +257,80 @@ function renderHistory() {
       btn.type = "button";
       btn.className = "history-item";
       btn.innerHTML = `<strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.mode)} · ${new Date(item.at).toLocaleTimeString()}</span>`;
-      btn.addEventListener("click", () => {
+      btn.onclick = () => {
         const real = history[history.length - 1 - idx];
         lastMarkdown = real.markdown || "";
         lastResult = real.result || null;
-        if (real.result) addRichResult(real.result, { fromHistory: true });
+        if (real.result) addRichResult(real.result);
         else addMessage("assistant", real.markdown || "", { markdown: true, engine: "history" });
-      });
+      };
       els.historyList.appendChild(btn);
     });
 }
 
 function pushHistory(entry) {
-  history.push(entry);
-  history = history.slice(-12);
+  history = [...history, entry].slice(-12);
+  lsSet(KEYS.history, history);
   renderHistory();
-  try {
-    localStorage.setItem(STORAGE_HISTORY_KEY, JSON.stringify(history));
-  } catch {
-    /* ignore */
-  }
-  if (anna?.storage?.set) anna.storage.set({ key: STORAGE_HISTORY_KEY, value: history }).catch(() => {});
 }
 
 function buildModeUi() {
-  els.railIcons.innerHTML = "";
   els.modeList.innerHTML = "";
   els.hubGrid.innerHTML = "";
-  for (const mode of MODES) {
-    const railBtn = document.createElement("button");
-    railBtn.type = "button";
-    railBtn.className = "rail-btn";
-    railBtn.dataset.mode = mode.id;
-    railBtn.title = mode.title;
-    railBtn.textContent = mode.short;
-    railBtn.addEventListener("click", () => {
-      setMode(mode.id);
-      setSidebarOpen(true);
-    });
-    els.railIcons.appendChild(railBtn);
-
+  MODES.forEach((mode) => {
     const card = document.createElement("button");
     card.type = "button";
     card.className = "mode-card";
     card.dataset.mode = mode.id;
     card.innerHTML = `<strong>${mode.title}</strong><span>${mode.blurb}</span>`;
-    card.addEventListener("click", () => setMode(mode.id));
+    card.onclick = () => setMode(mode.id);
     els.modeList.appendChild(card);
 
-    const hubCard = document.createElement("button");
-    hubCard.type = "button";
-    hubCard.className = "hub-card";
-    hubCard.innerHTML = `<strong>${mode.title}</strong><span>${mode.blurb}</span>`;
-    hubCard.addEventListener("click", () => {
+    const hub = document.createElement("button");
+    hub.type = "button";
+    hub.className = "hub-card";
+    hub.innerHTML = `<strong>${mode.title}</strong><span>${mode.blurb}</span>`;
+    hub.onclick = () => {
       setMode(mode.id);
-      if (!getDocumentText()) {
-        setSidebarOpen(true);
-        addMessage("system", `Mode set to ${mode.title}. Upload a document to run it.`);
-      } else {
-        runLearning();
-      }
-    });
-    els.hubGrid.appendChild(hubCard);
-  }
-}
-
-function getDocumentText() {
-  return (els.docInput.value || "").trim();
-}
-
-function extOf(name = "") {
-  const parts = String(name).toLowerCase().split(".");
-  return parts.length > 1 ? parts.pop() : "";
-}
-
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result || "");
-      resolve(result.includes(",") ? result.split(",")[1] : result);
+      if (!getDoc()) {
+        setDrawer(true);
+        addMessage("system", `Mode: ${mode.title}. Upload a document to run it.`);
+        showHub();
+      } else runLearning();
     };
-    reader.onerror = () => reject(reader.error || new Error("Failed to read file"));
-    reader.readAsDataURL(file);
+    els.hubGrid.appendChild(hub);
   });
 }
 
-async function callTool(method, args) {
-  if (!anna?.tools?.invoke) throw new Error("Tools unavailable");
-  const result = await anna.tools.invoke({ tool_id: TOOL_ID, method, args });
-  const data =
-    result?.data?.data || result?.data || result?.result?.data || result?.result || result;
-  if (data?.success === false) throw new Error(data.error || "Tool failed");
-  return data?.data || data;
-}
-
-async function extractWithTool(file) {
-  const base64 = await fileToBase64(file);
-  const data = await callTool("extract_document", {
-    filename: file.name,
-    content_base64: base64,
-    mime_type: file.type || "",
-  });
-  return { text: data.text || "", engine: data.engine || "executa-extract" };
+function getDoc() {
+  return (els.docInput.value || "").trim();
 }
 
 async function loadFile(file) {
   if (!file) return;
-  const ext = extOf(file.name);
+  if (file.size > 40 * 1024 * 1024) {
+    addMessage("assistant", "File is larger than 40MB. Please use a smaller document.");
+    return;
+  }
   setBusy(true);
   const sk = addSkeleton();
   try {
-    let text = "";
-    let engine = "browser-text";
-    if (TEXT_EXTS.has(ext) || (file.type || "").startsWith("text/")) {
-      text = await file.text();
-    } else if (BINARY_EXTS.has(ext) || file.type === "application/pdf") {
-      if (!anna?.tools?.invoke) throw new Error("PDF/DOCX needs Anna connection.");
-      const extracted = await extractWithTool(file);
-      text = extracted.text;
-      engine = extracted.engine;
-    } else if (anna?.tools?.invoke) {
-      const extracted = await extractWithTool(file);
-      text = extracted.text;
-      engine = extracted.engine;
-    } else text = await file.text();
-
-    if (!String(text).trim()) throw new Error("No extractable text found.");
-    els.docInput.value = text;
-    updateDocMeta({ name: file.name, type: ext || "file", chars: text.length });
-    if (anna?.storage?.set) {
-      await anna.storage.set({ key: STORAGE_DOC_KEY, value: text.slice(0, 200000) });
-      await anna.storage.set({
-        key: STORAGE_DOC_META_KEY,
-        value: { name: file.name, type: ext, chars: text.length },
-      });
-    }
+    // Always extract in-browser — avoids stdio 16MB frame limit
+    const { text, engine, ext } = await extractLocalFile(file);
+    if (!text) throw new Error("No extractable text found in this file.");
+    // Keep workspace text bounded for later tool/LLM calls
+    const clipped = text.slice(0, 180000);
+    els.docInput.value = clipped;
+    updateDocMeta({ name: file.name, type: ext || "file", chars: clipped.length });
+    lsSet(KEYS.doc, clipped);
+    lsSet(KEYS.meta, { name: file.name, type: ext, chars: clipped.length });
     sk.remove();
-    addMessage("system", `Loaded “${file.name}” (${text.length.toLocaleString()} chars) · ${engine}`);
+    addMessage(
+      "system",
+      `Loaded “${file.name}” (${clipped.length.toLocaleString()} chars) via ${engine}${
+        text.length > clipped.length ? " · truncated for speed" : ""
+      }`,
+    );
   } catch (e) {
     sk.remove();
     addMessage("assistant", `Could not read file: ${e?.message || e}`);
@@ -447,15 +341,15 @@ async function loadFile(file) {
 }
 
 function buildQuizNode(questions = []) {
-  quizState = { correct: 0, answered: 0 };
+  let correct = 0;
+  let answered = 0;
   const wrap = document.createElement("div");
   wrap.className = "rich";
   wrap.innerHTML = `<h3 class="rich-title">Interactive Quiz</h3>`;
   const score = document.createElement("div");
-  score.className = "quiz-score";
-  score.textContent = "Answer to score yourself";
+  score.className = "muted";
+  score.textContent = "Tap an answer to score";
   wrap.appendChild(score);
-
   questions.forEach((q, qi) => {
     const box = document.createElement("div");
     box.className = "quiz-q";
@@ -467,19 +361,19 @@ function buildQuizNode(questions = []) {
       btn.type = "button";
       btn.className = "quiz-opt";
       btn.textContent = `${String.fromCharCode(65 + oi)}) ${opt}`;
-      btn.addEventListener("click", () => {
+      btn.onclick = () => {
         if (box.dataset.done) return;
         box.dataset.done = "1";
-        quizState.answered += 1;
+        answered += 1;
         const ok = oi === Number(q.answer_index || 0);
-        if (ok) quizState.correct += 1;
+        if (ok) correct += 1;
         btn.classList.add(ok ? "correct" : "wrong");
-        [...opts.children].forEach((child, idx) => {
-          if (idx === Number(q.answer_index || 0)) child.classList.add("correct");
-          child.disabled = true;
+        [...opts.children].forEach((c, idx) => {
+          if (idx === Number(q.answer_index || 0)) c.classList.add("correct");
+          c.disabled = true;
         });
-        score.textContent = `Score: ${quizState.correct}/${quizState.answered}`;
-      });
+        score.textContent = `Score: ${correct}/${answered}`;
+      };
       opts.appendChild(btn);
     });
     box.appendChild(opts);
@@ -491,7 +385,7 @@ function buildQuizNode(questions = []) {
 function buildSlidesNode(slides = []) {
   let i = 0;
   const wrap = document.createElement("div");
-  wrap.className = "rich slides";
+  wrap.className = "rich";
   const title = document.createElement("h3");
   title.className = "rich-title";
   title.textContent = "Presentation";
@@ -502,7 +396,7 @@ function buildSlidesNode(slides = []) {
   prev.type = "button";
   prev.textContent = "← Prev";
   const meta = document.createElement("span");
-  meta.className = "pill soft";
+  meta.className = "pill";
   const next = document.createElement("button");
   next.className = "ghost compact";
   next.type = "button";
@@ -510,11 +404,10 @@ function buildSlidesNode(slides = []) {
   nav.append(prev, meta, next);
   const card = document.createElement("div");
   card.className = "slide-card";
-
   const paint = () => {
     const s = slides[i] || { title: "Empty", bullets: [] };
-    meta.textContent = `${i + 1} / ${slides.length || 1}`;
-    card.innerHTML = `<h4>${escapeHtml(s.title || `Slide ${i + 1}`)}</h4><ul>${(s.bullets || [])
+    meta.textContent = `${i + 1}/${slides.length || 1}`;
+    card.innerHTML = `<h4>${escapeHtml(s.title || "")}</h4><ul>${(s.bullets || [])
       .map((b) => `<li>${escapeHtml(b)}</li>`)
       .join("")}</ul>`;
   };
@@ -533,18 +426,15 @@ function buildSlidesNode(slides = []) {
 
 function buildGuideNode(steps = []) {
   const wrap = document.createElement("div");
-  wrap.className = "rich timeline";
+  wrap.className = "rich";
   wrap.innerHTML = `<h3 class="rich-title">Learning Guide</h3>`;
   steps.forEach((s, idx) => {
     const row = document.createElement("div");
     row.className = "timeline-step";
-    row.innerHTML = `
-      <div class="step-num">${s.step || idx + 1}</div>
-      <div>
-        <h4>${escapeHtml(s.title || `Step ${idx + 1}`)}</h4>
-        <p>${escapeHtml(s.detail || "")}</p>
-        <div class="action">${escapeHtml(s.action || "")}</div>
-      </div>`;
+    row.innerHTML = `<div class="step-num">${s.step || idx + 1}</div>
+      <div><strong>${escapeHtml(s.title || "")}</strong>
+      <p class="muted">${escapeHtml(s.detail || "")}</p>
+      <p><strong>${escapeHtml(s.action || "")}</strong></p></div>`;
     wrap.appendChild(row);
   });
   return wrap;
@@ -553,7 +443,7 @@ function buildGuideNode(steps = []) {
 function buildStudyNode(concepts = []) {
   const wrap = document.createElement("div");
   wrap.className = "rich";
-  wrap.innerHTML = `<h3 class="rich-title">Study Flashcards</h3><p class="hint">Click a card to flip</p>`;
+  wrap.innerHTML = `<h3 class="rich-title">Study Flashcards</h3><p class="muted">Tap to flip</p>`;
   const grid = document.createElement("div");
   grid.className = "flash-grid";
   concepts.forEach((c) => {
@@ -562,88 +452,35 @@ function buildStudyNode(concepts = []) {
     card.className = "flash";
     card.innerHTML = `<div class="term">${escapeHtml(c.term || "Concept")}</div>
       <div class="note">${escapeHtml(c.note || "")}</div>
-      <div class="hint-flip">Tap to reveal</div>`;
-    card.addEventListener("click", () => card.classList.toggle("open"));
+      <div class="hint-flip">Reveal</div>`;
+    card.onclick = () => card.classList.toggle("open");
     grid.appendChild(card);
   });
   wrap.appendChild(grid);
   return wrap;
 }
 
-function addRichResult(result, { fromHistory = false } = {}) {
+function addRichResult(result) {
   const mode = result.mode || activeMode;
   let node = null;
-  if (mode === "quiz" && Array.isArray(result.questions) && result.questions.length) {
-    node = buildQuizNode(result.questions);
-  } else if (mode === "presentation" && Array.isArray(result.slides) && result.slides.length) {
-    node = buildSlidesNode(result.slides);
-  } else if (mode === "guide" && Array.isArray(result.steps) && result.steps.length) {
-    node = buildGuideNode(result.steps);
-  } else if (mode === "study" && Array.isArray(result.concepts) && result.concepts.length) {
-    node = buildStudyNode(result.concepts);
-  }
+  if (mode === "quiz" && result.questions?.length) node = buildQuizNode(result.questions);
+  else if (mode === "presentation" && result.slides?.length) node = buildSlidesNode(result.slides);
+  else if (mode === "guide" && result.steps?.length) node = buildGuideNode(result.steps);
+  else if (mode === "study" && result.concepts?.length) node = buildStudyNode(result.concepts);
 
-  if (node) {
-    addMessage("assistant", "", { node, engine: result.engine || "" });
-    // also keep markdown exportable
-    if (!fromHistory && result.markdown) {
-      /* markdown already stored in lastMarkdown by caller */
-    }
-  } else {
-    addMessage("assistant", result.markdown || "No output.", {
-      markdown: true,
-      engine: result.engine || "",
-    });
-  }
+  if (node) addMessage("assistant", "", { node, engine: result.engine || "" });
+  else addMessage("assistant", result.markdown || "No output.", { markdown: true, engine: result.engine || "" });
 }
 
-async function invokeToolMode(mode, documentText, userPrompt) {
-  return callTool("run_mode", {
-    mode,
-    document_text: documentText,
-    user_prompt: userPrompt || "",
-    question_count: 5,
-    slide_count: 6,
-  });
-}
-
-async function invokeAskTool(documentText, question) {
-  return callTool("ask_document", { document_text: documentText, question });
-}
-
-async function invokeLlm(modeOrAsk, documentText, userPrompt, { ask = false } = {}) {
-  const instruction = ask
-    ? "Answer using only the document. Be precise. Markdown."
-    : MODE_PROMPTS[modeOrAsk] || MODE_PROMPTS.summarize;
-  const clipped = documentText.slice(0, 28000);
-  const userBit = ask
-    ? `Question: ${userPrompt}\n\nDOCUMENT:\n${clipped}`
-    : `${instruction}${userPrompt ? `\n\nUser request: ${userPrompt}` : ""}\n\nDOCUMENT:\n${clipped}`;
-  const reply = await anna.llm.complete({
-    messages: [
-      {
-        role: "system",
-        content: {
-          type: "text",
-          text: "You are MindSparkle, an elite study coach. Clear, structured, practical.",
-        },
-      },
-      { role: "user", content: { type: "text", text: userBit } },
-    ],
-    maxTokens: 2000,
-  });
-  const text = reply?.content?.text || reply?.message?.content?.text || reply?.text || "";
-  if (!text) throw new Error("Empty LLM response");
-  return {
-    mode: ask ? "ask" : modeOrAsk,
-    title: ask ? "Answer" : currentMode().title,
-    markdown: text,
-    engine: "anna.llm.complete",
-  };
+async function callTool(method, args) {
+  if (!anna?.tools?.invoke) throw new Error("Tools unavailable");
+  const result = await anna.tools.invoke({ tool_id: TOOL_ID, method, args });
+  const data = result?.data?.data || result?.data || result?.result?.data || result?.result || result;
+  if (data?.success === false) throw new Error(data.error || "Tool failed");
+  return data?.data || data;
 }
 
 function localFallback(mode, documentText, userPrompt) {
-  // Use tool logic offline by mimicking structured shapes for rich UI
   const sentences = documentText
     .split(/(?<=[.!?])\s+/)
     .map((s) => s.trim())
@@ -654,94 +491,85 @@ function localFallback(mode, documentText, userPrompt) {
       question: `Which statement best matches idea ${i + 1}?`,
       options: [s.slice(0, 120), "Unrelated claim", "Opposite claim", "Not in the document"],
       answer_index: 0,
-      explanation: s.slice(0, 180),
     }));
-    return {
-      mode,
-      questions,
-      markdown: questions.map((q) => `Q${q.id}. ${q.question}`).join("\n"),
-      engine: "standalone-local",
-    };
+    return { mode, questions, markdown: "Quiz", engine: "local" };
   }
   if (mode === "presentation") {
     const slides = [
-      { title: "Overview", bullets: [userPrompt || "Document walkthrough", "Key themes", "Outcomes"] },
+      { title: "Overview", bullets: [userPrompt || "Walkthrough", "Key themes"] },
       ...sentences.slice(0, 4).map((s, i) => ({ title: `Section ${i + 1}`, bullets: [s.slice(0, 120)] })),
-      { title: "Takeaways", bullets: ["Review", "Quiz weak spots", "Ask follow-ups"] },
     ];
-    return { mode, slides, markdown: slides.map((s) => s.title).join("\n"), engine: "standalone-local" };
+    return { mode, slides, markdown: "Presentation", engine: "local" };
   }
   if (mode === "guide") {
     const steps = sentences.slice(0, 5).map((s, i) => ({
       step: i + 1,
       title: `Step ${i + 1}`,
       detail: s.slice(0, 220),
-      action: "Explain this in your own words.",
+      action: "Explain in your own words",
     }));
-    return { mode, steps, markdown: steps.map((s) => s.title).join("\n"), engine: "standalone-local" };
+    return { mode, steps, markdown: "Guide", engine: "local" };
   }
   if (mode === "study") {
-    const concepts = sentences.slice(0, 6).map((s, i) => ({
-      term: `Concept ${i + 1}`,
-      note: s.slice(0, 160),
-    }));
-    return { mode, concepts, markdown: concepts.map((c) => c.term).join("\n"), engine: "standalone-local" };
+    const concepts = sentences.slice(0, 6).map((s, i) => ({ term: `Concept ${i + 1}`, note: s.slice(0, 160) }));
+    return { mode, concepts, markdown: "Study", engine: "local" };
   }
   const points = sentences.slice(0, 6);
-  const markdown = [
-    "## Summary",
-    "",
-    points.slice(0, 2).join(" ") || documentText.slice(0, 280),
-    "",
-    "### Key points",
-    ...points.map((p, i) => `${i + 1}. ${p}`),
-  ].join("\n");
-  return { mode: "summarize", markdown, engine: "standalone-local" };
+  return {
+    mode: "summarize",
+    markdown: ["## Summary", "", points.slice(0, 2).join(" "), "", "### Key points", ...points.map((p, i) => `${i + 1}. ${p}`)].join("\n"),
+    engine: "local",
+  };
 }
 
 async function runLearning({ userPrompt = "", fromChat = false } = {}) {
-  const doc = getDocumentText();
+  const doc = getDoc();
   if (!doc) {
-    setSidebarOpen(true);
+    setDrawer(true);
     addMessage("system", "Upload or paste a document first.");
+    showHub();
     return;
   }
   const mode = currentMode();
   const asking = fromChat && Boolean(userPrompt.trim());
-  if (asking) addMessage("user", userPrompt);
-  else addMessage("user", `Run ${mode.title}${userPrompt ? `: ${userPrompt}` : ""}`);
-
+  addMessage("user", asking ? userPrompt : `Run ${mode.title}${userPrompt ? `: ${userPrompt}` : ""}`);
   setBusy(true);
   const sk = addSkeleton();
   try {
     let result = null;
     if (anna?.llm?.complete && asking) {
       try {
-        result = await invokeLlm(mode.id, doc, userPrompt, { ask: true });
-      } catch (e) {
-        console.warn(e);
-      }
-    }
-    if (!result && anna?.llm?.complete && !asking) {
-      try {
-        // Prefer structured local/tool for rich widgets; LLM for summarize/ask mainly
-        if (mode.id === "summarize") result = await invokeLlm(mode.id, doc, userPrompt, { ask: false });
+        const reply = await anna.llm.complete({
+          messages: [
+            { role: "system", content: { type: "text", text: "You are MindSparkle, a precise study coach." } },
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: `Answer using the document.\n\nQuestion: ${userPrompt}\n\nDOCUMENT:\n${doc.slice(0, 24000)}`,
+              },
+            },
+          ],
+          maxTokens: 1600,
+        });
+        const text = reply?.content?.text || reply?.text || "";
+        if (text) result = { mode: "ask", markdown: text, engine: "anna.llm.complete" };
       } catch (e) {
         console.warn(e);
       }
     }
     if (!result && anna?.tools?.invoke) {
-      result = asking ? await invokeAskTool(doc, userPrompt) : await invokeToolMode(mode.id, doc, userPrompt);
-    }
-    if (!result) {
       result = asking
-        ? {
-            mode: "ask",
-            markdown: `### Answer\nBased on your document:\n\n${doc.slice(0, 420)}…`,
-            engine: "standalone-local",
-          }
-        : localFallback(mode.id, doc, userPrompt);
+        ? await callTool("ask_document", { document_text: doc.slice(0, 120000), question: userPrompt })
+        : await callTool("run_mode", {
+            mode: mode.id,
+            document_text: doc.slice(0, 120000),
+            user_prompt: userPrompt || "",
+          });
     }
+    if (!result) result = asking
+      ? { mode: "ask", markdown: `## Answer\n\n${doc.slice(0, 400)}…`, engine: "local" }
+      : localFallback(mode.id, doc, userPrompt);
 
     sk.remove();
     lastResult = result;
@@ -764,7 +592,7 @@ async function runLearning({ userPrompt = "", fromChat = false } = {}) {
 
 function exportLast() {
   if (!lastMarkdown.trim()) {
-    addMessage("system", "Nothing to export yet — run a mode first.");
+    addMessage("system", "Nothing to export yet.");
     return;
   }
   const blob = new Blob([lastMarkdown], { type: "text/markdown;charset=utf-8" });
@@ -776,176 +604,173 @@ function exportLast() {
   URL.revokeObjectURL(url);
 }
 
-function newSession() {
-  els.chat.querySelectorAll(".msg, .skeleton").forEach((n) => n.remove());
-  showHub();
-  lastMarkdown = "";
-  lastResult = null;
-  addMessage("system", "New session ready. Pick a mode or upload a document.");
-  // keep hub visible: remove the system? keep both — hideHub was called; restore hub
+function goWelcome() {
+  const name = currentUser?.name || currentUser?.email || "there";
+  els.welcomeUser.textContent = `Hi ${name} — your AI study workspace is ready.`;
+  setScreen("welcome");
+}
+
+function enterWorkspace() {
+  try {
+    sessionStorage.setItem(KEYS.welcomeSession, "1");
+  } catch {
+    /* ignore */
+  }
+  setScreen("workspace");
+  setDrawer(true);
   showHub();
 }
 
+function logout() {
+  currentUser = null;
+  lsSet(KEYS.user, null);
+  try {
+    sessionStorage.removeItem(KEYS.welcomeSession);
+  } catch {
+    /* ignore */
+  }
+  setScreen("auth");
+}
+
+function bindAuth() {
+  els.tabLogin.onclick = () => {
+    els.tabLogin.classList.add("active");
+    els.tabSignup.classList.remove("active");
+    els.loginForm.hidden = false;
+    els.signupForm.hidden = true;
+    showAuthError("");
+  };
+  els.tabSignup.onclick = () => {
+    els.tabSignup.classList.add("active");
+    els.tabLogin.classList.remove("active");
+    els.signupForm.hidden = false;
+    els.loginForm.hidden = true;
+    showAuthError("");
+  };
+
+  els.signupForm.onsubmit = (e) => {
+    e.preventDefault();
+    const name = $("#signup-name").value.trim();
+    const email = $("#signup-email").value.trim().toLowerCase();
+    const password = $("#signup-password").value;
+    const users = lsGet(KEYS.users, {}) || {};
+    if (users[email]) {
+      showAuthError("Account already exists. Use Login.");
+      return;
+    }
+    users[email] = { name, email, password };
+    lsSet(KEYS.users, users);
+    currentUser = { name, email };
+    lsSet(KEYS.user, currentUser);
+    showAuthError("");
+    goWelcome();
+  };
+
+  els.loginForm.onsubmit = (e) => {
+    e.preventDefault();
+    const email = $("#login-email").value.trim().toLowerCase();
+    const password = $("#login-password").value;
+    const users = lsGet(KEYS.users, {}) || {};
+    const found = users[email];
+    if (!found || found.password !== password) {
+      showAuthError("Invalid email or password.");
+      return;
+    }
+    currentUser = { name: found.name, email: found.email };
+    lsSet(KEYS.user, currentUser);
+    showAuthError("");
+    goWelcome();
+  };
+}
+
 function bindUi() {
-  els.enterBtn.addEventListener("click", () => {
-    enterWorkspace();
-    showHub();
-  });
-  els.showEntrance.addEventListener("click", () => showEntrance());
-  els.railToggle.addEventListener("click", () => setSidebarOpen(els.sidebar.hidden));
-  els.sidebarClose.addEventListener("click", () => setSidebarOpen(false));
-
-  els.clearDoc.addEventListener("click", () => {
-    els.docInput.value = "";
-    updateDocMeta({ name: "", type: "", chars: 0 });
-    if (anna?.storage?.set) {
-      anna.storage.set({ key: STORAGE_DOC_KEY, value: "" }).catch(() => {});
-      anna.storage.set({ key: STORAGE_DOC_META_KEY, value: null }).catch(() => {});
-    }
-  });
-  els.rerunBtn.addEventListener("click", () => runLearning());
-  els.clearHistory.addEventListener("click", () => {
-    history = [];
-    renderHistory();
-    try {
-      localStorage.removeItem(STORAGE_HISTORY_KEY);
-    } catch {
-      /* ignore */
-    }
-  });
-
-  els.fileInput.addEventListener("change", () => loadFile(els.fileInput.files?.[0]));
-  els.hubUpload.addEventListener("click", () => {
-    setSidebarOpen(true);
-    els.fileInput.click();
-  });
-  els.cmdUpload.addEventListener("click", () => {
-    setSidebarOpen(true);
-    els.fileInput.click();
-  });
-  els.cmdMode.addEventListener("click", () => setSidebarOpen(true));
-  els.cmdExport.addEventListener("click", exportLast);
-  els.cmdNew.addEventListener("click", newSession);
-  els.themeToggle.addEventListener("click", () => {
+  els.enterBtn.onclick = () => enterWorkspace();
+  els.menuBtn.onclick = () => setDrawer(els.layout.classList.contains("drawer-closed"));
+  els.drawerClose.onclick = () => setDrawer(false);
+  els.themeToggle.onclick = () => {
     const cur = document.documentElement.getAttribute("data-theme") || "light";
     applyTheme(cur === "dark" ? "light" : "dark");
+  };
+  els.cmdExport.onclick = exportLast;
+  els.logoutBtn.onclick = logout;
+  els.clearDoc.onclick = () => {
+    els.docInput.value = "";
+    updateDocMeta({ name: "", type: "", chars: 0 });
+    lsSet(KEYS.doc, "");
+  };
+  els.clearHistory.onclick = () => {
+    history = [];
+    lsSet(KEYS.history, []);
+    renderHistory();
+  };
+  els.fileInput.onchange = () => loadFile(els.fileInput.files?.[0]);
+  els.dropzone.addEventListener("click", (e) => {
+    if (e.target !== els.fileInput) els.fileInput.click();
   });
-
-  ["dragenter", "dragover"].forEach((evt) => {
+  ["dragenter", "dragover"].forEach((evt) =>
     els.dropzone.addEventListener(evt, (e) => {
       e.preventDefault();
       els.dropzone.classList.add("dragover");
-    });
-  });
-  ["dragleave", "drop"].forEach((evt) => {
+    }),
+  );
+  ["dragleave", "drop"].forEach((evt) =>
     els.dropzone.addEventListener(evt, (e) => {
       e.preventDefault();
       els.dropzone.classList.remove("dragover");
-    });
-  });
+    }),
+  );
   els.dropzone.addEventListener("drop", (e) => {
     const file = e.dataTransfer?.files?.[0];
     if (file) loadFile(file);
   });
-
-  els.docInput.addEventListener("input", () => {
-    updateDocMeta({
-      name: docMeta.name || "Pasted text",
-      type: docMeta.type || "text",
-      chars: els.docInput.value.length,
-    });
-  });
-  els.docInput.addEventListener("change", () => {
-    if (anna?.storage?.set) {
-      anna.storage.set({ key: STORAGE_DOC_KEY, value: els.docInput.value.slice(0, 200000) }).catch(() => {});
-    }
-  });
-
-  els.runMode.addEventListener("click", () => runLearning());
-  els.sendBtn.addEventListener("click", () => {
+  els.docInput.oninput = () => updateDocMeta({ name: docMeta.name || "Pasted", type: docMeta.type || "text", chars: els.docInput.value.length });
+  els.runMode.onclick = () => runLearning();
+  els.sendBtn.onclick = () => {
     const prompt = els.promptInput.value.trim();
     els.promptInput.value = "";
     runLearning({ userPrompt: prompt, fromChat: true });
-  });
+  };
   els.promptInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey || !e.shiftKey)) {
-      if (e.key === "Enter" && e.shiftKey) return;
+    if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       els.sendBtn.click();
-    }
-  });
-
-  window.addEventListener("keydown", (e) => {
-    if (els.workspace.hidden) return;
-    const tag = (e.target && e.target.tagName) || "";
-    if (tag === "TEXTAREA" || tag === "INPUT") return;
-    if (e.key >= "1" && e.key <= "5") {
-      const mode = MODES[Number(e.key) - 1];
-      if (mode) setMode(mode.id);
-    }
-    if (e.key.toLowerCase() === "u") {
-      e.preventDefault();
-      els.fileInput.click();
     }
   });
 }
 
 async function init() {
   buildModeUi();
+  bindAuth();
   bindUi();
-  setMode("summarize", { persist: false });
-  updateDocMeta({ name: "", type: "", chars: 0 });
-
-  let theme = "light";
-  let entered = false;
-  try {
-    theme = localStorage.getItem(STORAGE_THEME_KEY) || "light";
-    entered = localStorage.getItem(STORAGE_ENTERED_KEY) === "1";
-    const rawHist = localStorage.getItem(STORAGE_HISTORY_KEY);
-    if (rawHist) history = JSON.parse(rawHist) || [];
-  } catch {
-    /* ignore */
-  }
-  applyTheme(theme);
+  applyTheme(lsGet(KEYS.theme, "light"));
+  setMode(lsGet(KEYS.mode, "summarize") || "summarize");
+  history = lsGet(KEYS.history, []) || [];
   renderHistory();
+  const savedDoc = lsGet(KEYS.doc, "");
+  if (typeof savedDoc === "string" && savedDoc) {
+    els.docInput.value = savedDoc;
+    updateDocMeta(lsGet(KEYS.meta, { name: "Saved document", type: "text", chars: savedDoc.length }));
+  } else updateDocMeta({});
 
   try {
     anna = await AnnaAppRuntime.connect();
     setConn(true);
     await anna.window.set_title({ title: "MindSparkle" });
-    try {
-      const savedTheme = await anna.storage.get({ key: STORAGE_THEME_KEY });
-      if (savedTheme?.value) applyTheme(savedTheme.value);
-      const savedEntered = await anna.storage.get({ key: STORAGE_ENTERED_KEY });
-      if (savedEntered?.value) entered = true;
-      const savedDoc = await anna.storage.get({ key: STORAGE_DOC_KEY });
-      if (typeof savedDoc?.value === "string" && savedDoc.value) {
-        els.docInput.value = savedDoc.value;
-        updateDocMeta({ name: "Saved document", type: "text", chars: savedDoc.value.length });
-      }
-      const savedMeta = await anna.storage.get({ key: STORAGE_DOC_META_KEY });
-      if (savedMeta?.value && typeof savedMeta.value === "object") updateDocMeta(savedMeta.value);
-      const savedMode = await anna.storage.get({ key: STORAGE_MODE_KEY });
-      if (typeof savedMode?.value === "string" && MODES.some((m) => m.id === savedMode.value)) {
-        setMode(savedMode.value, { persist: false });
-      }
-      const savedHist = await anna.storage.get({ key: STORAGE_HISTORY_KEY });
-      if (Array.isArray(savedHist?.value)) {
-        history = savedHist.value;
-        renderHistory();
-      }
-    } catch {
-      /* ignore */
-    }
-  } catch (e) {
+  } catch {
     setConn(false);
-    console.warn("[mindsparkle] standalone:", e?.message || e);
   }
 
-  if (entered) {
-    enterWorkspace({ persist: false });
-    showHub();
-  } else showEntrance();
+  currentUser = lsGet(KEYS.user, null);
+  let welcomeDone = false;
+  try {
+    welcomeDone = sessionStorage.getItem(KEYS.welcomeSession) === "1";
+  } catch {
+    welcomeDone = false;
+  }
+
+  if (!currentUser) setScreen("auth");
+  else if (!welcomeDone) goWelcome();
+  else enterWorkspace();
 }
 
 init();

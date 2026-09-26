@@ -5,74 +5,92 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>MindSparkle</title>
     <link rel="stylesheet" href="./styles.css" />
+    <script src="./vendor/jszip.min.js"></script>
     <script src="./app.js" type="module"></script>
   </head>
   <body>
-    <!-- 0) Entrance -->
-    <section class="entrance" id="entrance" aria-label="Welcome">
-      <div class="entrance-orbit" aria-hidden="true"></div>
-      <div class="entrance-glow" aria-hidden="true"></div>
-      <div class="entrance-card">
-        <p class="eyebrow">AI Learning Workspace</p>
-        <h1 class="brand">Mind<span>Sparkle</span></h1>
-        <p class="entrance-lead">
-          Upload any document. Generate summaries, quizzes, decks, guides, and study packs —
-          then keep asking in chat.
-        </p>
-        <div class="entrance-pills">
-          <span>PDF</span><span>DOCX</span><span>TXT</span><span>MD</span><span>CSV</span>
+    <!-- Auth -->
+    <section class="screen auth-screen" id="auth-screen">
+      <div class="auth-shell">
+        <div class="auth-brand">
+          <p class="eyebrow">MindSparkle</p>
+          <h1>Learn from any document.</h1>
+          <p class="lead">Summaries, quizzes, decks, guides, and study packs — in one focused workspace.</p>
         </div>
-        <div class="entrance-preview" aria-hidden="true">
-          <div class="mini-rail"></div>
-          <div class="mini-chat">
-            <div class="mini-line"></div>
-            <div class="mini-line short"></div>
-            <div class="mini-bubble"></div>
+        <div class="auth-card">
+          <div class="tabs" role="tablist">
+            <button class="tab active" id="tab-login" type="button" role="tab" aria-selected="true">Login</button>
+            <button class="tab" id="tab-signup" type="button" role="tab" aria-selected="false">Sign up</button>
           </div>
+
+          <form id="login-form" class="auth-form">
+            <label>Email<input id="login-email" type="email" required placeholder="you@email.com" /></label>
+            <label>Password<input id="login-password" type="password" required placeholder="••••••••" minlength="6" /></label>
+            <button class="primary wide" type="submit">Login</button>
+            <p class="tiny">Local profile for this app. Anna account powers cloud LLM separately.</p>
+          </form>
+
+          <form id="signup-form" class="auth-form" hidden>
+            <label>Name<input id="signup-name" type="text" required placeholder="Your name" /></label>
+            <label>Email<input id="signup-email" type="email" required placeholder="you@email.com" /></label>
+            <label>Password<input id="signup-password" type="password" required placeholder="Min 6 characters" minlength="6" /></label>
+            <button class="primary wide" type="submit">Create account</button>
+            <p class="tiny">Creates a local MindSparkle profile on this device.</p>
+          </form>
+          <p class="auth-error" id="auth-error" hidden></p>
         </div>
-        <button class="primary entrance-cta" id="enter-btn" type="button">Enter workspace</button>
-        <p class="entrance-note">Built for Anna · Stronger than the original MindSparkle</p>
+      </div>
+    </section>
+
+    <!-- Welcome -->
+    <section class="screen entrance" id="entrance" hidden>
+      <div class="entrance-card">
+        <p class="eyebrow">Welcome to MindSparkle</p>
+        <h1 class="brand">Mind<span>Sparkle</span></h1>
+        <p class="entrance-lead" id="welcome-user">Your AI study workspace is ready.</p>
+        <ul class="welcome-points">
+          <li>Upload PDF, DOCX, TXT, MD, CSV</li>
+          <li>Run Summarize, Quiz, Presentation, Guide, Study</li>
+          <li>Ask follow-up questions in chat</li>
+        </ul>
+        <button class="primary entrance-cta" id="enter-btn" type="button">Start learning</button>
       </div>
     </section>
 
     <!-- Workspace -->
     <div class="app" id="workspace" hidden>
-      <aside class="rail" aria-label="Mode rail">
-        <button class="rail-toggle" id="rail-toggle" type="button" title="Modes" aria-expanded="false">
-          <span></span><span></span><span></span>
-        </button>
-        <nav class="rail-icons" id="rail-icons" aria-label="Learning modes"></nav>
-        <button class="rail-home" id="show-entrance" type="button" title="Welcome">MS</button>
-      </aside>
-
-      <aside class="sidebar" id="sidebar" hidden>
-        <div class="sidebar-head">
+      <header class="top">
+        <div class="top-left">
+          <button class="icon-btn" id="menu-btn" type="button" title="Modes">☰</button>
           <div>
-            <p class="eyebrow">Modes</p>
-            <h2>Learn</h2>
+            <p class="eyebrow">MindSparkle</p>
+            <h1 id="mode-title">Summarize</h1>
           </div>
-          <button class="ghost" id="sidebar-close" type="button">Close</button>
         </div>
-        <div class="mode-list" id="mode-list"></div>
+        <div class="top-actions">
+          <span class="pill" id="conn-pill">Connecting…</span>
+          <button class="cmd" id="theme-toggle" type="button">Dark</button>
+          <button class="cmd" id="cmd-export" type="button">Export</button>
+          <button class="cmd" id="logout-btn" type="button">Logout</button>
+        </div>
+      </header>
 
-        <!-- 2) Document cockpit -->
-        <section class="cockpit" id="cockpit">
-          <div class="cockpit-top">
-            <div>
-              <p class="eyebrow">Document</p>
-              <h3 id="cockpit-title">No document</h3>
+      <div class="layout">
+        <aside class="drawer" id="drawer">
+          <div class="drawer-head">
+            <h2>Modes</h2>
+            <button class="ghost" id="drawer-close" type="button">Close</button>
+          </div>
+          <div class="mode-list" id="mode-list"></div>
+
+          <div class="doc-box">
+            <div class="doc-box-head">
+              <h3>Document</h3>
+              <span id="doc-meta">No file</span>
             </div>
-            <span class="pill soft" id="cockpit-type">—</span>
-          </div>
-          <div class="cockpit-stats">
-            <div><strong id="cockpit-chars">0</strong><span>chars</span></div>
-            <div><strong id="cockpit-words">0</strong><span>words</span></div>
-            <div><strong id="cockpit-mode">SU</strong><span>mode</span></div>
-          </div>
-          <div class="dropzone" id="dropzone">
-            <p><strong>Drop a document</strong><br />PDF, DOCX, TXT, MD, CSV</p>
-            <label class="file-btn">
-              Upload
+            <label class="upload-tile" id="dropzone">
+              <strong>Upload document</strong>
+              <span>PDF · DOCX · TXT · MD · CSV</span>
               <input
                 id="file-input"
                 type="file"
@@ -80,78 +98,40 @@
                 hidden
               />
             </label>
-          </div>
-          <textarea id="doc-input" placeholder="Or paste text here…"></textarea>
-          <div class="sidebar-actions">
-            <button class="ghost" id="clear-doc" type="button">Clear</button>
-            <button class="secondary compact" id="rerun-btn" type="button">Re-run mode</button>
-          </div>
-        </section>
-
-        <!-- 7) Recent outputs -->
-        <section class="history-panel">
-          <div class="history-head">
-            <p class="eyebrow">Recent</p>
-            <button class="ghost compact" id="clear-history" type="button">Clear</button>
-          </div>
-          <div class="history-list" id="history-list">
-            <p class="history-empty">No outputs yet</p>
-          </div>
-        </section>
-      </aside>
-
-      <main class="stage">
-        <!-- 5) Command bar -->
-        <header class="command-bar" id="command-bar">
-          <div class="brand-lockup">
-            <span class="brand-mark">Mind<span>Sparkle</span></span>
-            <span class="pill" id="conn-pill">Connecting…</span>
-          </div>
-          <div class="command-actions">
-            <button class="cmd" id="cmd-upload" type="button">Upload</button>
-            <button class="cmd" id="cmd-mode" type="button">Mode</button>
-            <button class="cmd" id="cmd-export" type="button">Export</button>
-            <button class="cmd" id="cmd-new" type="button">New session</button>
-            <button class="cmd theme-btn" id="theme-toggle" type="button" title="Toggle theme">Theme</button>
-          </div>
-        </header>
-
-        <div class="stage-title-row">
-          <div>
-            <p class="eyebrow" id="mode-eyebrow">Active mode</p>
-            <h1 id="mode-title">Summarize</h1>
-          </div>
-          <span class="pill mode-pill" id="mode-pill">Summarize</span>
-        </div>
-
-        <section class="chat" id="chat" aria-live="polite">
-          <!-- 1) Action hub (empty state) -->
-          <div class="hub" id="hub">
-            <div class="hub-copy">
-              <p class="eyebrow">Start here</p>
-              <h2>What do you want to learn from?</h2>
-              <p>Upload a document, then pick a mode — or ask anything in chat.</p>
-            </div>
-            <div class="hub-grid" id="hub-grid"></div>
-            <button class="secondary" id="hub-upload" type="button">Upload document</button>
-          </div>
-        </section>
-
-        <footer class="composer">
-          <div class="composer-box">
-            <textarea
-              id="prompt-input"
-              rows="1"
-              placeholder="Ask about your document, or describe what you want from this mode…"
-            ></textarea>
-            <div class="composer-actions">
+            <textarea id="doc-input" placeholder="Or paste text…"></textarea>
+            <div class="row">
+              <button class="ghost" id="clear-doc" type="button">Clear</button>
               <button class="secondary" id="run-mode" type="button">Run mode</button>
+            </div>
+          </div>
+
+          <div class="history-box">
+            <div class="doc-box-head">
+              <h3>Recent</h3>
+              <button class="ghost compact" id="clear-history" type="button">Clear</button>
+            </div>
+            <div id="history-list"><p class="muted">No outputs yet</p></div>
+          </div>
+        </aside>
+
+        <main class="main">
+          <section class="chat" id="chat" aria-live="polite">
+            <div class="hub" id="hub">
+              <h2>What do you want to create?</h2>
+              <p class="muted">Pick a mode or upload a document to begin.</p>
+              <div class="hub-grid" id="hub-grid"></div>
+            </div>
+          </section>
+
+          <footer class="composer">
+            <div class="composer-box">
+              <textarea id="prompt-input" rows="1" placeholder="Ask about your document…"></textarea>
               <button class="primary" id="send-btn" type="button">Send</button>
             </div>
-          </div>
-          <p class="hint" id="hint">Tip: press ⌘/Ctrl + Enter to send · U to upload · 1–5 to switch modes</p>
-        </footer>
-      </main>
+            <p class="hint" id="hint">Modes 1–5 · Upload extracts text in-browser (no huge file transfer)</p>
+          </footer>
+        </main>
+      </div>
     </div>
   </body>
 </html>
