@@ -8,12 +8,30 @@
     <script src="./app.js" type="module"></script>
   </head>
   <body>
-    <div class="app">
+    <section class="entrance" id="entrance" aria-label="Welcome">
+      <div class="entrance-glow" aria-hidden="true"></div>
+      <div class="entrance-card">
+        <p class="eyebrow">AI Learning Workspace</p>
+        <h1 class="brand">Mind<span>Sparkle</span></h1>
+        <p class="entrance-lead">
+          Turn any document into summaries, quizzes, presentations, guides, and study packs —
+          inside one focused chat.
+        </p>
+        <div class="entrance-pills">
+          <span>PDF</span><span>DOCX</span><span>TXT</span><span>MD</span><span>CSV</span>
+        </div>
+        <button class="primary entrance-cta" id="enter-btn" type="button">Enter workspace</button>
+        <p class="entrance-note">Phase 1 on Anna · Built to outpace the original MindSparkle</p>
+      </div>
+    </section>
+
+    <div class="app" id="workspace" hidden>
       <aside class="rail" aria-label="Mode rail">
         <button class="rail-toggle" id="rail-toggle" type="button" title="Modes" aria-expanded="false">
           <span></span><span></span><span></span>
         </button>
         <nav class="rail-icons" id="rail-icons" aria-label="Learning modes"></nav>
+        <button class="rail-home" id="show-entrance" type="button" title="Welcome">MS</button>
       </aside>
 
       <aside class="sidebar" id="sidebar" hidden>
@@ -25,15 +43,28 @@
           <button class="ghost" id="sidebar-close" type="button">Close</button>
         </div>
         <div class="mode-list" id="mode-list"></div>
+
         <div class="sidebar-doc">
-          <label for="doc-input">Source document</label>
-          <textarea id="doc-input" placeholder="Paste notes, chapter text, or lecture content…"></textarea>
-          <div class="sidebar-actions">
+          <div class="doc-head">
+            <label for="doc-input">Source document</label>
+            <span class="doc-meta" id="doc-meta">No file yet</span>
+          </div>
+          <div class="dropzone" id="dropzone">
+            <p><strong>Drop a document</strong> or upload PDF, DOCX, TXT, MD, CSV</p>
             <label class="file-btn">
-              Upload .txt
-              <input id="file-input" type="file" accept=".txt,text/plain" hidden />
+              Upload document
+              <input
+                id="file-input"
+                type="file"
+                accept=".txt,.md,.markdown,.csv,.json,.pdf,.docx,text/plain,text/markdown,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                hidden
+              />
             </label>
+          </div>
+          <textarea id="doc-input" placeholder="Or paste lecture notes / chapter text here…"></textarea>
+          <div class="sidebar-actions">
             <button class="ghost" id="clear-doc" type="button">Clear</button>
+            <button class="ghost" id="export-btn" type="button">Export last</button>
           </div>
         </div>
       </aside>
@@ -57,14 +88,14 @@
             <textarea
               id="prompt-input"
               rows="1"
-              placeholder="Ask about your document, or press Run mode…"
+              placeholder="Ask anything about your document, or run the active mode…"
             ></textarea>
             <div class="composer-actions">
               <button class="secondary" id="run-mode" type="button">Run mode</button>
               <button class="primary" id="send-btn" type="button">Send</button>
             </div>
           </div>
-          <p class="hint" id="hint">Attach a document from the side panel, then run Summarize.</p>
+          <p class="hint" id="hint">Upload a document, pick a mode, then run — or just ask in chat.</p>
         </footer>
       </main>
     </div>
